@@ -1,0 +1,8 @@
+{"parentUuid":null,"type":"user","message":{"role":"user","content":"good line"},"uuid":"u1","timestamp":"2026-09-09T19:07:15.164Z","isSidechain":false,"userType":"external","entrypoint":"remote_mobile","cwd":"/home/user/session-search","sessionId":"sess-fixture","version":"2.1.266","gitBranch":"main","origin":{"kind":"human"}}
+this is not json at all
+{"type":"user","message":{"role":"user","content":"unterminated
+
+   
+3
+[1,2,3]
+{"parentUuid":"u1","type":"assistant","message":{"model":"claude-opus-5","id":"msg_1","type":"message","role":"assistant","content":[{"type":"text","text":"still fine"}],"stop_reason":"tool_use","usage":{"input_tokens":2,"cache_creation_input_tokens":22034,"cache_read_input_tokens":39062,"output_tokens":623}},"apiBlockIndex":0,"requestId":"req_1","uuid":"a1","timestamp":"2026-09-09T19:07:19.248Z","isSidechain":false,"userType":"external","entrypoint":"remote_mobile","cwd":"/home/user/session-search","sessionId":"sess-fixture","version":"2.1.266","gitBranch":"main"}

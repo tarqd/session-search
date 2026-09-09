@@ -1,0 +1,11 @@
+{"type":"queue-operation","operation":"enqueue","timestamp":"2026-09-09T19:07:12.396Z","sessionId":"sess-fixture","content":"first prompt"}
+{"parentUuid":null,"type":"user","message":{"role":"user","content":"first prompt"},"uuid":"u1","timestamp":"2026-09-09T19:07:15.164Z","isSidechain":false,"userType":"external","entrypoint":"remote_mobile","cwd":"/home/user/session-search","sessionId":"sess-fixture","version":"2.1.266","gitBranch":"main","origin":{"kind":"human"},"promptId":"p1"}
+{"type":"atis-latch","atis":"","sessionId":"sess-fixture"}
+{"type":"last-prompt","lastPrompt":"first prompt","leafUuid":"u1","sessionId":"sess-fixture"}
+{"type":"summary","summary":"Stale title from before the resume","leafUuid":"u1"}
+{"parentUuid":"u1","type":"assistant","message":{"model":"claude-opus-5","id":"msg_1","type":"message","role":"assistant","content":[{"type":"text","text":"an answer"}],"stop_reason":"tool_use","usage":{"input_tokens":2,"cache_creation_input_tokens":22034,"cache_read_input_tokens":39062,"output_tokens":623}},"apiBlockIndex":0,"requestId":"req_1","uuid":"a1","timestamp":"2026-09-09T19:07:19.248Z","isSidechain":false,"userType":"external","entrypoint":"remote_mobile","cwd":"/home/user/session-search","sessionId":"sess-fixture","version":"2.1.266","gitBranch":"main"}
+{"type":"atis-latch","atis":"","sessionId":"sess-fixture"}
+{"type":"last-prompt","lastPrompt":"first prompt","leafUuid":"u1","sessionId":"sess-fixture"}
+{"type":"summary","summary":"Fresh title after the resume","leafUuid":"u1"}
+{"type":"worktree-state","sessionId":"sess-fixture","payload":{"unknown":true}}
+{"type":"a-record-type-from-the-future","sessionId":"sess-fixture"}
