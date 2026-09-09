@@ -12,7 +12,10 @@
 //! * sidecar records re-appended wholesale on resume (deduped last-wins).
 //!
 //! A `tool_use` block and the `tool_result` that answers it are joined by `tool_use_id` into a
-//! single [`DocKind::ToolCall`] document carrying name, input, result text and error flag.
+//! single [`DocKind::ToolCall`] document carrying name, input, result text and error flag. The
+//! result goes into its own [`Doc::tool_output`] field rather than being concatenated onto
+//! `text`, so `tool_output:"..."` can ask about what a tool *returned* and not what it was
+//! asked to do.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs::File;
@@ -72,8 +75,12 @@ pub struct Doc {
     pub permission_mode: Option<String>,
     pub version: Option<String>,
     pub slug: Option<String>,
-    /// The indexed body.
+    /// The indexed body. For a tool call this is the name and the input's own strings; the
+    /// result lives in [`Doc::tool_output`], so a match can be attributed to one or the other.
     pub text: String,
+    /// The joined `tool_result` text, indexed and stored in its own right. `None` on a
+    /// message, and on a tool call whose result has not been read yet.
+    pub tool_output: Option<String>,
     /// Stored; indexed only with `include_thinking`.
     pub thinking: Option<String>,
     /// The original JSONL line.
@@ -236,7 +243,8 @@ pub fn file_tag(source_path: &str) -> String {
 
 #[derive(Debug, Clone)]
 pub struct ParseOptions {
-    /// Cap on the indexed body of one doc.
+    /// Cap on the indexed body of one doc. `tool_output` is capped separately, at the same
+    /// number: a tool call's input and its result are two fields now, not one shared budget.
     pub max_text_bytes: usize,
     /// Follow `<persisted-output>` pointers into `tool-results/<id>.txt`.
     pub load_spilled_results: bool,
@@ -748,8 +756,8 @@ impl<'a> Parser<'a> {
     }
 
     /// Complete the documents a previous run left waiting for a result. The replacement keeps
-    /// the original `doc_id` and `seq` and appends the result exactly as `tool_call_doc` would
-    /// have, so the outcome is byte-identical to what a whole-file parse produces.
+    /// the original `doc_id` and `seq` and fills in the result exactly as `tool_call_doc`
+    /// would have, so the outcome is byte-identical to what a whole-file parse produces.
     fn build_replacements(&self) -> Vec<Doc> {
         let mut out = Vec::new();
         for pending in self.carried_pending.values() {
@@ -760,8 +768,8 @@ impl<'a> Parser<'a> {
                 continue;
             };
             let mut doc = doc.clone();
-            let remaining = self.opts.max_text_bytes.saturating_sub(doc.text.len());
-            doc.text.push_str(&truncate(&outcome.text, remaining));
+            doc.tool_output =
+                Some(truncate(&outcome.text, self.opts.max_text_bytes)).filter(|s| !s.is_empty());
             doc.is_error = outcome.is_error;
             out.push(doc);
         }
@@ -931,14 +939,17 @@ impl<'a> Parser<'a> {
                             }
                             let outcome = self.outcomes.get(&id).cloned().unwrap_or_default();
                             self.session.tool_calls += 1;
+                            // An orphan has no call side at all — no name, no input — so its
+                            // whole body is the result, and `text` stays empty.
                             out.push(
                                 PartialDoc::tool_call(
                                     None,
                                     Some(id),
                                     None,
-                                    truncate(&outcome.text, self.opts.max_text_bytes),
+                                    String::new(),
                                     outcome.is_error,
                                 )
+                                .output(truncate(&outcome.text, self.opts.max_text_bytes))
                                 .role("user")
                                 .meta(is_meta),
                             );
@@ -1049,8 +1060,10 @@ impl<'a> Parser<'a> {
             .cloned()
             .unwrap_or_default();
 
-        // Index the input's own strings alongside the result, so `Bash cargo build` matches
-        // on `text` as well as through `tool_input.command`.
+        // Index the input's own strings, so `Bash cargo build` matches on `text` as well as
+        // through `tool_input.command`. The same quarter-of-the-budget cap as before this
+        // field existed: `text` no longer shares its budget with the result, but a `Write`
+        // payload is still not worth 32 KB of it.
         let input_budget = self.opts.max_text_bytes / 4;
         let mut body = String::new();
         if let Some(name) = &tu.name {
@@ -1061,8 +1074,6 @@ impl<'a> Parser<'a> {
             body.push_str(&truncate(&string_leaves(input).join("\n"), input_budget));
             body.push('\n');
         }
-        let remaining = self.opts.max_text_bytes.saturating_sub(body.len());
-        body.push_str(&truncate(&outcome.text, remaining));
 
         PartialDoc::tool_call(
             tu.name.clone(),
@@ -1071,6 +1082,7 @@ impl<'a> Parser<'a> {
             body,
             outcome.is_error,
         )
+        .output(truncate(&outcome.text, self.opts.max_text_bytes))
     }
 
     fn attachment_docs(&mut self, a: &AttachmentRecord, out: &mut Vec<PartialDoc>) {
@@ -1188,6 +1200,7 @@ impl<'a> Parser<'a> {
                 .and_then(|c| c.slug.clone())
                 .or_else(|| self.session.slug.clone()),
             text: p.text,
+            tool_output: p.tool_output,
             thinking: p.thinking,
             raw: raw.to_string(),
         }
@@ -1200,6 +1213,7 @@ struct PartialDoc {
     kind: DocKind,
     role: String,
     text: String,
+    tool_output: Option<String>,
     thinking: Option<String>,
     model: Option<String>,
     tool_name: Option<String>,
@@ -1215,6 +1229,7 @@ impl PartialDoc {
             kind: DocKind::Message,
             role: role.to_string(),
             text,
+            tool_output: None,
             thinking: None,
             model: None,
             tool_name: None,
@@ -1225,6 +1240,8 @@ impl PartialDoc {
         }
     }
 
+    /// `text` is the call side — the tool name and the input's own strings. The result goes in
+    /// `tool_output` via [`PartialDoc::output`], never concatenated onto `text`.
     fn tool_call(
         tool_name: Option<String>,
         tool_use_id: Option<String>,
@@ -1236,6 +1253,7 @@ impl PartialDoc {
             kind: DocKind::ToolCall,
             role: "assistant".to_string(),
             text,
+            tool_output: None,
             thinking: None,
             model: None,
             tool_name,
@@ -1256,6 +1274,12 @@ impl PartialDoc {
     }
     fn thinking(mut self, thinking: Option<String>) -> Self {
         self.thinking = thinking;
+        self
+    }
+    /// Empty output is `None`, not `Some("")`: "the tool returned nothing" and "the result has
+    /// not arrived yet" both render as absent, and neither should occupy a posting list.
+    fn output(mut self, output: String) -> Self {
+        self.tool_output = Some(output).filter(|s| !s.is_empty());
         self
     }
     fn meta(mut self, is_meta: bool) -> Self {
@@ -1307,7 +1331,8 @@ fn ids_from_path(path: &Path) -> FileIds {
 
 /// A copy of a document small enough to sit in `state.json` until its result arrives.
 fn carryable(doc: &Doc) -> Option<Box<Doc>> {
-    (doc.text.len() + doc.raw.len() <= PENDING_DOC_CAP).then(|| Box::new(doc.clone()))
+    let size = doc.text.len() + doc.raw.len() + doc.tool_output.as_deref().map_or(0, str::len);
+    (size <= PENDING_DOC_CAP).then(|| Box::new(doc.clone()))
 }
 
 /// The last `cap` elements, in order. Used to bound what one file's [`ParseCarry`] persists.
@@ -1469,6 +1494,12 @@ mod tests {
 
     fn texts(out: &ParseOutput) -> Vec<&str> {
         out.docs.iter().map(|d| d.text.as_str()).collect()
+    }
+
+    /// Everything a document indexes as prose, for assertions that do not care which of the
+    /// two fields a tool call happened to put it in.
+    fn body_of(d: &Doc) -> String {
+        format!("{}{}", d.text, d.tool_output.as_deref().unwrap_or(""))
     }
 
     // -- file-level hazards -------------------------------------------------
@@ -1635,8 +1666,15 @@ mod tests {
         assert_eq!(bash.tool_input.as_ref().unwrap()["command"], "cargo build");
         assert!(bash.text.contains("cargo build"), "input is indexed");
         assert!(
-            bash.text.contains("Compiling session-search"),
-            "result is indexed"
+            bash.tool_output
+                .as_deref()
+                .unwrap()
+                .contains("Compiling session-search"),
+            "result is indexed, in its own field"
+        );
+        assert!(
+            !bash.text.contains("Compiling session-search"),
+            "and not also smuggled into `text`"
         );
         assert!(!bash.is_error);
 
@@ -1646,10 +1684,40 @@ mod tests {
             .find(|d| d.tool_use_id.as_deref() == Some("toolu_2"))
             .unwrap();
         assert!(read.is_error);
-        assert!(read.text.contains("Error: file not found"));
+        assert!(
+            read.tool_output
+                .as_deref()
+                .unwrap()
+                .contains("Error: file not found")
+        );
         assert_eq!(
             read.tool_input.as_ref().unwrap()["file_path"],
             "/home/user/session-search/src/index.rs"
+        );
+    }
+
+    /// The two halves of a tool call must not bleed into one another: a word that occurs only
+    /// in the input must not be findable through `tool_output`, and vice versa.
+    #[test]
+    fn the_call_and_its_result_stay_in_separate_fields() {
+        let (out, _) = parse("assistant_split_blocks.jsonl");
+        let bash = out
+            .docs
+            .iter()
+            .find(|d| d.tool_use_id.as_deref() == Some("toolu_1"))
+            .unwrap();
+        let output = bash.tool_output.as_deref().unwrap();
+        assert!(bash.text.contains("Bash"), "the name is on the call side");
+        assert!(!output.contains("cargo build"), "input leaked into output");
+        assert!(!bash.text.contains("Compiling"), "output leaked into text");
+
+        // A message carries no output at all — not even an empty string, which would sit in
+        // the index as a term nobody can search for.
+        assert!(
+            out.docs
+                .iter()
+                .filter(|d| d.kind == DocKind::Message)
+                .all(|d| d.tool_output.is_none())
         );
     }
 
@@ -1678,7 +1746,7 @@ mod tests {
             ls.is_error,
             "a bare-string toolUseResult starting `Error:` is a failure"
         );
-        assert!(ls.text.contains("total 24"));
+        assert!(ls.tool_output.as_deref().unwrap().contains("total 24"));
     }
 
     #[test]
@@ -1689,7 +1757,13 @@ mod tests {
             .iter()
             .find(|d| d.tool_use_id.as_deref() == Some("toolu_b"))
             .unwrap();
-        assert!(agent.text.contains("agent said hello"));
+        assert!(
+            agent
+                .tool_output
+                .as_deref()
+                .unwrap()
+                .contains("agent said hello")
+        );
         assert!(!agent.is_error);
     }
 
@@ -1773,7 +1847,7 @@ mod tests {
         };
         let out = parse_whole(&transcript, &off).unwrap();
         assert!(
-            !out.docs.iter().any(|d| d.text.contains("quokkatron")),
+            !out.docs.iter().any(|d| body_of(d).contains("quokkatron")),
             "the spill must stay out unless asked for"
         );
 
@@ -1783,18 +1857,24 @@ mod tests {
         };
         let out = parse_whole(&transcript, &on).unwrap();
         assert!(
-            out.docs.iter().any(|d| d.text.contains("quokkatron")),
+            out.docs.iter().any(|d| body_of(d).contains("quokkatron")),
             "spill not folded in: {:?}",
-            out.docs.iter().map(|d| &d.text).collect::<Vec<_>>()
+            out.docs.iter().map(body_of).collect::<Vec<_>>()
         );
 
-        // And it obeys the same body cap as anything else.
+        // And it obeys the same body cap as anything else — `tool_output` has its own budget,
+        // so the cap is checked per field rather than on their sum.
         let capped = ParseOptions {
             load_spilled_results: true,
             max_text_bytes: 24,
         };
         let out = parse_whole(&transcript, &capped).unwrap();
         assert!(out.docs.iter().all(|d| d.text.len() <= 24));
+        assert!(
+            out.docs
+                .iter()
+                .all(|d| d.tool_output.as_deref().map_or(0, str::len) <= 24)
+        );
     }
 
     // -- session metadata ---------------------------------------------------
@@ -2042,7 +2122,13 @@ mod tests {
             "bare `Error:` string: {:?}",
             call("t1")
         );
-        assert!(call("t1").text.contains("No such tool available"));
+        assert!(
+            call("t1")
+                .tool_output
+                .as_deref()
+                .unwrap()
+                .contains("No such tool available")
+        );
         assert!(call("t2").is_error, "toolDenialKind: {:?}", call("t2"));
         assert!(!call("t3").is_error, "a success must stay a success");
         // And nothing was invented: three tool calls in, three documents out.
@@ -2197,7 +2283,14 @@ mod tests {
         assert_eq!(second.replacements[0].doc_id, expected.doc_id);
         assert_eq!(second.replacements[0].seq, expected.seq);
         assert_eq!(second.replacements[0].text, expected.text);
-        assert!(second.replacements[0].text.contains("Finished"));
+        assert_eq!(second.replacements[0].tool_output, expected.tool_output);
+        assert!(
+            second.replacements[0]
+                .tool_output
+                .as_deref()
+                .unwrap()
+                .contains("Finished")
+        );
 
         // Without the carry the same tail invents a second half-document instead.
         let (naive, _) = parse_file(

@@ -39,6 +39,7 @@ pub struct Fields {
     pub project_facet: tantivy::schema::Field,
     pub tool_input: tantivy::schema::Field,
     pub text: tantivy::schema::Field,
+    pub tool_output: tantivy::schema::Field,
     pub thinking: tantivy::schema::Field,
     pub timestamp: tantivy::schema::Field,
     pub seq: tantivy::schema::Field,
@@ -93,6 +94,10 @@ pub fn build_schema() -> (Schema, Fields) {
     let tool_input = sb.add_json_field("tool_input", tool_input_options());
 
     let text = sb.add_text_field("text", TEXT | STORED);
+    // What a tool returned, indexed apart from what it was asked to do. Always indexed — a
+    // tool result is the record of what actually happened, and `--include-thinking` has no
+    // equivalent here.
+    let tool_output = sb.add_text_field("tool_output", TEXT | STORED);
     let thinking = sb.add_text_field("thinking", TEXT | STORED);
 
     let timestamp = sb.add_date_field("timestamp", INDEXED | STORED | FAST);
@@ -129,6 +134,7 @@ pub fn build_schema() -> (Schema, Fields) {
         project_facet,
         tool_input,
         text,
+        tool_output,
         thinking,
         timestamp,
         seq,
@@ -198,6 +204,7 @@ pub fn doc_to_json(doc: &Doc, include_thinking: bool) -> Value {
     put_str(&mut o, "version", doc.version.as_deref());
     put_str(&mut o, "slug", doc.slug.as_deref());
     put_str(&mut o, "text", Some(&doc.text));
+    put_str(&mut o, "tool_output", doc.tool_output.as_deref());
     put_str(&mut o, "raw", Some(&doc.raw));
 
     if let Some(facet) = doc.project.as_deref().and_then(facet_path) {
@@ -261,7 +268,8 @@ mod tests {
             permission_mode: Some("default".into()),
             version: Some("2.1.266".into()),
             slug: Some("wild-spinning-puppy".into()),
-            text: "cargo build".into(),
+            text: "Bash\ncargo build".into(),
+            tool_output: Some("Finished dev profile".into()),
             thinking: Some("hmm".into()),
             raw: "{}".into(),
         }
@@ -292,6 +300,7 @@ mod tests {
             "project_facet",
             "tool_input",
             "text",
+            "tool_output",
             "thinking",
             "timestamp",
             "seq",

@@ -217,6 +217,34 @@ session-search search "" --tool-input file_path=DESIGN.md --limit 2
       4 files and must code against the signatures here rather than …
 ```
 
+Filter on what a tool **returned** with `--tool-output`, a phrase over the result text —
+"which commands printed a passing test summary?", with no free-text query at all:
+
+```bash
+session-search search "" --tool-output "test result: ok" --limit 1
+```
+
+```
+1 of 10 hits · 6 ms
+
+▌ 246d26f9-45fd-5656-aaa1-1768c41a6448  (1 hit)
+▌ /home/user/session-search · claude/tool-outputs-indexing-9l87sj · 2026-09-09 23:38
+
+   1. 23:38:26  assistant Bash command=cargo test --all-features 2>&1 | grep -E "test resu…  #63  6.48
+      **test** **result**: **ok**. 176 passed; 0 failed; 4 ignored; 0 measured; 0 filtered out
+      **test** **result**: **ok**. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
+```
+
+The call and its result are two fields, so you can ask about either one alone:
+
+| query | matches |
+| --- | --- |
+| `Compiling` | 14 — both fields, the default |
+| `text:Compiling` | 10 — the tool name and its input only |
+| `tool_output:Compiling` | 5 — what the tool actually printed |
+
+A bare query still spans the pair, so nothing that used to match stops matching.
+
 ### 5. Read the conversation around a hit
 
 `--context N` pulls the surrounding turns in next to each hit:
@@ -473,6 +501,8 @@ Accepted by `search`, `facets` and `sessions`:
   -t, --tool <NAME>             Tool name; repeatable
       --tool-input <KEY=VALUE>  Tool parameter filter as `key=value`, e.g. `--tool-input
                                 command=cargo`; repeatable
+      --tool-output <TEXT>      Phrase the tool's *output* must contain, e.g. `--tool-output "No
+                                such file"`; repeatable, and ANDed
       --branch <BRANCH>
       --model <MODEL>
       --role <ROLE>
@@ -499,7 +529,8 @@ b20208d8-fbdb-5918-ba69-d203de6ed6dc  wild-spinning-puppy  agent a02e0e345842f6e
   harden:docs
 ```
 
-The ignored set is `--tool`, `--tool-input`, `--model`, `--role`, `--kind`, `--errors-only`.
+The ignored set is `--tool`, `--tool-input`, `--tool-output`, `--model`, `--role`, `--kind`,
+`--errors-only`.
 
 ### `index`
 
@@ -709,6 +740,7 @@ session-search search "aggregation" -t Bash --limit 1 --json --facets tool_name
         "description": "Check tantivy aggregation module availability"
       },
       "tool_name": "Bash",
+      "tool_output": "192:pub mod aggregation;\n193:pub mod collector;…",
       "tool_use_id": "toolu_01QtnP3F5Y8o8sPGoePwD6Ug",
       "uuid": "cfbf460d-4921-4c09-b9f2-ff341c7141d6",
       "version": "2.1.266"
@@ -718,8 +750,9 @@ session-search search "aggregation" -t Bash --limit 1 --json --facets tool_name
 }
 ```
 
-(Pretty-printed here; the real output is a single line. `snippet`, `source_path`, `text` and
-`tool_input.command` are truncated with `…` for width — they are complete in the actual output.)
+(Pretty-printed here; the real output is a single line. `snippet`, `source_path`, `text`,
+`tool_output` and `tool_input.command` are truncated with `…` for width — they are complete in
+the actual output.)
 
 ---
 
@@ -741,8 +774,12 @@ merge and old ones are reclaimed.
 ### Documents
 
 One document per message, one per tool call. That granularity is what makes hits precise and
-facets meaningful — a hit points at the exact turn, not at a 400-line session. The index for this
-project's own development history:
+facets meaningful — a hit points at the exact turn, not at a 400-line session.
+
+A tool call is one document holding both halves in separate fields: `text` carries the tool name
+and the input's own strings, `tool_output` the result that answered it, joined by `tool_use_id`
+across the records they were written in. Each is capped independently (32 KB by default), and
+both are searched by a bare query. The index for this project's own development history:
 
 ```bash
 session-search facets role

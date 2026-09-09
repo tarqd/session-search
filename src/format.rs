@@ -178,6 +178,20 @@ fn hit_json(hit: &Hit, context: &[Doc]) -> Value {
     value
 }
 
+/// Whichever body a document actually has. A tool call with no input, and an orphaned
+/// `tool_result`, both carry an empty `text` and everything worth showing in `tool_output`.
+fn doc_body(d: &Doc) -> &str {
+    [
+        Some(d.text.as_str()),
+        d.tool_output.as_deref(),
+        d.thinking.as_deref(),
+    ]
+    .into_iter()
+    .flatten()
+    .find(|b| !b.trim().is_empty())
+    .unwrap_or("")
+}
+
 /// The stable JSON shape of one document. `raw` is deliberately not included.
 pub fn doc_json(d: &Doc) -> Value {
     json!({
@@ -206,6 +220,7 @@ pub fn doc_json(d: &Doc) -> Value {
         "version": d.version,
         "slug": d.slug,
         "text": d.text,
+        "tool_output": d.tool_output,
         "thinking": d.thinking,
         "source_path": d.source_path,
     })
@@ -246,7 +261,7 @@ fn human_search(
             writeln!(w)?;
             write_hit_line(w, hit, i + 1, ink, cols)?;
             let body = if hit.snippet.trim().is_empty() {
-                one_line(&hit.doc.text, cols * MAX_SNIPPET_LINES)
+                one_line(doc_body(&hit.doc), cols * MAX_SNIPPET_LINES)
             } else {
                 one_line(&hit.snippet, usize::MAX)
             };
@@ -388,7 +403,7 @@ fn write_context(
             _ => doc.role.clone(),
         };
         let prefix = format!("      #{:<5} {:<20} ", doc.seq, truncate(&label, 20));
-        let body = one_line(&doc.text, cols.saturating_sub(prefix.chars().count()));
+        let body = one_line(doc_body(doc), cols.saturating_sub(prefix.chars().count()));
         writeln!(w, "{}", ink.paint(&format!("{prefix}{body}"), dim()))?;
     }
     Ok(())
@@ -558,6 +573,13 @@ pub fn session_view(w: &mut impl Write, docs: &[Doc], o: &OutputOpts) -> Result<
         };
         for line in wrap(&clip(&doc.text, budget), cols.saturating_sub(6)) {
             writeln!(w, "      {line}")?;
+        }
+        // The result gets its own budget and its own indent: on a tool call the interesting
+        // half is usually what came back, and it must not be crowded out by a `Write` payload.
+        if let Some(output) = doc.tool_output.as_deref().filter(|o| !o.trim().is_empty()) {
+            for line in wrap(&clip(output, TOOL_BUDGET), cols.saturating_sub(8)) {
+                writeln!(w, "        {line}")?;
+            }
         }
         if let Some(thinking) = doc.thinking.as_deref().filter(|t| !t.trim().is_empty()) {
             for line in wrap(&clip(thinking, MESSAGE_BUDGET), cols.saturating_sub(8)) {
@@ -1004,6 +1026,7 @@ mod tests {
             version: Some("2.1.266".into()),
             slug: Some("wild-spinning-puppy".into()),
             text: text.into(),
+            tool_output: None,
             thinking: None,
             raw: "{\"type\":\"user\"}".into(),
         }
@@ -1142,6 +1165,7 @@ mod tests {
             "version",
             "slug",
             "text",
+            "tool_output",
             "thinking",
             "source_path",
             "score",
@@ -1402,6 +1426,53 @@ mod tests {
         assert_eq!(col(lines[1]), col(lines[2]));
         assert_eq!(col(lines[2]), col(lines[3]));
         assert!(lines[3].contains('…'), "long values are truncated: {out}");
+    }
+
+    #[test]
+    fn session_view_renders_the_result_under_the_call() {
+        let mut tool = tool_doc(
+            2,
+            "Bash",
+            json!({"command": "cargo build"}),
+            "Bash\ncargo build",
+        );
+        tool.tool_output = Some("error: linker `cc` not found".into());
+        let out = render(|w| session_view(w, &[tool], &plain()));
+        assert!(out.contains("cargo build"), "{out}");
+        assert!(out.contains("error: linker `cc` not found"), "{out}");
+        // Indented one step deeper than the call it answers.
+        let result_line = out
+            .lines()
+            .find(|l| l.contains("linker"))
+            .expect("the result is rendered");
+        assert!(result_line.starts_with("        "), "{result_line:?}");
+
+        // A result that never arrived adds no blank line.
+        let mut pending = tool_doc(3, "Bash", json!({"command": "ls"}), "Bash\nls");
+        pending.tool_output = None;
+        let out = render(|w| session_view(w, &[pending], &plain()));
+        assert!(!out.contains("\n\n\n"), "{out:?}");
+    }
+
+    /// A document whose whole body is its output — an orphaned `tool_result` — must not render
+    /// as a blank row in the hit list or in a context window.
+    #[test]
+    fn an_output_only_document_renders_its_output() {
+        let mut orphan = doc(4, "user", "");
+        orphan.kind = DocKind::ToolCall;
+        orphan.tool_use_id = Some("toolu_orphan".into());
+        orphan.tool_output = Some("Finished dev profile".into());
+
+        let r = response(vec![hit(orphan.clone(), 1.0, "")]);
+        let out = render(|w| search_results(w, &r, &plain()));
+        assert!(out.contains("Finished dev profile"), "{out}");
+
+        // …and the same document seen as a neighbour in a context window.
+        let neighbour = doc(5, "assistant", "and then");
+        let r = response(vec![hit(neighbour.clone(), 1.0, "and then")]);
+        let ctx = vec![vec![orphan, neighbour]];
+        let out = render(|w| search_results_ctx(w, &r, &ctx, &plain()));
+        assert!(out.contains("Finished dev profile"), "{out}");
     }
 
     #[test]
