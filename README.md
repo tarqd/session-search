@@ -880,10 +880,14 @@ and `elapsed 0 ms` — meaningless for a static read — and labels the index's 
 
 **Thinking is indexed but not searched by default.** `index` stores thinking blocks unless you
 pass `--no-thinking`; `search --include-thinking` opts a query into them. So the common case needs
-no rebuild — only opting *out* and back in does. Note that remote and web sessions strip thinking
-text before it reaches disk: the block survives with its `signature` intact but `"thinking": ""`,
-so on those machines there is nothing to index either way. Thinking is worth indexing because it
-is often the only record of *why* something was done — but expect it only from local sessions.
+no rebuild — only opting *out* and back in does.
+
+Remote and web sessions strip thinking text before it reaches disk: the block survives with its
+`signature` intact but `"thinking": ""`, so on those machines there is nothing to index. Empty
+blocks are skipped rather than indexed as blank documents — in a corpus with 453 stripped blocks,
+the index holds none of them. What *does* survive is the cost: `thinking_tokens` is indexed as a
+fast field, so `--min-thinking N` and `facets thinking_tokens` still find the turns where the
+model stopped to reason, even when you cannot read what it reasoned about.
 
 **Snippet markers can collide with the text.** Matches are wrapped in `**…**`; if the indexed text
 already contains `**` (this tool's own Markdown output, for instance) you will see `****term****`.

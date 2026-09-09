@@ -288,6 +288,7 @@ Field names and options:
 | `tool_input` | JSON, indexed + `set_fast(Some("raw"))` + `set_expand_dots_enabled()` + stored |
 | `text` | `TEXT \| STORED` |
 | `thinking` | `TEXT \| STORED` (only populated when `include_thinking`) |
+| `thinking_tokens` | `U64 \| FAST \| STORED \| INDEXED` — per-message reasoning cost |
 | `timestamp` | date field, `INDEXED \| STORED \| FAST` (tantivy 0.26 has no `DATE` flag const; `add_date_field` takes the numeric flags) |
 | `seq` | `U64 \| STORED \| FAST \| INDEXED` |
 | `is_error`, `is_sidechain`, `is_meta` | `U64 \| FAST \| INDEXED \| STORED` (0/1) — STORED because `search::doc_from_stored` reads them back out of the stored payload |
@@ -324,6 +325,13 @@ index built over a snapshot, and every count then described the union.
 Thinking is indexed by **default** (`index --no-thinking` opts out) and the choice is recorded, so
 a query-time `--include-thinking` against an index built without it warns instead of silently
 matching nothing.
+
+`usage.output_tokens_details.thinking_tokens` is indexed as a fast field, because it survives on
+transcripts whose thinking *text* was stripped before it reached disk. It is a per-message total
+that appears on only some of the message's block records — usually the `tool_use` one, not the
+first to emit — repeated with the same value on up to four of them, so it is charged once per
+`message.id` on a record that actually carries it (`ParseCarry::charged_message_ids` keeps that
+true across an incremental boundary). Filter with `--min-thinking N`.
 
 Incremental rules:
 - Watermark per file: `{size, mtime_ms, byte_offset, docs, carry}`.

@@ -1039,6 +1039,7 @@ mod tests {
             slug: Some("wild-spinning-puppy".into()),
             text: text.into(),
             thinking: None,
+            thinking_tokens: None,
             raw: "{\"type\":\"user\"}".into(),
         }
     }

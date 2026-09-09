@@ -76,6 +76,11 @@ pub struct Doc {
     pub text: String,
     /// Stored; indexed only with `include_thinking`.
     pub thinking: Option<String>,
+    /// `usage.output_tokens_details.thinking_tokens`, attached to exactly ONE document per API
+    /// message so sums and facets are not multiplied by the block count. Remote and web
+    /// sessions strip the thinking *text* but keep this, so it is the only surviving measure of
+    /// where a session stopped to reason.
+    pub thinking_tokens: Option<u64>,
     /// The original JSONL line.
     pub raw: String,
 }
@@ -178,6 +183,10 @@ pub struct ParseCarry {
     pub pending_tool_uses: Vec<PendingToolCall>,
     /// API `message.id`s already counted towards [`SessionInfo::messages`].
     pub counted_message_ids: Vec<String>,
+    /// API `message.id`s whose thinking cost has already been charged to a document. Separate
+    /// from `counted_message_ids` because the record carrying `thinking_tokens` is usually the
+    /// `tool_use` one, not whichever block record emitted first.
+    pub charged_message_ids: Vec<String>,
     /// `(start offset, hash)` of the last complete line consumed.
     pub tail_line: Option<TailLine>,
 }
@@ -372,6 +381,8 @@ struct Parser<'a> {
     /// API `message.id`s already counted, seeded from the carry so a tail boundary inside one
     /// message does not count it twice.
     counted_message_ids: HashSet<String>,
+    charged_message_ids: HashSet<String>,
+    charged_order: Vec<String>,
     /// The same ids in arrival order, so the carry can keep the most recent ones.
     counted_order: Vec<String>,
     last_uuid: Option<String>,
@@ -415,6 +426,8 @@ impl<'a> Parser<'a> {
             sidecars: BTreeMap::new(),
             last_prompt: None,
             counted_message_ids: ctx.carry.counted_message_ids.iter().cloned().collect(),
+            charged_message_ids: ctx.carry.charged_message_ids.iter().cloned().collect(),
+            charged_order: ctx.carry.charged_message_ids.clone(),
             counted_order: ctx.carry.counted_message_ids.clone(),
             last_uuid: None,
             tail_line: ctx.carry.tail_line,
@@ -803,7 +816,19 @@ impl<'a> Parser<'a> {
         ParseCarry {
             pending_tool_uses: pending,
             counted_message_ids: tail_of(self.counted_order.clone(), CARRY_CAP),
+            charged_message_ids: tail_of(self.charged_order.clone(), CARRY_CAP),
             tail_line: self.tail_line,
+        }
+    }
+
+    /// Claim a message's thinking cost. Returns false if it was already charged, including in
+    /// an earlier incremental run.
+    fn charge_message(&mut self, id: &str) -> bool {
+        if self.charged_message_ids.insert(id.to_string()) {
+            self.charged_order.push(id.to_string());
+            true
+        } else {
+            false
         }
     }
 
@@ -998,6 +1023,7 @@ impl<'a> Parser<'a> {
         let mut counted = id
             .as_deref()
             .is_some_and(|id| self.counted_message_ids.contains(id));
+        let first_emitted = out.len();
 
         for block in msg.content.blocks() {
             match block {
@@ -1038,6 +1064,22 @@ impl<'a> Parser<'a> {
                 }
                 _ => {}
             }
+        }
+
+        // `thinking_tokens` is a per-message total that appears on *some* of the message's
+        // block records — usually the `tool_use` one, not the first to emit — and is repeated
+        // on 1 to 4 of them with the same value. So charge it on a record that actually carries
+        // it, once per message, or the sum is multiplied by however many records repeated it.
+        if let Some(tokens) = msg
+            .usage
+            .as_ref()
+            .and_then(|u| u.output_tokens_details.as_ref())
+            .and_then(|d| d.thinking_tokens)
+            .filter(|n| *n > 0)
+            && let Some(doc) = out.get_mut(first_emitted)
+            && id.as_deref().is_none_or(|id| self.charge_message(id))
+        {
+            doc.thinking_tokens = Some(tokens);
         }
     }
 
@@ -1189,6 +1231,7 @@ impl<'a> Parser<'a> {
                 .or_else(|| self.session.slug.clone()),
             text: p.text,
             thinking: p.thinking,
+            thinking_tokens: p.thinking_tokens,
             raw: raw.to_string(),
         }
     }
@@ -1201,6 +1244,7 @@ struct PartialDoc {
     role: String,
     text: String,
     thinking: Option<String>,
+    thinking_tokens: Option<u64>,
     model: Option<String>,
     tool_name: Option<String>,
     tool_use_id: Option<String>,
@@ -1216,6 +1260,7 @@ impl PartialDoc {
             role: role.to_string(),
             text,
             thinking: None,
+            thinking_tokens: None,
             model: None,
             tool_name: None,
             tool_use_id: None,
@@ -1237,6 +1282,7 @@ impl PartialDoc {
             role: "assistant".to_string(),
             text,
             thinking: None,
+            thinking_tokens: None,
             model: None,
             tool_name,
             tool_use_id,
@@ -1469,6 +1515,50 @@ mod tests {
 
     fn texts(out: &ParseOutput) -> Vec<&str> {
         out.docs.iter().map(|d| d.text.as_str()).collect()
+    }
+
+    /// `thinking_tokens` is a per-message total that appears on only *some* of the message's
+    /// block records — in real transcripts usually the `tool_use` one, not the first to emit —
+    /// and is repeated with the same value on up to four of them. Charging per record would
+    /// multiply the total; keying off "the record that emitted first" would miss it entirely,
+    /// which is how a first attempt at this recovered 20,154 of a real 185,472 tokens.
+    #[test]
+    fn thinking_tokens_are_charged_once_on_a_record_that_carries_them() {
+        let block = |idx: u32, uuid: &str, parent: &str, content: &str, usage: &str| {
+            format!(
+                r#"{{"type":"assistant","uuid":"{uuid}","parentUuid":"{parent}","timestamp":"2026-09-09T19:07:19.248Z","sessionId":"sess-1","cwd":"/home/user/proj","gitBranch":"main","version":"2.1.266","isSidechain":false,"apiBlockIndex":{idx},"requestId":"req1","message":{{"role":"assistant","id":"msg1","model":"claude-opus-5","content":[{content}],"usage":{{"output_tokens":623{usage}}}}}}}"#
+            )
+        };
+        let carries = r#","output_tokens_details":{"thinking_tokens":300}"#;
+        let body = [
+            // Emits first, and does NOT carry the count. (On a stripped transcript this block
+            // emits nothing at all, since the thinking text is empty.)
+            block(
+                0,
+                "a1",
+                "u0",
+                r#"{"type":"text","text":"here is the plan"}"#,
+                "",
+            ),
+            // Carries it.
+            block(
+                1,
+                "a2",
+                "a1",
+                r#"{"type":"tool_use","id":"toolu_1","name":"Bash","input":{"command":"ls"}}"#,
+                carries,
+            ),
+            // Repeats the same value; must not be charged twice.
+            block(2, "a3", "a2", r#"{"type":"text","text":"done"}"#, carries),
+        ]
+        .join("\n")
+            + "\n";
+
+        let tmp = tempfile::tempdir().unwrap();
+        let out = parse_body(tmp.path(), "sess-1.jsonl", &body);
+
+        let charged: Vec<u64> = out.docs.iter().filter_map(|d| d.thinking_tokens).collect();
+        assert_eq!(charged, [300], "one message, one charge, on the carrier");
     }
 
     // -- file-level hazards -------------------------------------------------

@@ -52,6 +52,11 @@ pub struct Filters {
     /// Tool parameter filter as `key=value`, e.g. `--tool-input command=cargo`; repeatable.
     #[arg(long = "tool-input", value_name = "KEY=VALUE")]
     pub tool_input: Vec<String>,
+    /// Only turns where the model spent at least N thinking tokens. Works even where the
+    /// thinking text itself was stripped before it reached disk, which is the case for remote
+    /// and web sessions.
+    #[arg(long, value_name = "N")]
+    pub min_thinking: Option<u64>,
     #[arg(long, value_name = "BRANCH")]
     pub branch: Option<String>,
     #[arg(long, value_name = "MODEL")]
@@ -374,6 +379,15 @@ fn build_query(
 
     if flt.errors_only {
         clauses.push((Occur::Must, flag_query(f.is_error, 1)));
+    }
+    if let Some(min) = flt.min_thinking {
+        clauses.push((
+            Occur::Must,
+            Box::new(RangeQuery::new(
+                std::ops::Bound::Included(Term::from_field_u64(f.thinking_tokens, min)),
+                std::ops::Bound::Unbounded,
+            )),
+        ));
     }
     if flt.sidechains_only {
         clauses.push((Occur::Must, flag_query(f.is_sidechain, 1)));
@@ -814,6 +828,7 @@ pub fn doc_from_stored(f: &Fields, stored: &TantivyDocument) -> Doc {
         slug: s(f.slug),
         text: s(f.text).unwrap_or_default(),
         thinking: s(f.thinking),
+        thinking_tokens: u(f.thinking_tokens),
         raw: s(f.raw).unwrap_or_default(),
     }
 }
@@ -917,6 +932,7 @@ pub(crate) mod testkit {
             slug: None,
             text: String::new(),
             thinking: None,
+            thinking_tokens: None,
             raw: "{}".into(),
         }
     }

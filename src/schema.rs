@@ -40,6 +40,7 @@ pub struct Fields {
     pub tool_input: tantivy::schema::Field,
     pub text: tantivy::schema::Field,
     pub thinking: tantivy::schema::Field,
+    pub thinking_tokens: tantivy::schema::Field,
     pub timestamp: tantivy::schema::Field,
     pub seq: tantivy::schema::Field,
     pub is_error: tantivy::schema::Field,
@@ -94,6 +95,9 @@ pub fn build_schema() -> (Schema, Fields) {
 
     let text = sb.add_text_field("text", TEXT | STORED);
     let thinking = sb.add_text_field("thinking", TEXT | STORED);
+    // Fast so it can be faceted and range-filtered; this is the only measure of reasoning that
+    // survives on machines where the thinking text is stripped.
+    let thinking_tokens = sb.add_u64_field("thinking_tokens", FAST | STORED | INDEXED);
 
     let timestamp = sb.add_date_field("timestamp", INDEXED | STORED | FAST);
     let seq = sb.add_u64_field("seq", INDEXED | STORED | FAST);
@@ -130,6 +134,7 @@ pub fn build_schema() -> (Schema, Fields) {
         tool_input,
         text,
         thinking,
+        thinking_tokens,
         timestamp,
         seq,
         is_error,
@@ -212,6 +217,11 @@ pub fn doc_to_json(doc: &Doc, include_thinking: bool) -> Value {
         };
         o.insert("tool_input".to_string(), value);
     }
+    if let Some(n) = doc.thinking_tokens {
+        // Not gated on include_thinking: this is metadata about the turn, not thinking text,
+        // and it is the only thing left when the text was stripped before it reached disk.
+        o.insert("thinking_tokens".to_string(), json!(n));
+    }
     if include_thinking && let Some(t) = doc.thinking.as_deref().filter(|s| !s.is_empty()) {
         o.insert("thinking".to_string(), json!(t));
     }
@@ -263,6 +273,7 @@ mod tests {
             slug: Some("wild-spinning-puppy".into()),
             text: "cargo build".into(),
             thinking: Some("hmm".into()),
+            thinking_tokens: None,
             raw: "{}".into(),
         }
     }
