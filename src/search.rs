@@ -113,6 +113,50 @@ pub struct FacetCount {
     pub count: u64,
 }
 
+/// A terms aggregation plus the context needed to read it honestly.
+///
+/// The bucket list alone is misleading on a high-cardinality field: summing the returned
+/// buckets answers "how many documents are in the rows I am showing you", which a caller
+/// naturally misreads as "how many documents matched". On `tool_input.command` those differ by
+/// 50x. So the counts a caller needs to interpret the buckets travel with them.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct FacetResult {
+    pub field: String,
+    pub values: Vec<FacetCount>,
+    /// Documents matching the query and filters. **Not** the sum of `values`.
+    pub matching_docs: u64,
+    /// Of those, the ones that actually carry a value for this field.
+    pub docs_with_value: u64,
+    /// Documents whose value fell outside the returned buckets (`sum_other_doc_count`).
+    pub other_docs: u64,
+    /// Approximate count of distinct values (HyperLogLog), over the matching set.
+    pub distinct: Option<u64>,
+}
+
+impl FacetResult {
+    /// True when the values barely repeat, so a bucket list is just a sample of a long tail.
+    ///
+    /// Shell commands are the motivating case: they are near-unique strings, so faceting them
+    /// returns a list rather than a distribution. Such a field wants full-text search, and
+    /// `tool_input` is indexed for exactly that. The threshold is deliberately loose — this
+    /// drives a hint, not behaviour.
+    pub fn is_search_shaped(&self) -> bool {
+        match self.distinct {
+            Some(distinct) if self.docs_with_value >= 20 => {
+                distinct as f64 >= 0.8 * self.docs_with_value as f64
+            }
+            _ => false,
+        }
+    }
+
+    /// Values not shown, as an approximation. `None` when everything fit.
+    pub fn hidden_values(&self) -> Option<u64> {
+        let distinct = self.distinct?;
+        let shown = self.values.len() as u64;
+        (distinct > shown).then(|| distinct - shown)
+    }
+}
+
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct Hit {
     pub doc: Doc,
@@ -124,7 +168,7 @@ pub struct Hit {
 pub struct SearchResponse {
     pub hits: Vec<Hit>,
     pub total: usize,
-    pub facets: BTreeMap<String, Vec<FacetCount>>,
+    pub facets: BTreeMap<String, FacetResult>,
     pub elapsed_ms: u128,
 }
 
@@ -172,7 +216,7 @@ pub fn search(
         for (i, name) in facet_fields.iter().enumerate() {
             facets.insert(
                 (*name).to_string(),
-                buckets_from(&as_json, &agg_key(i), req.facet_top),
+                facet_result_from(&as_json, i, name, req.facet_top, total as u64),
             );
         }
     }
@@ -239,15 +283,23 @@ pub fn facets(
     f: &Fields,
     field: &str,
     req: &SearchRequest,
-) -> anyhow::Result<Vec<FacetCount>> {
+) -> anyhow::Result<FacetResult> {
     let schema = index.schema();
     validate_agg_field(&schema, field)?;
     let searcher = index.reader()?.searcher();
     let query = build_query(index, f, req)?;
     let collector = agg_collector(&[field], req.facet_top);
-    let agg = searcher.search(&query, &collector)?;
+    // `Count` rides along so the reported total is documents matched, not the sum of the rows
+    // that happened to fit under `--top`.
+    let (matching, agg) = searcher.search(&query, &(Count, collector))?;
     let as_json = serde_json::to_value(agg).context("serializing aggregation result")?;
-    Ok(buckets_from(&as_json, &agg_key(0), req.facet_top))
+    Ok(facet_result_from(
+        &as_json,
+        0,
+        field,
+        req.facet_top,
+        matching as u64,
+    ))
 }
 
 // ---------------------------------------------------------------------------
@@ -549,6 +601,10 @@ fn parse_relative(s: &str) -> Option<i64> {
 // aggregations
 // ---------------------------------------------------------------------------
 
+fn card_key(i: usize) -> String {
+    format!("c{i}")
+}
+
 fn agg_key(i: usize) -> String {
     // Facet field names carry dots (`tool_input.file_path`); positional keys keep the
     // aggregation request JSON unambiguous.
@@ -563,10 +619,44 @@ fn agg_collector(fields: &[&str], top: usize) -> AggregationCollector {
             agg_key(i),
             json!({ "terms": { "field": field, "size": size } }),
         );
+        // Distinct-value count rides along in the same pass; it is what tells a caller that a
+        // field is a long tail rather than a distribution.
+        req.insert(card_key(i), json!({ "cardinality": { "field": field } }));
     }
     let aggs: Aggregations = serde_json::from_value(Value::Object(req))
         .expect("terms aggregation request is well-formed");
     AggregationCollector::from_aggs(aggs, Default::default())
+}
+
+/// Assemble the buckets and the counts needed to read them, for facet `i` of a request.
+fn facet_result_from(
+    result: &Value,
+    i: usize,
+    field: &str,
+    top: usize,
+    matching_docs: u64,
+) -> FacetResult {
+    let values = buckets_from(result, &agg_key(i), top);
+    let other_docs = result
+        .get(agg_key(i))
+        .and_then(|v| v.get("sum_other_doc_count"))
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    // The cardinality metric is a float in the aggregation JSON, and absent when the field has
+    // no values at all in the matching set.
+    let distinct = result
+        .get(card_key(i))
+        .and_then(|v| v.get("value"))
+        .and_then(Value::as_f64)
+        .map(|v| v.round() as u64);
+    FacetResult {
+        field: field.to_string(),
+        docs_with_value: values.iter().map(|f| f.count).sum::<u64>() + other_docs,
+        matching_docs,
+        other_docs,
+        distinct,
+        values,
+    }
 }
 
 /// A terms aggregation may be keyed on a string (text fast fields, JSON subpaths) or on a
@@ -938,6 +1028,91 @@ mod tests {
         }
     }
 
+    /// The bug this guards: the facet total used to be the sum of the returned buckets, so a
+    /// field with 60 near-unique values reported "3 docs" under `--top 3` when 60 matched.
+    #[test]
+    fn a_truncated_facet_reports_matching_docs_not_the_visible_rows() {
+        let mut docs = Vec::new();
+        for i in 0..60u64 {
+            let mut d = blank_doc(i);
+            d.kind = DocKind::ToolCall;
+            d.role = "assistant".into();
+            d.tool_name = Some("Bash".into());
+            d.tool_use_id = Some(format!("toolu_{i}"));
+            // Near-unique, like real shell commands.
+            d.tool_input = Some(json!({ "command": format!("cargo test --test case_{i}") }));
+            d.text = format!("cargo test --test case_{i}");
+            docs.push(d);
+        }
+        let (index, fields) = index_docs(&docs);
+
+        let request = SearchRequest {
+            facet_top: 3,
+            ..SearchRequest::default()
+        };
+        let r = facets(&index, &fields, "tool_input.command", &request).unwrap();
+
+        assert_eq!(r.values.len(), 3, "only --top rows come back");
+        assert_eq!(r.matching_docs, 60, "every doc matched the empty query");
+        assert_eq!(r.docs_with_value, 60, "every doc carries a command");
+        assert_eq!(
+            r.other_docs, 57,
+            "the docs behind the rows that did not fit are still counted"
+        );
+        // Cardinality is a HyperLogLog estimate; exact at this size, so allow a little slack.
+        let distinct = r
+            .distinct
+            .expect("cardinality rides along with the terms agg");
+        assert!((55..=60).contains(&distinct), "distinct was {distinct}");
+        assert!(
+            r.is_search_shaped(),
+            "60 distinct values over 60 docs is a long tail, not a distribution"
+        );
+    }
+
+    /// The other side of the same judgement: a field that genuinely repeats must not be
+    /// labelled search-shaped, or the hint becomes noise.
+    #[test]
+    fn a_repeating_field_is_not_flagged_as_search_shaped() {
+        let mut docs = Vec::new();
+        for i in 0..60u64 {
+            let mut d = blank_doc(i);
+            d.kind = DocKind::ToolCall;
+            d.role = "assistant".into();
+            d.tool_name = Some(if i % 2 == 0 { "Bash" } else { "Read" }.into());
+            d.tool_use_id = Some(format!("toolu_{i}"));
+            d.text = "tool call".into();
+            docs.push(d);
+        }
+        let (index, fields) = index_docs(&docs);
+
+        let r = facets(&index, &fields, "tool_name", &SearchRequest::default()).unwrap();
+
+        assert_eq!(r.values.len(), 2);
+        assert_eq!(r.matching_docs, 60);
+        assert_eq!(r.other_docs, 0);
+        assert_eq!(r.distinct, Some(2));
+        assert!(
+            !r.is_search_shaped(),
+            "two values over 60 docs is a distribution"
+        );
+    }
+
+    /// Facet counts must describe the filtered set, not the whole index.
+    #[test]
+    fn facet_totals_follow_the_active_filters() {
+        let (index, fields) = index_docs(&corpus());
+        let mut request = SearchRequest::default();
+        request.filters.tool = vec!["Bash".into()];
+        let r = facets(&index, &fields, "tool_name", &request).unwrap();
+        assert!(
+            r.matching_docs > 0 && r.matching_docs < corpus().len() as u64,
+            "matching_docs {} should be the filtered subset",
+            r.matching_docs
+        );
+        assert_eq!(r.values.len(), 1, "only Bash survives the filter");
+    }
+
     #[test]
     fn free_text_matches_and_ranks() {
         let (index, f) = index_docs(&corpus());
@@ -1096,7 +1271,7 @@ mod tests {
         let r = search(&index, &f, &r0).unwrap();
         assert!(r.hits.is_empty(), "{:?}", texts(&r));
         assert_eq!(r.total, 3);
-        assert!(!r.facets["role"].is_empty());
+        assert!(!r.facets["role"].values.is_empty());
     }
 
     #[test]
@@ -1192,12 +1367,20 @@ mod tests {
     fn facets_on_a_plain_fast_field() {
         let (index, f) = index_docs(&corpus());
         let counts = facets(&index, &f, "tool_name", &SearchRequest::default()).unwrap();
-        let map: BTreeMap<_, _> = counts.iter().map(|c| (c.value.as_str(), c.count)).collect();
+        let map: BTreeMap<_, _> = counts
+            .values
+            .iter()
+            .map(|c| (c.value.as_str(), c.count))
+            .collect();
         assert_eq!(map.get("Bash"), Some(&2));
         assert_eq!(map.get("Read"), Some(&1));
 
         let counts = facets(&index, &f, "project", &SearchRequest::default()).unwrap();
-        let map: BTreeMap<_, _> = counts.iter().map(|c| (c.value.as_str(), c.count)).collect();
+        let map: BTreeMap<_, _> = counts
+            .values
+            .iter()
+            .map(|c| (c.value.as_str(), c.count))
+            .collect();
         assert_eq!(map.get("/home/user/session-search"), Some(&6));
         assert_eq!(map.get("/home/user/other-project"), Some(&1));
     }
@@ -1206,7 +1389,11 @@ mod tests {
     fn facets_on_a_json_subpath_never_named_in_the_schema() {
         let (index, f) = index_docs(&corpus());
         let counts = facets(&index, &f, "tool_input.command", &SearchRequest::default()).unwrap();
-        let map: BTreeMap<_, _> = counts.iter().map(|c| (c.value.as_str(), c.count)).collect();
+        let map: BTreeMap<_, _> = counts
+            .values
+            .iter()
+            .map(|c| (c.value.as_str(), c.count))
+            .collect();
         // Aggregations key on the raw, untokenized value: whole commands, not words.
         assert_eq!(map.get("cargo build --release"), Some(&1));
         assert_eq!(map.get("cargo test"), Some(&1));
@@ -1218,8 +1405,11 @@ mod tests {
             &SearchRequest::default(),
         )
         .unwrap();
-        assert_eq!(counts.len(), 1);
-        assert_eq!(counts[0].value, "/home/user/session-search/src/index.rs");
+        assert_eq!(counts.values.len(), 1);
+        assert_eq!(
+            counts.values[0].value,
+            "/home/user/session-search/src/index.rs"
+        );
     }
 
     #[test]
@@ -1228,8 +1418,8 @@ mod tests {
         let mut r0 = req("cargo");
         r0.filters.errors_only = true;
         let counts = facets(&index, &f, "tool_input.command", &r0).unwrap();
-        assert_eq!(counts.len(), 1);
-        assert_eq!(counts[0].value, "cargo test");
+        assert_eq!(counts.values.len(), 1);
+        assert_eq!(counts.values[0].value, "cargo test");
     }
 
     #[test]
@@ -1244,10 +1434,14 @@ mod tests {
         assert_eq!(r.hits.len(), 3);
         assert_eq!(r.facets.len(), 2);
         assert_eq!(
-            r.facets["tool_name"].iter().map(|c| c.count).sum::<u64>(),
+            r.facets["tool_name"]
+                .values
+                .iter()
+                .map(|c| c.count)
+                .sum::<u64>(),
             3
         );
-        assert_eq!(r.facets["tool_input.command"].len(), 2);
+        assert_eq!(r.facets["tool_input.command"].values.len(), 2);
     }
 
     #[test]
@@ -1560,10 +1754,13 @@ mod tests {
 
         // Facets over a declared field and over a parameter key that is not in the schema.
         let tools = facets(&index, &f, "tool_name", &SearchRequest::default()).unwrap();
-        assert!(tools.iter().any(|c| c.value == "Bash"));
+        assert!(tools.values.iter().any(|c| c.value == "Bash"));
         let commands = facets(&index, &f, "tool_input.command", &SearchRequest::default()).unwrap();
         assert!(
-            commands.iter().any(|c| c.value.starts_with("ls -la")),
+            commands
+                .values
+                .iter()
+                .any(|c| c.value.starts_with("ls -la")),
             "{commands:?}"
         );
     }

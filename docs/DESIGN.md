@@ -352,16 +352,32 @@ pub struct SearchRequest {
     pub facet_top: usize, pub snippet_chars: usize, pub include_thinking: bool,
 }
 pub struct FacetCount { pub value: String, pub count: u64 }
+/// Buckets plus the counts needed to read them honestly. Summing `values` answers "how many
+/// docs are in the rows shown", which reads as "how many matched" and is wrong by 50x on a
+/// high-cardinality field like `tool_input.command`.
+pub struct FacetResult {
+    pub field: String, pub values: Vec<FacetCount>,
+    pub matching_docs: u64,      // docs matching query+filters; NOT the sum of `values`
+    pub docs_with_value: u64,    // of those, the ones carrying a value for this field
+    pub other_docs: u64,         // sum_other_doc_count: docs outside the returned buckets
+    pub distinct: Option<u64>,   // approximate distinct values (cardinality agg)
+}
+impl FacetResult {
+    /// Values barely repeat, so the bucket list is a sample of a long tail. Drives a hint
+    /// steering the caller to full-text search; `tool_input` is indexed for exactly that.
+    pub fn is_search_shaped(&self) -> bool;
+    pub fn hidden_values(&self) -> Option<u64>;
+}
 pub struct Hit { pub doc: Doc, pub score: f32, pub snippet: String }
 pub struct SearchResponse {
     pub hits: Vec<Hit>, pub total: usize,
-    pub facets: BTreeMap<String, Vec<FacetCount>>, pub elapsed_ms: u128,
+    pub facets: BTreeMap<String, FacetResult>, pub elapsed_ms: u128,
 }
 /// The inverse of `schema::doc_to_json` — the one way to read a `Doc` back out of the index.
 pub fn doc_from_stored(f: &Fields, stored: &tantivy::TantivyDocument) -> Doc;
 pub fn search(index: &tantivy::Index, f: &Fields, req: &SearchRequest) -> anyhow::Result<SearchResponse>;
 pub fn facets(index: &tantivy::Index, f: &Fields, field: &str, req: &SearchRequest)
-    -> anyhow::Result<Vec<FacetCount>>;
+    -> anyhow::Result<FacetResult>;
 ```
 
 Query semantics: the free-text query goes through `QueryParser` over `text` (+ `thinking` when
@@ -402,7 +418,7 @@ pub fn search_results(w: &mut impl Write, r: &SearchResponse, o: &OutputOpts) ->
 /// `search_results` is the `context: &[]` case of this.
 pub fn search_results_ctx(w: &mut impl Write, r: &SearchResponse, context: &[Vec<Doc>],
                           o: &OutputOpts) -> anyhow::Result<()>;
-pub fn facet_list(w: &mut impl Write, field: &str, c: &[FacetCount], o: &OutputOpts) -> anyhow::Result<()>;
+pub fn facet_list(w: &mut impl Write, r: &FacetResult, o: &OutputOpts) -> anyhow::Result<()>;
 pub fn session_view(w: &mut impl Write, docs: &[Doc], o: &OutputOpts) -> anyhow::Result<()>;
 pub fn session_list(w: &mut impl Write, s: &[SessionInfo], o: &OutputOpts) -> anyhow::Result<()>;
 pub fn stats(w: &mut impl Write, s: &IndexStats, o: &OutputOpts) -> anyhow::Result<()>;

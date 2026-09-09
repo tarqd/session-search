@@ -281,8 +281,8 @@ fn dispatch(
                 snippet_chars: SNIPPET_CHARS,
                 ..SearchRequest::default()
             };
-            let counts = search::facets(&index, &fields, &field, &request)?;
-            format::facet_list(out, &field, &counts, &opts)
+            let result = search::facets(&index, &fields, &field, &request)?;
+            format::facet_list(out, &result, &opts)
         }
 
         Command::Show {

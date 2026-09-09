@@ -288,19 +288,20 @@ session-search facets tool_name
 ```
 
 ```
-tool_name  12 values · 491 total
-  Bash              449  ████████████████████████████████████████
-  Read               15  █
+tool_name  13 values · 756 of 978 matching docs have a value
+  Bash              624  ████████████████████████████████████████
+  Edit               75  █████
+  Read               24  ██
+  Write              10  █
   WebFetch            8  █
-  Write               6  █
-  ToolSearch          4  █
+  ToolSearch          5  █
   AskUserQuestion     2  █
+  StructuredOutput    2  █
   Agent               2  █
   Skill               1  █
-  Workflow            1  █
+  TaskList            1  █
   ExitPlanMode        1  █
-  StructuredOutput    1  █
-  Edit                1  █
+  Workflow            1  █
 ```
 
 Now descend into a *parameter*. Which files does this project actually churn?
@@ -310,15 +311,17 @@ session-search facets tool_input.file_path --top 10
 ```
 
 ```
-tool_input.file_path  8 values · 22 total
-  /home/user/session-search/docs/DESIGN.md          8  █████████████████████████████████████
-  /home/user/session-search/docs/TRANSCRIPT-FORMA…  6  ████████████████████████████
-  /home/user/session-search/src/index.rs            2  █████████
-  /root/.claude/plans/wild-spinning-puppy.md        2  █████████
-  /home/user/session-search/src/search.rs           1  █████
-  /home/user/session-search/README.md               1  █████
-  /home/user/session-search/src/context.rs          1  █████
-  /tmp/claude-0/-home-user-session-search/b20208d…  1  █████
+tool_input.file_path  showing 10 of ~19 values · 109 of 978 matching docs have a value
+  /home/user/session-search/src/parse.rs            27  ████████████████████████████████████████
+  /home/user/session-search/src/index.rs            21  ███████████████████████████████
+  /home/user/session-search/src/search.rs           12  ██████████████████
+  /home/user/session-search/docs/DESIGN.md           9  █████████████
+  /home/user/session-search/src/format.rs            8  ████████████
+  /home/user/session-search/src/cli.rs               7  ██████████
+  /home/user/session-search/docs/TRANSCRIPT-FORMA…   6  █████████
+  /home/user/session-search/src/context.rs           4  ██████
+  /root/.claude/plans/wild-spinning-puppy.md         2  ███
+  /home/user/session-search/README.md                2  ███
 ```
 
 `file_path` is a `Read`/`Write`/`Edit` parameter. `command` is a `Bash` parameter. Same query,
@@ -329,16 +332,32 @@ session-search facets tool_input.command --tool Bash --top 8
 ```
 
 ```
-tool_input.command  8 values · 12 total
-  cargo check --all-targets 2>&1 | tail -20         2  █████████████████████████████████████
-  cargo test 2>&1 | tail -25                        2  █████████████████████████████████████
-  cargo check --all-targets 2>&1 | tail -40         2  █████████████████████████████████████
-  cargo build --release 2>&1 | tail -5              2  █████████████████████████████████████
-  grep -n "fn corpus" -A 40 src/search.rs | head …  1  ███████████████████
-  cargo fmt -- --check 2>&1 | head -40              1  ███████████████████
-  cargo test --test adversarial 2>&1 | tail -80     1  ███████████████████
-  cargo test 2>&1 | tail -12; cargo clippy --all-…  1  ███████████████████
+tool_input.command  showing 8 of ~622 values · 624 of 624 matching docs have a value
+  cargo check --all-targets 2>&1 | tail -20         2  ████████████████████████████████████████
+  cargo check --all-targets 2>&1 | tail -40         2  ████████████████████████████████████████
+  cargo build --release 2>&1 | tail -5              2  ████████████████████████████████████████
+  bash /tmp/claude-0/-home-user-session-search/b2…  2  ████████████████████████████████████████
+  cargo build --lib 2>&1 | grep -E "^(error|warni…  2  ████████████████████████████████████████
+  for c in index search facets show sessions stat…  1  ████████████████████
+  S=/tmp/claude-0/-home-user-session-search/b2020…  1  ████████████████████
+  S=/tmp/claude-0/-home-user-session-search/b2020…  1  ████████████████████
+  note: ~622 distinct values across 624 docs — this field is search-shaped, not facet-shaped.
+        try:  search 'tool_input.command:"<text>"'
 ```
+
+That `note:` line is the tool telling you it is the wrong instrument. Shell commands are
+near-unique strings — 622 distinct values across 624 calls — so bucketing them returns a *list*,
+not a distribution. Compare `file_path` above, where paths genuinely repeat and the counts mean
+something. When a field is a long tail like this, search it instead:
+
+```bash
+session-search search 'tool_input.command:"cargo test"'
+```
+
+`tool_input` is full-text indexed, so every parameter is searchable whether or not it is worth
+faceting. Nothing derives an "executable name" facet from a command, because doing that honestly
+would mean parsing shell grammar — `FOO=bar cmd`, `cd x && cargo build`, subshells, quoting — and
+a wrong bucket is worse than no bucket.
 
 Numeric parameters work exactly the same way — here, the timeouts the agent picked for its Bash
 calls:
@@ -348,12 +367,12 @@ session-search facets tool_input.timeout
 ```
 
 ```
-tool_input.timeout  5 values · 119 total
-  600000  98  ████████████████████████████████████████
-  300000  18  ███████
-  420000   1  █
-  540000   1  █
-  180000   1  █
+tool_input.timeout  5 values · 210 of 978 matching docs have a value
+  600000  189  ████████████████████████████████████████
+  300000   18  ████
+  420000    1  █
+  540000    1  █
+  180000    1  █
 ```
 
 Facets also take a `--query`, which restricts the counted set to matching documents — "when the
@@ -364,15 +383,17 @@ session-search facets tool_name --query "tantivy"
 ```
 
 ```
-tool_name  8 values · 141 total
-  Bash             118  ████████████████████████████████████████
-  Read               9  ███
-  Write              5  ██
-  WebFetch           4  █
-  AskUserQuestion    2  █
-  Workflow           1  █
-  ExitPlanMode       1  █
-  Agent              1  █
+tool_name  10 values · 195 of 236 matching docs have a value
+  Bash              157  ████████████████████████████████████████
+  Read               16  ████
+  Edit                7  ██
+  Write               5  █
+  WebFetch            4  █
+  AskUserQuestion     2  █
+  StructuredOutput    1  █
+  ExitPlanMode        1  █
+  Workflow            1  █
+  Agent               1  █
 ```
 
 The declared fast fields — `tool_name`, `project`, `model`, `git_branch`, `role`, `kind`,
@@ -383,9 +404,9 @@ session-search facets agent_type
 ```
 
 ```
-agent_type  2 values · 522 total
-  workflow-subagent  428  ████████████████████████████████████████
-  Explore             94  █████████
+agent_type  2 values · 895 of 978 matching docs have a value
+  workflow-subagent  789  ████████████████████████████████████████
+  Explore            106  █████
 ```
 
 ```bash
@@ -393,9 +414,9 @@ session-search facets kind
 ```
 
 ```
-kind  2 values · 646 total
-  tool_call  493  ████████████████████████████████████████
-  message    153  ████████████
+kind  2 values · 978 of 978 matching docs have a value
+  tool_call  756  ████████████████████████████████████████
+  message    222  ████████████
 ```
 
 And `search --facets a,b` returns hits and aggregations in one pass, so a single call answers
@@ -405,6 +426,12 @@ And `search --facets a,b` returns hits and aggregations in one pass, so a single
 > inside it.** So `facets tool_input.command` shows whole command lines, while
 > `search --tool-input command=cargo` matches any command *containing* `cargo`. That is
 > deliberate — it is what makes both the counting and the searching useful.
+
+> The facet header reads `showing N of ~D values · V of M matching docs have a value`. `M` is the
+> size of the match set, `V` how many of those carry the field at all, and `~D` an estimate of the
+> distinct values (HyperLogLog, hence the tilde). Summing the printed rows is **not** the total —
+> on a long-tail field the visible rows can be a fraction of a percent of the matches. The JSON
+> carries the same four numbers as `matching_docs`, `docs_with_value`, `other_docs` and `distinct`.
 
 ---
 
@@ -722,11 +749,11 @@ session-search facets role
 ```
 
 ```
-role  4 values · 646 total
-  assistant   550  ████████████████████████████████████████
-  attachment   79  ██████
-  user         16  █
-  system        1  █
+role  4 values · 978 of 978 matching docs have a value
+  assistant   860  ████████████████████████████████████████
+  attachment   95  ████
+  user         18  █
+  system        5  █
 ```
 
 ### Incremental
@@ -846,11 +873,6 @@ the waiting document so a late result can complete it, but it refuses to hold on
 `state.json` is rewritten on every run and must not grow to contain a copy of an enormous `Write`
 payload. Such a call is still indexed exactly once, with its name and input; only the result text
 waits for `index --full`.
-
-**`facets --top N` counts only the buckets it prints.** The header says `8 values · 12 docs
-listed`, and the JSON `total` means the same thing: the sum of the listed buckets, not the size of
-the match set. A terms aggregation is truncated to `--top`, and Tantivy's `sum_other_doc_count`
-is not plumbed through. Raise `--top`, or read `total` from `search --json`.
 
 **`stats` reuses the indexer's stat block.** It prints `files updated 0`, `documents deleted 0`
 and `elapsed 0 ms` — meaningless for a static read — and labels the index's document count as

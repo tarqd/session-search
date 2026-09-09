@@ -25,7 +25,7 @@ use serde_json::{Value, json};
 
 use crate::index::IndexStats;
 use crate::parse::{Doc, SessionInfo};
-use crate::search::{FacetCount, Hit, SearchResponse};
+use crate::search::{FacetResult, Hit, SearchResponse};
 
 /// The marker `search.rs` wraps matched spans in. Identical on both sides, so splitting on it
 /// yields alternating plain/highlighted segments.
@@ -263,9 +263,9 @@ fn human_search(
     }
 
     if !r.facets.is_empty() {
-        for (field, counts) in &r.facets {
+        for facet in r.facets.values() {
             writeln!(w)?;
-            facet_list(w, field, counts, o)?;
+            facet_list(w, facet, o)?;
         }
     }
     Ok(())
@@ -402,32 +402,33 @@ fn write_context(
 /// documents the query matched: a terms aggregation is truncated to `--top N`, so a field with
 /// more values than that has documents in buckets nobody asked for. The label says "listed" so
 /// the number is not read as a corpus total.
-pub fn facet_list(w: &mut impl Write, field: &str, c: &[FacetCount], o: &OutputOpts) -> Result<()> {
-    let total: u64 = c.iter().map(|f| f.count).sum();
+pub fn facet_list(w: &mut impl Write, r: &FacetResult, o: &OutputOpts) -> Result<()> {
+    let field = r.field.as_str();
+    let c = &r.values;
     if o.json {
-        return json_line(
-            w,
-            &json!({
-                "field": field,
-                "count": c.len(),
-                "total": total,
-                "values": c,
-            }),
-        );
+        return json_line(w, &json!(r));
     }
 
     let ink = Ink::new(o.color);
     let cols = o.cols();
+    // Say what is shown out of what exists. Summing the visible rows and calling it the total
+    // is how a 618-value field reads as an 11-document one.
+    let shown = match r.distinct {
+        Some(distinct) if distinct > c.len() as u64 => {
+            format!("showing {} of ~{distinct} values", c.len())
+        }
+        _ => format!("{} value{}", c.len(), if c.len() == 1 { "" } else { "s" }),
+    };
     writeln!(
         w,
         "{}  {}",
         ink.paint(field, bold()),
         ink.paint(
             &format!(
-                "{} value{} · {total} doc{} listed",
-                c.len(),
-                if c.len() == 1 { "" } else { "s" },
-                if total == 1 { "" } else { "s" }
+                "{shown} · {} of {} matching doc{} have a value",
+                r.docs_with_value,
+                r.matching_docs,
+                if r.matching_docs == 1 { "" } else { "s" }
             ),
             dim()
         )
@@ -467,6 +468,33 @@ pub fn facet_list(w: &mut impl Write, field: &str, c: &[FacetCount], o: &OutputO
             " ".repeat(pad),
             ink.paint(&format!("{:>count_w$}", f.count), bold()),
             ink.paint(&"█".repeat(filled), bar_style()),
+        )?;
+    }
+
+    // A field whose values barely repeat has no distribution to show. Say so, and point at the
+    // thing that does work — `tool_input` is full-text indexed, so the values are searchable
+    // even when they are useless as buckets.
+    if r.is_search_shaped() {
+        let distinct = r.distinct.unwrap_or_default();
+        writeln!(
+            w,
+            "  {}",
+            ink.paint(
+                &format!(
+                    "note: ~{distinct} distinct values across {} docs — this field is \
+                     search-shaped, not facet-shaped.",
+                    r.docs_with_value
+                ),
+                dim()
+            )
+        )?;
+        writeln!(
+            w,
+            "  {}",
+            ink.paint(
+                &format!("      try:  search '{}:\"<text>\"'", r.field),
+                dim()
+            )
         )?;
     }
     Ok(())
@@ -917,7 +945,7 @@ fn scalar(v: &Value) -> String {
 }
 
 /// Facet counts as a map, for callers that already hold a `BTreeMap` shape.
-pub fn facets_json(facets: &BTreeMap<String, Vec<FacetCount>>) -> Value {
+pub fn facets_json(facets: &BTreeMap<String, FacetResult>) -> Value {
     json!(facets)
 }
 
@@ -928,6 +956,22 @@ pub fn facets_json(facets: &BTreeMap<String, Vec<FacetCount>>) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    use crate::search::FacetCount;
+
+    /// Wrap bare bucket counts as a `FacetResult`, as if every matching doc carried a value and
+    /// nothing was truncated. Tests that care about truncation or cardinality build their own.
+    fn fr(field: &str, values: Vec<FacetCount>) -> FacetResult {
+        let docs: u64 = values.iter().map(|f| f.count).sum();
+        FacetResult {
+            field: field.to_string(),
+            distinct: Some(values.len() as u64),
+            matching_docs: docs,
+            docs_with_value: docs,
+            other_docs: 0,
+            values,
+        }
+    }
     use crate::parse::DocKind;
 
     /// 2026-09-09T19:07:19Z — fixed so every rendering assertion is reproducible.
@@ -1032,16 +1076,19 @@ mod tests {
         r.total = 42;
         r.facets.insert(
             "tool_name".into(),
-            vec![
-                FacetCount {
-                    value: "Bash".into(),
-                    count: 64,
-                },
-                FacetCount {
-                    value: "Read".into(),
-                    count: 8,
-                },
-            ],
+            fr(
+                "tool_name",
+                vec![
+                    FacetCount {
+                        value: "Bash".into(),
+                        count: 64,
+                    },
+                    FacetCount {
+                        value: "Read".into(),
+                        count: 8,
+                    },
+                ],
+            ),
         );
         r
     }
@@ -1056,8 +1103,9 @@ mod tests {
         assert_eq!(v["total"], 42);
         assert_eq!(v["count"], 2);
         assert_eq!(v["elapsed_ms"], 7);
-        assert_eq!(v["facets"]["tool_name"][0]["value"], "Bash");
-        assert_eq!(v["facets"]["tool_name"][0]["count"], 64);
+        assert_eq!(v["facets"]["tool_name"]["values"][0]["value"], "Bash");
+        assert_eq!(v["facets"]["tool_name"]["values"][0]["count"], 64);
+        assert_eq!(v["facets"]["tool_name"]["matching_docs"], 72);
         assert_eq!(v["hits"].as_array().unwrap().len(), 2);
     }
 
@@ -1153,12 +1201,16 @@ mod tests {
                 count: 8,
             },
         ];
-        let out = render(|w| facet_list(w, "tool_name", &counts, &json_opts()));
+        let out = render(|w| facet_list(w, &fr("tool_name", counts.to_vec()), &json_opts()));
         let v: Value = serde_json::from_str(&out).unwrap();
         assert_eq!(v["field"], "tool_name");
-        assert_eq!(v["count"], 2);
-        assert_eq!(v["total"], 72);
         assert_eq!(v["values"][1]["value"], "Read");
+        // The counts a caller needs to read the buckets honestly, rather than a `total` that
+        // is really just the sum of the visible rows.
+        assert_eq!(v["matching_docs"], 72);
+        assert_eq!(v["docs_with_value"], 72);
+        assert_eq!(v["other_docs"], 0);
+        assert_eq!(v["distinct"], 2);
     }
 
     #[test]
@@ -1288,7 +1340,7 @@ mod tests {
         assert_eq!(out.trim(), "no documents");
         let out = render(|w| session_list(w, &[], &plain()));
         assert_eq!(out.trim(), "no sessions indexed");
-        let out = render(|w| facet_list(w, "tool_name", &[], &plain()));
+        let out = render(|w| facet_list(w, &fr("tool_name", vec![]), &plain()));
         assert!(out.contains("(none)"), "{out}");
     }
 
@@ -1333,10 +1385,12 @@ mod tests {
                 count: 1,
             },
         ];
-        let out = render(|w| facet_list(w, "tool_name", &counts, &plain()));
+        let out = render(|w| facet_list(w, &fr("tool_name", counts.to_vec()), &plain()));
         let lines: Vec<&str> = out.lines().collect();
-        // "listed", not "total": a terms aggregation is truncated to `--top N`.
-        assert!(lines[0].contains("3 values · 97 docs listed"), "{out}");
+        assert!(
+            lines[0].contains("3 values · 97 of 97 matching docs have a value"),
+            "{out}"
+        );
         let bar = |line: &str| line.matches('█').count();
         assert!(bar(lines[1]) > bar(lines[2]), "counts scale the bar");
         assert!(
@@ -1496,21 +1550,23 @@ mod tests {
             "{}",
             render(|w| facet_list(
                 w,
-                "tool_input.file_path",
-                &[
-                    FacetCount {
-                        value: "/home/user/session-search/src/search.rs".into(),
-                        count: 12
-                    },
-                    FacetCount {
-                        value: "/home/user/session-search/src/format.rs".into(),
-                        count: 5
-                    },
-                    FacetCount {
-                        value: "/home/user/session-search/Cargo.toml".into(),
-                        count: 1
-                    },
-                ],
+                &fr(
+                    "tool_input.file_path",
+                    vec![
+                        FacetCount {
+                            value: "/home/user/session-search/src/search.rs".into(),
+                            count: 12
+                        },
+                        FacetCount {
+                            value: "/home/user/session-search/src/format.rs".into(),
+                            count: 5
+                        },
+                        FacetCount {
+                            value: "/home/user/session-search/Cargo.toml".into(),
+                            count: 1
+                        },
+                    ]
+                ),
                 &o
             ))
         );
@@ -1598,7 +1654,8 @@ mod tests {
             value: format!("cargo {}[1mbuild", '\u{1b}'),
             count: 1,
         }];
-        let facets = render(|w| facet_list(w, "tool_input.command", &counts, &plain()));
+        let facets =
+            render(|w| facet_list(w, &fr("tool_input.command", counts.to_vec()), &plain()));
         assert!(!facets.contains('\u{1b}'), "{facets:?}");
 
         // Ordinary whitespace is still whitespace, not a replacement character.
