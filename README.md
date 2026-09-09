@@ -422,6 +422,13 @@ kind  2 values · 978 of 978 matching docs have a value
 And `search --facets a,b` returns hits and aggregations in one pass, so a single call answers
 "show me the top matches *and* the distribution behind them".
 
+> **Colons.** `tool_input` is a JSON field in the default search fields, so `word:value` is a
+> lookup on that JSON subpath — which is why `command:cargo` works as shorthand for
+> `tool_input.command:cargo`. A colon followed by whitespace or `/` is treated as ordinary
+> punctuation instead, so `https://github.com` and `note: this` search as text. If an
+> unqualified `word:value` returns nothing, the tool says so on stderr rather than letting a
+> misread colon look like an empty corpus; quote the term to force a literal search.
+
 > One asymmetry worth knowing: **facets key on the raw, untokenized value; search matches words
 > inside it.** So `facets tool_input.command` shows whole command lines, while
 > `search --tool-input command=cargo` matches any command *containing* `cargo`. That is
