@@ -19,7 +19,9 @@ errors. A CLI now; an `mcp` subcommand serving the same operations over stdio ne
 - **Indexed text:** user prompts, assistant text, tool inputs, tool results (size-capped).
   Assistant **thinking is stored but not indexed** — `--include-thinking` opts in, default off.
 - **Incremental one-shot indexing** keyed on (size, mtime, byte offset) per file.
-  `search` auto-refreshes unless `--no-refresh`.
+  The read commands (`search`, `facets`, `show`, `sessions`) auto-refresh unless `--no-refresh`;
+  `stats` never opens the index at all. `--include-thinking` is an *index-time* choice — turning
+  it on later needs `index --full`, because the watermarks say nothing changed.
 
 ## Verified Tantivy facts (0.26.2) — do not re-litigate these
 
@@ -102,13 +104,21 @@ overridable with `--index` / `$SESSION_SEARCH_INDEX`.
 
 ```
 <index>/tantivy/        the Tantivy index
-<index>/state.json      { "files": { "<abs path>": {size, mtime_ms, byte_offset, docs} }, "version": 1 }
-<index>/sessions.json   { "<session_id>[:<agent_id>]": SessionInfo }
+<index>/state.json      { "files": { "<abs path>": {size, mtime_ms, byte_offset, docs, carry} }, "version": 1 }
+<index>/sessions.json   { "<abs transcript path>": SessionInfo }
 ```
 
 `sessions.json` exists because a session's title arrives in a `summary` sidecar record that may
 be appended long after the messages it titles. Keeping session metadata out of Tantivy means a
 late title update is a cheap JSON rewrite instead of a doc rebuild.
+
+It is keyed by **transcript path, one entry per file** — not by session id. A session can start
+a new file mid-life (`resetSessionFile()`) or move project directories (`relocated`), so two
+files may share a `sessionId` (TRANSCRIPT-FORMAT §9); they are two transcripts with their own
+counts, project and opening prompt, and merging them loses all three. The display key
+`"<session_id>[:<agent_id>]"` is derived at render time.
+
+`carry` is `parse::ParseCarry` — see `parse.rs` below.
 
 ## Core types (pinned)
 
@@ -125,10 +135,18 @@ pub enum DocKind { Message, ToolCall }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct Doc {
-    pub doc_id: String,          // "<session_id>:<agent_id|->:<seq>" — unique, delete key
+    pub doc_id: String,          // "<session_id>:<agent_id|->:<file_tag>:<seq>" — unique,
+                                 // delete key. `file_tag` is 8 hex digits of a digest of
+                                 // `source_path`: `seq` restarts at 0 in every file and two
+                                 // transcripts can share a `session_id`, so without it the
+                                 // id is not unique.
     pub kind: DocKind,
     pub source_path: String,     // absolute; delete-by-term key for re-index
-    pub seq: u64,                // 0-based record order within the file
+    pub seq: u64,                // monotonic doc ordinal within the file, in record order.
+                                 // NOT the line number: one record can yield several docs
+                                 // (or none), and `index.rs` continues numbering with
+                                 // `seq_base` = the previously recorded `docs` count, so the
+                                 // two only agree if they are both per-doc.
     pub session_id: String,
     pub agent_id: Option<String>,
     pub agent_type: Option<String>,
@@ -167,18 +185,71 @@ pub struct SessionInfo {
     pub source_path: String,
     pub first_ts_ms: Option<i64>,
     pub last_ts_ms: Option<i64>,
-    pub messages: u64,
+    pub messages: u64,           // conversational turns: human prompts, assistant API
+                                 // messages (once per `message.id`), `system` records.
+                                 // Compaction records and attachments are excluded (§9).
     pub tool_calls: u64,
     pub first_prompt: Option<String>,
 }
 
-pub struct ParseOutput { pub docs: Vec<Doc>, pub session: SessionInfo, pub errors: Vec<ParseError> }
+pub struct ParseOutput {
+    pub docs: Vec<Doc>,
+    pub replacements: Vec<Doc>,  // documents that REPLACE ones already in the index: same
+                                 // `doc_id`, same `seq`, now carrying a tool result that
+                                 // arrived after they were written. The consumer deletes each
+                                 // `doc_id` before adding it, and must NOT count them towards
+                                 // the file's `docs` watermark.
+    pub session: SessionInfo, pub errors: Vec<ParseError>,
+    pub carry: ParseCarry,       // what the NEXT tail parse of this file must be told
+}
+
+/// A malformed line. Counted, never fatal.
+pub struct ParseError { pub path: String, pub line: u64, pub byte_offset: u64, pub message: String }
+
+/// State that has to survive from one incremental parse of a file to the next, because a tail
+/// parse sees only the bytes appended since the last run and two things straddle that boundary:
+///
+/// * a `tool_use` and the `tool_result` answering it are consecutive records, so on a live
+///   transcript the boundary lands between them almost every time. Without
+///   `pending_tool_uses` the tail reads the result as an *orphan* and emits a second,
+///   half-empty document for a tool call that is already indexed — doubling every tool call.
+///   Each entry carries the document itself, not just the id, so the later tail can COMPLETE
+///   it (as a `ParseOutput::replacements` entry) instead of losing the result text.
+/// * blocks of one API message share a `message.id` and are NOT contiguous (§7), so a boundary
+///   inside one message would count it twice without `counted_message_ids`.
+///
+/// `tail_line` is not about parsing: it fingerprints the last complete line consumed so the
+/// indexer can tell "the file grew" from "the file was rewritten in place".
+/// Both id lists are bounded (last 512).
+pub struct ParseCarry {
+    pub pending_tool_uses: Vec<PendingToolCall>,   // { tool_use_id, doc: Option<Box<Doc>> };
+                                         // `doc` is None when it was too large to carry, and
+                                         // then a late result only suppresses the duplicate.
+    pub counted_message_ids: Vec<String>,
+    pub tail_line: Option<TailLine>,     // { start: u64, hash: u64 }
+}
+
+/// Per-file inputs that are not the bytes of the file itself.
+pub struct FileContext {
+    pub agent_type: Option<String>,  // agent-<id>.meta.json `agentType` — the canonical source
+                                     // per §1, and the only one for subagents whose records
+                                     // carry no `attributionAgent`. Seeds `Doc::agent_type`.
+    pub carry: ParseCarry,
+}
 
 /// Parse a transcript. `from_offset` supports incremental tailing; `seq_base` continues
-/// numbering. Returns the byte offset of the end of the last COMPLETE line — a partial
-/// trailing line must be left unconsumed so the next run re-reads it.
-pub fn parse_file(path: &Path, from_offset: u64, seq_base: u64, opts: &ParseOptions)
-    -> anyhow::Result<(ParseOutput, u64)>;
+/// numbering; `ctx` carries the per-file facts a tail parse cannot see for itself. Returns the
+/// byte offset of the end of the last COMPLETE line — a partial trailing line must be left
+/// unconsumed so the next run re-reads it.
+pub fn parse_file(path: &Path, from_offset: u64, seq_base: u64, opts: &ParseOptions,
+                  ctx: &FileContext) -> anyhow::Result<(ParseOutput, u64)>;
+
+/// One-shot parse of a whole file with no carried state — the ground truth an incremental run
+/// must converge on, and what every caller that is not the indexer wants.
+pub fn parse_whole(path: &Path, opts: &ParseOptions) -> anyhow::Result<ParseOutput>;
+
+/// 8 hex digits of a digest of an absolute `source_path`; the `file_tag` in every `doc_id`.
+pub fn file_tag(source_path: &str) -> String;
 
 pub struct ParseOptions { pub max_text_bytes: usize, pub load_spilled_results: bool }
 ```
@@ -216,9 +287,9 @@ Field names and options:
 | `tool_input` | JSON, indexed + `set_fast(Some("raw"))` + `set_expand_dots_enabled()` + stored |
 | `text` | `TEXT \| STORED` |
 | `thinking` | `TEXT \| STORED` (only populated when `include_thinking`) |
-| `timestamp` | `DATE \| STORED \| FAST` (`INDEXED` too) |
+| `timestamp` | date field, `INDEXED \| STORED \| FAST` (tantivy 0.26 has no `DATE` flag const; `add_date_field` takes the numeric flags) |
 | `seq` | `U64 \| STORED \| FAST \| INDEXED` |
-| `is_error`, `is_sidechain`, `is_meta` | `U64 \| FAST \| INDEXED` (0/1) |
+| `is_error`, `is_sidechain`, `is_meta` | `U64 \| FAST \| INDEXED \| STORED` (0/1) — STORED because `search::doc_from_stored` reads them back out of the stored payload |
 | `raw` | `STORED` only |
 
 `index.rs`:
@@ -226,7 +297,11 @@ Field names and options:
 ```rust
 pub struct IndexOptions {
     pub full: bool, pub jobs: Option<usize>, pub include_thinking: bool,
-    pub max_text_bytes: usize,   // default 32 * 1024
+    pub load_spilled_results: bool,  // default TRUE — follow `Full output saved to: <path>`
+                                     // into `tool-results/<id>.txt`, else an oversized tool
+                                     // result is only its "output too large" stub. CLI:
+                                     // `index --no-spilled-results` opts out.
+    pub max_text_bytes: usize,   // default 32 * 1024, and it caps the spill too
     pub heap_bytes: usize,       // default 200 MB
 }
 pub struct IndexStats {
@@ -240,10 +315,21 @@ pub fn load_sessions(index_dir: &Path) -> anyhow::Result<BTreeMap<String, Sessio
 ```
 
 Incremental rules:
-- Watermark per file: `{size, mtime_ms, byte_offset, docs}`.
+- Watermark per file: `{size, mtime_ms, byte_offset, docs, carry}`.
 - Unchanged `size` **and** `mtime_ms` → skip entirely.
-- Grew → seek to `byte_offset`, parse the tail only, `seq_base` = recorded `docs`.
+- Grew → seek to `byte_offset`, parse the tail only, `seq_base` = recorded `docs`, and hand the
+  parser the recorded `carry` so the tail converges on what a whole-file parse would produce.
 - Shrank, or mtime went backwards, or `--full` → `delete_term(source_path)` and reparse whole.
+- **Before trusting a tail, re-check `carry.tail_line`**: seek to its `start`, re-read up to
+  `byte_offset`, and compare the hash. A rewind, `resetSessionFile()` or a restored fork (§9)
+  rewrites bytes the watermark already covers and can leave the file the same size or larger,
+  which `size`/`mtime` cannot distinguish from an append; a mismatch means everything recorded
+  describes bytes that no longer exist, so the file becomes a `Reset`. An absent fingerprint
+  (a `state.json` written by an older build) is treated as intact.
+- `ParseOutput::replacements` are `delete_term(doc_id)`-ed and re-added, and excluded from the
+  `docs` count. This is what makes live indexing converge on the one-shot result *byte for
+  byte*, not merely in document count.
+- A file that produced no documents and no session metadata gets no `sessions.json` row.
 - One `commit()` per run. Parse with `rayon` across files; a **single** writer consumes.
 - Never `memmap2` — these files are appended live and truncation raises an uncatchable SIGBUS.
 
@@ -271,23 +357,39 @@ pub struct SearchResponse {
     pub hits: Vec<Hit>, pub total: usize,
     pub facets: BTreeMap<String, Vec<FacetCount>>, pub elapsed_ms: u128,
 }
+/// The inverse of `schema::doc_to_json` — the one way to read a `Doc` back out of the index.
+pub fn doc_from_stored(f: &Fields, stored: &tantivy::TantivyDocument) -> Doc;
 pub fn search(index: &tantivy::Index, f: &Fields, req: &SearchRequest) -> anyhow::Result<SearchResponse>;
 pub fn facets(index: &tantivy::Index, f: &Fields, field: &str, req: &SearchRequest)
     -> anyhow::Result<Vec<FacetCount>>;
 ```
 
 Query semantics: the free-text query goes through `QueryParser` over `text` (+ `thinking` when
-opted in, + `tool_input`), so phrases, booleans, `field:value` and fuzzy all work. Filters are
-ANDed on top as term/range queries. `--tool-input k=v` becomes a term query on
-`tool_input.k` for `v`. `project` matches by prefix so `-p ~/code` catches subdirectories.
+opted in, + `tool_input`), so phrases, booleans and `field:value` all work. **There is no fuzzy
+operator**: `~` is phrase slop in Tantivy 0.26 and `set_field_fuzzy` is deliberately not wired
+up, so do not advertise `term~1`. A query that fails to parse falls back to
+`parse_query_lenient`, and the discarded errors are logged at WARN — a typo'd field name must
+not look like an empty corpus. Filters are ANDed on top as term/range queries. `--tool-input
+k=v` becomes a term query on `tool_input.k` for `v`; an empty key *or value* is an error, not a
+silent zero. `project` matches by prefix **on a path boundary**, so `-p ~/code` catches
+subdirectories but `-p ~/code` does not catch `~/code-scratch`; `--session` is a bare character
+prefix, so the leading block of a uuid is enough (`show` resolves an unambiguous id prefix the
+same way, and errors when it is ambiguous). `--limit 0` returns totals and facets with no hits,
+and the human rendering still prints the total. Every collector limit (`--limit`, `--offset`,
+`--context`, `show --before/--after`) is clamped against the number of documents in the index:
+`TopDocs` preallocates whatever it is handed, so an unclamped number aborts the process.
 
 `context.rs`:
 
 ```rust
+// `source_path` scopes the lookup to one transcript file. `seq` is a per-FILE ordinal and two
+// files can share a `session_id` (§9), so a window scoped only by session id interleaves them
+// and silently drops the neighbours it was asked for. `None` means "whichever file(s)".
 pub fn around(index: &tantivy::Index, f: &Fields, session_id: &str, agent_id: Option<&str>,
-              seq: u64, before: usize, after: usize) -> anyhow::Result<Vec<Doc>>;
+              source_path: Option<&str>, seq: u64, before: usize, after: usize)
+    -> anyhow::Result<Vec<Doc>>;
 pub fn session(index: &tantivy::Index, f: &Fields, session_id: &str, agent_id: Option<&str>,
-               limit: usize) -> anyhow::Result<Vec<Doc>>;
+               source_path: Option<&str>, limit: usize) -> anyhow::Result<Vec<Doc>>;
 ```
 
 `format.rs`:
@@ -295,6 +397,11 @@ pub fn session(index: &tantivy::Index, f: &Fields, session_id: &str, agent_id: O
 ```rust
 pub struct OutputOpts { pub json: bool, pub color: bool, pub context: usize, pub width: usize }
 pub fn search_results(w: &mut impl Write, r: &SearchResponse, o: &OutputOpts) -> anyhow::Result<()>;
+/// `--context N`: `SearchResponse` carries no surrounding turns and `format.rs` holds no index
+/// handle, so `cli.rs` fetches one `context::around` window per hit and passes them in here.
+/// `search_results` is the `context: &[]` case of this.
+pub fn search_results_ctx(w: &mut impl Write, r: &SearchResponse, context: &[Vec<Doc>],
+                          o: &OutputOpts) -> anyhow::Result<()>;
 pub fn facet_list(w: &mut impl Write, field: &str, c: &[FacetCount], o: &OutputOpts) -> anyhow::Result<()>;
 pub fn session_view(w: &mut impl Write, docs: &[Doc], o: &OutputOpts) -> anyhow::Result<()>;
 pub fn session_list(w: &mut impl Write, s: &[SessionInfo], o: &OutputOpts) -> anyhow::Result<()>;
@@ -305,12 +412,14 @@ pub fn stats(w: &mut impl Write, s: &IndexStats, o: &OutputOpts) -> anyhow::Resu
 
 ```
 session-search index [--full] [--root DIR]... [--index DIR] [--jobs N] [--include-thinking]
+                     [--no-spilled-results]
 session-search search <QUERY> [FILTERS] [--facets f1,f2] [--context N]
                               [--limit N] [--offset N] [--json] [--no-refresh]
-session-search facets <FIELD> [--query Q] [FILTERS] [--top N] [--json]
+                              [--include-thinking]
+session-search facets <FIELD> [--query Q] [FILTERS] [--top N] [--json] [--no-refresh]
 session-search show <SESSION_ID> [--agent AGENT_ID] [--around UUID|SEQ]
-                                 [--before N] [--after N] [--limit N] [--json]
-session-search sessions [FILTERS] [--limit N] [--json]
+                                 [--before N] [--after N] [--limit N] [--json] [--no-refresh]
+session-search sessions [FILTERS] [--limit N] [--json] [--no-refresh]
 session-search stats [--json]
 
 FILTERS: -p/--project P  -t/--tool T  --tool-input k=v  --branch B  --model M
