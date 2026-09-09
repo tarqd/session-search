@@ -104,7 +104,8 @@ overridable with `--index` / `$SESSION_SEARCH_INDEX`.
 
 ```
 <index>/tantivy/        the Tantivy index
-<index>/state.json      { "files": { "<abs path>": {size, mtime_ms, byte_offset, docs, carry} }, "version": 1 }
+<index>/state.json      { "version": 2, "roots": [...], "thinking_indexed": bool,
+                          "files": { "<abs path>": {size, mtime_ms, byte_offset, docs, carry} } }
 <index>/sessions.json   { "<abs transcript path>": SessionInfo }
 ```
 
@@ -296,7 +297,8 @@ Field names and options:
 
 ```rust
 pub struct IndexOptions {
-    pub full: bool, pub jobs: Option<usize>, pub include_thinking: bool,
+    pub full: bool, pub jobs: Option<usize>,
+    pub include_thinking: bool,   // default TRUE; `index --no-thinking` opts out
     pub load_spilled_results: bool,  // default TRUE — follow `Full output saved to: <path>`
                                      // into `tool-results/<id>.txt`, else an oversized tool
                                      // result is only its "output too large" stub. CLI:
@@ -313,6 +315,15 @@ pub fn open_or_create(index_dir: &Path) -> anyhow::Result<(tantivy::Index, Field
 pub fn run(index_dir: &Path, roots: &[PathBuf], opts: &IndexOptions) -> anyhow::Result<IndexStats>;
 pub fn load_sessions(index_dir: &Path) -> anyhow::Result<BTreeMap<String, SessionInfo>>;
 ```
+
+An index is **bound to its corpus**: `state.json` records the roots it was built from, and
+`run()` refuses a different set unless `--full` re-points it. Auto-refresh follows the recorded
+roots, never the default one — resolving the default here silently merged a second corpus into an
+index built over a snapshot, and every count then described the union.
+
+Thinking is indexed by **default** (`index --no-thinking` opts out) and the choice is recorded, so
+a query-time `--include-thinking` against an index built without it warns instead of silently
+matching nothing.
 
 Incremental rules:
 - Watermark per file: `{size, mtime_ms, byte_offset, docs, carry}`.

@@ -664,10 +664,44 @@ fn session_json(info: &SessionInfo) -> Value {
 // ---------------------------------------------------------------------------
 
 pub fn stats(w: &mut impl Write, s: &IndexStats, o: &OutputOpts) -> Result<()> {
+    stats_scoped(w, s, &[], o)
+}
+
+/// [`stats`] that also names the corpus the index is bound to. Worth printing: a count is
+/// meaningless without knowing what it counted over, and an index silently holding a corpus
+/// the caller did not expect is exactly the failure this guards against.
+pub fn stats_scoped(
+    w: &mut impl Write,
+    s: &IndexStats,
+    roots: &[std::path::PathBuf],
+    o: &OutputOpts,
+) -> Result<()> {
     if o.json {
-        return json_line(w, &serde_json::to_value(s)?);
+        let mut value = serde_json::to_value(s)?;
+        if let Some(object) = value.as_object_mut() {
+            object.insert(
+                "roots".into(),
+                json!(
+                    roots
+                        .iter()
+                        .map(|r| r.display().to_string())
+                        .collect::<Vec<_>>()
+                ),
+            );
+        }
+        return json_line(w, &value);
     }
     let ink = Ink::new(o.color);
+    if !roots.is_empty() {
+        for (i, root) in roots.iter().enumerate() {
+            writeln!(
+                w,
+                "  {}  {}",
+                ink.paint(if i == 0 { "corpus" } else { "      " }, dim()),
+                ink.paint(&root.display().to_string(), bold()),
+            )?;
+        }
+    }
     let rows: [(&str, String); 8] = [
         ("files scanned", thousands(s.files_scanned as u64)),
         ("files updated", thousands(s.files_updated as u64)),

@@ -62,10 +62,11 @@ pub enum Command {
         /// Parser threads. Defaults to the rayon pool size.
         #[arg(long, value_name = "N")]
         jobs: Option<usize>,
-        /// Also index assistant thinking blocks. This is an index-time choice: switching it
-        /// on later needs `index --full`, since the watermarks say nothing changed.
+        /// Do NOT index assistant thinking blocks. Thinking is indexed by default; searching
+        /// it still requires `search --include-thinking`. Switching this later needs
+        /// `index --full`, since the watermarks say nothing changed.
         #[arg(long)]
-        include_thinking: bool,
+        no_thinking: bool,
         /// Do not follow `Full output saved to: <path>` pointers into `tool-results/`;
         /// index only the "output too large" stub the transcript carries inline.
         #[arg(long)]
@@ -212,17 +213,28 @@ fn dispatch(
             full,
             roots,
             jobs,
-            include_thinking,
+            no_thinking,
             no_spilled_results,
         } => {
-            let roots = resolve_roots(roots)?;
+            // An explicit --root wins; otherwise stay with whatever corpus this index already
+            // holds, and only fall back to the default root for a brand-new index.
+            let roots = if roots.is_empty() {
+                let bound = index::meta(index_dir).roots;
+                if bound.is_empty() {
+                    resolve_roots(Vec::new())?
+                } else {
+                    bound
+                }
+            } else {
+                resolve_roots(roots)?
+            };
             let stats = index::run(
                 index_dir,
                 &roots,
                 &IndexOptions {
                     full,
                     jobs,
-                    include_thinking,
+                    include_thinking: !no_thinking,
                     load_spilled_results: !no_spilled_results,
                     ..IndexOptions::default()
                 },
@@ -371,8 +383,9 @@ fn dispatch(
         }
 
         Command::Stats { json: _ } => {
+            let roots = index::meta(index_dir).roots;
             let stats = index_stats(index_dir)?;
-            format::stats(out, &stats, &opts)
+            format::stats_scoped(out, &stats, &roots, &opts)
         }
     }
 }
@@ -384,23 +397,46 @@ fn dispatch(
 /// The read commands index first, so a search is never silently answered from a stale index.
 /// A refresh failure is not fatal: an unreadable transcript root should not stop you searching
 /// what was indexed yesterday.
-fn refresh(index_dir: &Path, no_refresh: bool, include_thinking: bool) {
+fn refresh(index_dir: &Path, no_refresh: bool, query_wants_thinking: bool) {
+    let meta = index::meta(index_dir);
+
+    // Searching thinking that was never indexed matches nothing and looks like an empty corpus.
+    if query_wants_thinking && !meta.roots.is_empty() && !meta.thinking_indexed {
+        tracing::warn!(
+            "this index was built with --no-thinking, so --include-thinking cannot match; \
+             rebuild with `index --full` to search thinking"
+        );
+    }
+
     if no_refresh {
         tracing::debug!("--no-refresh: querying the index as it stands");
         return;
     }
-    let roots = match resolve_roots(Vec::new()) {
-        Ok(roots) => roots,
-        Err(err) => {
-            tracing::warn!(error = %format!("{err:#}"), "cannot locate transcripts; skipping refresh");
-            return;
+
+    // Refresh the corpus this index actually holds. Resolving the *default* root here is what
+    // silently merged a second corpus into an index built over a snapshot.
+    let roots = if meta.roots.is_empty() {
+        match resolve_roots(Vec::new()) {
+            Ok(roots) => roots,
+            Err(err) => {
+                tracing::warn!(error = %format!("{err:#}"), "cannot locate transcripts; skipping refresh");
+                return;
+            }
         }
+    } else {
+        meta.roots.clone()
     };
     match index::run(
         index_dir,
         &roots,
         &IndexOptions {
-            include_thinking,
+            // Keep the index's own thinking setting; a query-time flag must never silently
+            // change what is stored.
+            include_thinking: if meta.roots.is_empty() {
+                IndexOptions::default().include_thinking
+            } else {
+                meta.thinking_indexed
+            },
             ..IndexOptions::default()
         },
     ) {
@@ -905,7 +941,7 @@ mod tests {
             full,
             roots,
             jobs,
-            include_thinking,
+            no_thinking,
             no_spilled_results,
         } = parse(&[
             "session-search",
@@ -917,13 +953,13 @@ mod tests {
             "/b/projects",
             "--jobs",
             "4",
-            "--include-thinking",
+            "--no-thinking",
         ])
         .command
         else {
             panic!("expected index");
         };
-        assert!(full && include_thinking);
+        assert!(full && no_thinking);
         // Spilled tool results are followed unless explicitly turned off.
         assert!(!no_spilled_results);
         assert_eq!(
