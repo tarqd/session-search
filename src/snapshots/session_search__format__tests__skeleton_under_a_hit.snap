@@ -1,0 +1,18 @@
+---
+source: src/format.rs
+expression: rendered
+---
+1 of 1 hit · 7 ms
+
+▌ b20208d8-fbdb-5918-ba69-d203de6ed6dc  wild-spinning-puppy  (1 hit)
+▌ [path] · claude/rust-mcp · [date]
+
+   1. [time]  assistant Bash command=cargo build --release  description=Reproduce it  #12  4.25
+      Bash cargo build --release
+      turn #10 · 6 docs
+      user: why did the release build start failing?
+      assistant: Checking what the last green run did.
+      Bash(command=cargo build --release, description=Reproduce it) -> ok
+      Read(file_path=[path] -> ok
+      Grep(path=src, pattern=register_tokenizer) -> ok
+      assistant: The analyzer was renamed, so every field's tokenizer is missing.

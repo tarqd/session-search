@@ -48,6 +48,10 @@ pub enum ContextWindow {
     Docs(usize),
     /// The hit's whole enclosing turn, capped at `TURN_WINDOW_LIMIT`.
     Turn,
+    /// The same window as [`ContextWindow::Turn`], rendered as a skeleton: one line per
+    /// document, call signatures without their output. A window, not a filter — the fetch is
+    /// identical and only the rendering differs, which is why it lives on `--context`.
+    Skeleton,
 }
 
 impl std::str::FromStr for ContextWindow {
@@ -58,10 +62,13 @@ impl std::str::FromStr for ContextWindow {
         if value.eq_ignore_ascii_case("turn") {
             return Ok(ContextWindow::Turn);
         }
+        if value.eq_ignore_ascii_case("skeleton") {
+            return Ok(ContextWindow::Skeleton);
+        }
         value
             .parse::<usize>()
             .map(ContextWindow::Docs)
-            .map_err(|_| format!("expected a document count or `turn`, got {value:?}"))
+            .map_err(|_| format!("expected a document count, `turn` or `skeleton`, got {value:?}"))
     }
 }
 
@@ -121,10 +128,16 @@ pub enum Command {
         /// Comma-separated facet fields, e.g. `tool_name,code_lang,tool_input.file_path`.
         #[arg(long, value_delimiter = ',', value_name = "FIELD")]
         facets: Vec<String>,
-        /// Also show N documents either side of each hit, or `turn` for the hit's whole
-        /// enclosing turn — the prompt that opened it, what was tried, and what came back.
-        #[arg(long, default_value = "0", value_name = "N|turn")]
+        /// Also show N documents either side of each hit, `turn` for the hit's whole enclosing
+        /// turn — the prompt that opened it, what was tried, and what came back — or
+        /// `skeleton` for that same turn as one line per document: call signatures with no
+        /// output, except the first line of a failed one.
+        #[arg(long, default_value = "0", value_name = "N|turn|skeleton")]
         context: ContextWindow,
+        /// Collapse hits that share a turn into one, keeping the best-scoring member and
+        /// reporting how many others matched. `--limit` and `--offset` then count turns.
+        #[arg(long = "group-by-turn")]
+        group_by_turn: bool,
         #[arg(long, default_value_t = 20, value_name = "N")]
         limit: usize,
         #[arg(long, default_value_t = 0, value_name = "N")]
@@ -203,6 +216,10 @@ pub enum Command {
         // `--around`; requiring it turns a silent no-op into a usage error.
         #[arg(long, requires = "around")]
         turn: bool,
+        /// Render the `--turn` window as a skeleton: one line per document, call signatures
+        /// with no output, except the first line of a failed one.
+        #[arg(long, requires = "turn")]
+        skeleton: bool,
         #[arg(long, default_value_t = 3, value_name = "N")]
         before: usize,
         #[arg(long, default_value_t = 3, value_name = "N")]
@@ -365,6 +382,7 @@ fn dispatch(
             similar_to,
             similar_in,
             include_source,
+            group_by_turn,
         } => {
             refresh(index_dir, no_refresh, include_thinking);
             let (index, fields) = index::open_or_create(index_dir)?;
@@ -393,11 +411,12 @@ fn dispatch(
                 include_thinking,
                 sort,
                 similar_to: similar,
+                group_by_turn,
             };
             let response = search::search(&index, &fields, &request)?;
             opts.context = match window {
                 ContextWindow::Docs(n) => n,
-                ContextWindow::Turn => 0,
+                ContextWindow::Turn | ContextWindow::Skeleton => 0,
             };
             let around = match window {
                 ContextWindow::Docs(0) => Vec::new(),
@@ -433,6 +452,7 @@ fn dispatch(
             agent,
             around,
             turn,
+            skeleton,
             before,
             after,
             limit,
@@ -507,6 +527,7 @@ fn dispatch(
                 );
             }
             match span {
+                Some(span) if skeleton => format::turn_skeleton_view(out, &docs, span, &opts),
                 Some(span) => format::turn_view(out, &docs, span, &opts),
                 None => format::session_view(out, &docs, &opts),
             }
@@ -689,15 +710,21 @@ fn context_windows(
                 )
                 .map(format::HitContext::around),
                 // `turn_seq` rides on the hit itself, so snapping to the turn costs one query,
-                // not a lookup of the doc first.
-                ContextWindow::Turn => context::turn_window(
+                // not a lookup of the doc first. A skeleton walks the very same window: it is a
+                // rendering of the turn, so fetching anything else would let the two disagree.
+                ContextWindow::Turn | ContextWindow::Skeleton => context::turn_window(
                     index,
                     fields,
                     &hit.doc.source_path,
                     hit.doc.turn_seq,
                     TURN_WINDOW_LIMIT,
                 )
-                .map(|w| format::HitContext::turn(w.docs, w.turn_seq, w.total)),
+                .map(|w| match window {
+                    ContextWindow::Skeleton => {
+                        format::HitContext::skeleton(w.docs, w.turn_seq, w.total)
+                    }
+                    _ => format::HitContext::turn(w.docs, w.turn_seq, w.total),
+                }),
             };
             fetched.unwrap_or_else(|err| {
                 tracing::warn!(doc = %hit.doc.doc_id, error = %format!("{err:#}"), "context lookup failed");
@@ -1234,6 +1261,7 @@ mod tests {
             similar_to,
             similar_in,
             include_source,
+            group_by_turn,
         } = parse(&["session-search", "search", "tantivy"]).command
         else {
             panic!("expected search");
@@ -1242,6 +1270,9 @@ mod tests {
         assert_eq!((limit, offset, context), (20, 0, ContextWindow::Docs(0)));
         assert!(facets.is_empty());
         assert!(!json && !no_refresh && !include_thinking);
+        // Grouping changes what a hit is, so it is opt-in: a saved command line must not start
+        // returning one hit where it used to return four.
+        assert!(!group_by_turn);
         assert_eq!(sort, SortBy::Relevance);
         assert!(filters.project.is_none() && filters.tool.is_empty());
         // Similarity is entirely opt-in: no reference, no seed fields, source not re-included.
@@ -1339,6 +1370,7 @@ mod tests {
             agent,
             around,
             turn,
+            skeleton: _,
             before,
             after,
             limit,
@@ -1702,8 +1734,8 @@ mod tests {
         assert!(err.contains("bbbb-2222, bbbb-3333"), "{err}");
     }
 
-    /// `--context` takes a document count or the word `turn`; anything else is a usage error
-    /// rather than a silently-zero window.
+    /// `--context` takes a document count, the word `turn` or the word `skeleton`; anything
+    /// else is a usage error rather than a silently-zero window.
     #[test]
     fn the_context_flag_takes_a_count_or_a_turn() {
         let window = |value: &str| {
@@ -1718,11 +1750,16 @@ mod tests {
         assert_eq!(window("3"), ContextWindow::Docs(3));
         assert_eq!(window("turn"), ContextWindow::Turn);
         assert_eq!(window("TURN"), ContextWindow::Turn);
+        assert_eq!(window("skeleton"), ContextWindow::Skeleton);
+        assert_eq!(window("Skeleton"), ContextWindow::Skeleton);
 
         let err = Cli::try_parse_from(["session-search", "search", "q", "--context", "session"])
             .unwrap_err()
             .to_string();
-        assert!(err.contains("expected a document count or `turn`"), "{err}");
+        assert!(
+            err.contains("expected a document count, `turn` or `skeleton`"),
+            "{err}"
+        );
         assert!(Cli::try_parse_from(["session-search", "search", "q", "--context", "-1"]).is_err());
     }
 

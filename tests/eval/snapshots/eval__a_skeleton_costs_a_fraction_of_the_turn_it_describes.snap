@@ -1,0 +1,17 @@
+---
+source: tests/eval/main.rs
+expression: table
+---
+| transcript                                 |     turns |      docs |     ctx B |    skel B |  skel % |
+|--------------------------------------------|-----------|-----------|-----------|-----------|---------|
+| real_main_slice.jsonl                      |         1 |         9 |     14002 |      1596 |    11.4 |
+| real_sidechain_slice.jsonl                 |         1 |        11 |     19541 |      1642 |     8.4 |
+| b20208d8-fbdb-5918-ba69-d203de6ed6dc.jsonl |         3 |        12 |     13008 |      1078 |     8.3 |
+| eval-buildfail.jsonl                       |         3 |        13 |     11831 |      1096 |     9.3 |
+| eval-facets.jsonl                          |         2 |        13 |     12234 |      1261 |    10.3 |
+| eval-notes.jsonl                           |         2 |         9 |      8005 |       954 |    11.9 |
+| eval-tokenizer.jsonl                       |         4 |        12 |     11808 |      1259 |    10.7 |
+| ALL                                        |        16 |        79 |     90429 |      8886 |     9.8 |
+
+mean turn: 5651 B of context, 555 B of skeleton
+worst turn: 19541 B of context, 1642 B of skeleton

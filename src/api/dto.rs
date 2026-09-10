@@ -375,9 +375,10 @@ impl SearchBody {
             sort,
             // Spelled out rather than left to `..defaults`, so that adding a field to
             // `SearchRequest` is a compile error here and somebody has to decide, once, whether
-            // the HTTP envelope carries it. This one deliberately does not — see
-            // `similar_to_is_not_a_search_parameter`.
+            // the HTTP envelope carries it. These two deliberately do not — see
+            // `similar_to_is_not_a_search_parameter` and `group_by_turn_is_not_a_search_parameter`.
             similar_to: None,
+            group_by_turn: false,
         };
 
         Ok(PreparedSearch {
@@ -1347,6 +1348,27 @@ mod tests {
         assert!(err.contains("\"similar_to\""), "{err}");
     }
 
+    /// Nor does it carry `--group-by-turn`, for a reason that is specific to this envelope:
+    /// grouping makes `limit`/`offset` count turns while `total` keeps counting documents, and
+    /// every page control in a Search UI response — `current`, `resultsPerPage`, the pager the
+    /// bundled UI draws from them — divides one by the other. A facade that paged in turns and
+    /// reported a document total would be wrong in the one place a user can see it. The CLI is
+    /// free of that: it prints a page and says what the page is.
+    #[test]
+    fn group_by_turn_is_not_a_search_parameter() {
+        let err = params("q=x&group_by_turn=1")
+            .reject_unknown(SEARCH_PARAMS)
+            .unwrap_err();
+        assert!(err.contains("\"group_by_turn\""), "{err}");
+        assert!(
+            !SearchBody::default()
+                .prepare()
+                .unwrap()
+                .request
+                .group_by_turn
+        );
+    }
+
     // --- GET -> body -------------------------------------------------------
 
     #[test]
@@ -1722,11 +1744,13 @@ mod tests {
                     snippet: String::new(),
                     snippet_field: SnippetSource::Text,
                     snippet_marks: Vec::new(),
+                    collapsed: 0,
                 })
                 .collect(),
             total: 431,
             facets: Default::default(),
             elapsed_ms: 7,
+            grouped: false,
         };
 
         let prep = prepared(json!({ "current": 22, "resultsPerPage": 20 })).unwrap();
@@ -1799,12 +1823,14 @@ mod tests {
             snippet: "the **memmap** panic".into(),
             snippet_field: SnippetSource::ToolOutput,
             snippet_marks: marks(&[(6, 12)]),
+            collapsed: 0,
         };
         let resp = SearchResponse {
             hits: vec![hit],
             total: 1,
             facets: Default::default(),
             elapsed_ms: 7,
+            grouped: false,
         };
         let prep = prepared(json!({ "searchTerm": "memmap" })).unwrap();
         let out = search_ui_response(&prep, &resp);
@@ -1891,6 +1917,7 @@ mod tests {
             total: 431,
             facets,
             elapsed_ms: 1,
+            grouped: false,
         };
         let out = search_ui_response(&prepared(json!({})).unwrap(), &resp);
         let facet = &out["facets"]["tool_name"][0];

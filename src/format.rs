@@ -24,7 +24,7 @@ use owo_colors::Style;
 use serde_json::{Value, json};
 
 use crate::index::IndexStats;
-use crate::parse::{Doc, SessionInfo};
+use crate::parse::{Doc, DocKind, SessionInfo};
 use crate::search::{FacetResult, Hit, SearchResponse};
 
 /// The marker `search.rs` wraps matched spans in. Identical on both sides, so splitting on it
@@ -37,6 +37,21 @@ const MESSAGE_BUDGET: usize = 4_000;
 const TOOL_BUDGET: usize = 1_200;
 /// Snippet lines shown under a hit. The snippet itself is already capped by `snippet_chars`.
 const MAX_SNIPPET_LINES: usize = 4;
+
+/// Per-turn byte cap for a skeleton ([`turn_skeleton`]).
+///
+/// The point of a skeleton is that a turn costs a predictable, small number of tokens no matter
+/// what it did, so the cap is on the rendered bytes rather than on a document count: forty
+/// one-line `Bash` calls are cheap and one `Read` of a 200 KB log is not. 1600 bytes is roughly
+/// 400 tokens — a whole turn for about the price of one ordinary snippet.
+pub const SKELETON_BUDGET: usize = 1_600;
+/// Per-line cap inside a skeleton. Long enough for a real command line, short enough that one
+/// `Write` of a whole file cannot spend the turn's budget by itself.
+const SKELETON_LINE: usize = 200;
+/// How much of a failed call's output leads its line. The error is the answer, but the whole
+/// stack trace is not — the first line of it names the failure, and the rest is what `show`
+/// exists for.
+const SKELETON_ERROR: usize = 140;
 
 #[derive(Debug, Clone)]
 pub struct OutputOpts {
@@ -178,12 +193,20 @@ impl TurnSpan {
 pub struct HitContext {
     pub docs: Vec<Doc>,
     pub turn: Option<TurnSpan>,
+    /// Render the turn as a skeleton — call signatures, no outputs — instead of document
+    /// bodies. The same documents either way: this is a rendering choice, and the fetch that
+    /// produced them is identical.
+    pub skeleton: bool,
 }
 
 impl HitContext {
     /// A `--context N` window: neighbouring documents, no turn boundary involved.
     pub fn around(docs: Vec<Doc>) -> Self {
-        HitContext { docs, turn: None }
+        HitContext {
+            docs,
+            turn: None,
+            skeleton: false,
+        }
     }
 
     /// A `--context turn` window: the head of the turn, and what the whole turn holds.
@@ -191,6 +214,15 @@ impl HitContext {
         HitContext {
             docs,
             turn: Some(TurnSpan { turn_seq, total }),
+            skeleton: false,
+        }
+    }
+
+    /// A `--context skeleton` window: the same turn, rendered as its shape.
+    pub fn skeleton(docs: Vec<Doc>, turn_seq: u64, total: usize) -> Self {
+        HitContext {
+            skeleton: true,
+            ..HitContext::turn(docs, turn_seq, total)
         }
     }
 }
@@ -218,6 +250,7 @@ fn search_json(r: &SearchResponse, context: &[HitContext]) -> Value {
     const NONE: &HitContext = &HitContext {
         docs: Vec::new(),
         turn: None,
+        skeleton: false,
     };
     let hits: Vec<Value> = r
         .hits
@@ -241,7 +274,20 @@ fn hit_json(hit: &Hit, context: &HitContext) -> Value {
         .expect("doc_json always builds an object");
     object.insert("score".into(), json!(hit.score));
     object.insert("snippet".into(), json!(hit.snippet));
-    if !context.docs.is_empty() {
+    // Only under `--group-by-turn`, and only as a key that is there or is not: a `0` on every
+    // hit of every ordinary search is a column of noise that says nothing happened.
+    if hit.collapsed > 0 {
+        object.insert("collapsed".into(), json!(hit.collapsed));
+    }
+    if context.skeleton {
+        // The skeleton *replaces* the documents rather than joining them. Sending both would
+        // undo the only thing it is for: a turn whose outputs cost 200 KB arrives as a few
+        // hundred bytes, and a caller that wants the bytes has `--context turn` and `show`.
+        object.insert(
+            "skeleton".into(),
+            skeleton_json(&turn_skeleton(&context.docs, SKELETON_BUDGET)),
+        );
+    } else if !context.docs.is_empty() {
         object.insert(
             "context".into(),
             Value::Array(context.docs.iter().map(doc_json).collect()),
@@ -359,19 +405,32 @@ fn human_search(
         writeln!(w, "{}", ink.paint("no matches", dim()))?;
     } else {
         let shown = r.hits.len();
-        let summary = format!(
-            "{shown} of {} hit{} · {} ms",
-            r.total,
-            if r.total == 1 { "" } else { "s" },
-            r.elapsed_ms
-        );
+        // Grouped, the two numbers count different things — turns shown, documents matched —
+        // and "3 of 4211 hits" would invite the reader to divide one by the other.
+        let summary = if r.grouped {
+            format!(
+                "{shown} turn{} · {} matching doc{} · {} ms",
+                if shown == 1 { "" } else { "s" },
+                r.total,
+                if r.total == 1 { "" } else { "s" },
+                r.elapsed_ms
+            )
+        } else {
+            format!(
+                "{shown} of {} hit{} · {} ms",
+                r.total,
+                if r.total == 1 { "" } else { "s" },
+                r.elapsed_ms
+            )
+        };
         writeln!(w, "{}", ink.paint(&summary, dim()))?;
     }
 
     for group in group_hits(&r.hits) {
         writeln!(w)?;
         let lead = &r.hits[group.members[0]].doc;
-        write_session_header(w, lead, Some(group.members.len()), ink, cols)?;
+        let unit = if r.grouped { "turn" } else { "hit" };
+        write_session_header(w, lead, Some(group.members.len()), unit, ink, cols)?;
 
         for &i in &group.members {
             let hit = &r.hits[i];
@@ -396,7 +455,11 @@ fn human_search(
                         ink.paint(&span.label(around.docs.len()), bar_style())
                     )?;
                 }
-                write_context(w, &around.docs, hit.doc.seq, ink, cols)?;
+                if around.skeleton {
+                    write_skeleton(w, &around.docs, ink, cols)?;
+                } else {
+                    write_context(w, &around.docs, hit.doc.seq, ink, cols)?;
+                }
             }
         }
     }
@@ -432,10 +495,14 @@ fn group_hits(hits: &[Hit]) -> Vec<Group> {
     order.into_iter().map(|(_, g)| g).collect()
 }
 
+/// `hits` is the count in this session's block, and `unit` is what that count counts: a grouped
+/// search's block holds turns, not hits, and calling them hits would be the same lie the summary
+/// line above it avoids.
 fn write_session_header(
     w: &mut impl Write,
     doc: &Doc,
     hits: Option<usize>,
+    unit: &str,
     ink: Ink,
     cols: usize,
 ) -> Result<()> {
@@ -454,7 +521,7 @@ fn write_session_header(
     }
     if let Some(n) = hits {
         line.push_str(&ink.paint(
-            &format!("  ({n} hit{})", if n == 1 { "" } else { "s" }),
+            &format!("  ({n} {unit}{})", if n == 1 { "" } else { "s" }),
             dim(),
         ));
     }
@@ -498,13 +565,25 @@ fn write_hit_line(w: &mut impl Write, hit: &Hit, rank: usize, ink: Ink, cols: us
         used += 6;
     }
 
+    // With the per-hit numbers rather than beside the tool name: a collapsed hit is one turn
+    // standing in for several matched documents, which is a fact about the hit, not about what
+    // the document did. Without it the reader sees a page of unrelated-looking hits and no sign
+    // that anything was folded away.
+    let collapsed = if hit.collapsed > 0 {
+        format!("  +{} in turn", hit.collapsed)
+    } else {
+        String::new()
+    };
     let tail = format!("  #{}  {:.2}", doc.seq, hit.score);
-    let room = cols.saturating_sub(used + tail.chars().count());
+    let room = cols.saturating_sub(used + collapsed.chars().count() + tail.chars().count());
     if let Some(params) = doc.tool_input.as_ref().map(|v| tool_params(v, room))
         && !params.is_empty()
     {
         line.push(' ');
         line.push_str(&ink.paint(&params, dim()));
+    }
+    if !collapsed.is_empty() {
+        line.push_str(&ink.paint(&collapsed, bar_style()));
     }
     line.push_str(&ink.paint(&tail, dim()));
     writeln!(w, "{line}")?;
@@ -529,6 +608,163 @@ fn write_context(
         let prefix = format!("      #{:<5} {:<20} ", doc.seq, truncate(&label, 20));
         let line = one_line(&doc_body(doc), cols.saturating_sub(prefix.chars().count()));
         writeln!(w, "{}", ink.paint(&format!("{prefix}{line}"), dim()))?;
+    }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// turn skeletons
+// ---------------------------------------------------------------------------
+
+/// A turn reduced to its shape: the prompt, the prose, and every call's signature — with no
+/// tool output except the first line of a failed one.
+///
+/// The split that makes this free was made for query semantics: a tool call already stores the
+/// *call* (its name and the strings of its input) in `text` and the *result* in `tool_output`,
+/// so a skeleton is the `text` side of a turn's documents and nothing has to be derived, stored
+/// or kept in sync. See `docs/DESIGN.md`, "Turn skeletons".
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Skeleton {
+    /// One line per document, in transcript order.
+    pub lines: Vec<String>,
+    /// Documents the byte cap left out. Reported, never dropped silently — a skeleton that
+    /// stops in the middle of a turn otherwise reads as a turn that stopped there.
+    pub dropped: usize,
+}
+
+impl Skeleton {
+    /// Rendered size, newlines included: the number the budget is actually spent in, and the
+    /// one worth measuring a corpus with.
+    pub fn bytes(&self) -> usize {
+        self.lines.iter().map(|l| l.len() + 1).sum()
+    }
+
+    fn is_empty(&self) -> bool {
+        self.lines.is_empty()
+    }
+}
+
+/// Render `docs` — one turn, in transcript order — as a skeleton within `budget` bytes.
+///
+/// The budget is spent in document order rather than shared out, so a turn always reads from
+/// its prompt forwards: what the turn was for is the one line nobody can reconstruct from the
+/// others.
+pub fn turn_skeleton(docs: &[Doc], budget: usize) -> Skeleton {
+    let mut out = Skeleton::default();
+    let mut used = 0usize;
+    for (i, doc) in docs.iter().enumerate() {
+        let line = skeleton_line(doc);
+        if line.is_empty() {
+            continue;
+        }
+        let cost = line.len() + 1;
+        // The first line always goes in: a budget too small to hold the prompt should return a
+        // truncated skeleton, not an empty one that claims the turn had nothing in it.
+        if used + cost > budget && !out.is_empty() {
+            out.dropped = docs.len() - i;
+            break;
+        }
+        used += cost;
+        out.lines.push(line);
+    }
+    out
+}
+
+/// One document, one line. Empty for a document with nothing to say, which the caller skips —
+/// an `is_meta` marker with no text would otherwise spend a line on `user:`.
+fn skeleton_line(d: &Doc) -> String {
+    match d.tool_name.as_deref().filter(|t| !t.is_empty()) {
+        // A call: name, the input's own key parameters, and how it ended.
+        Some(tool) => format!("{tool}({}){}", skeleton_params(d), skeleton_status(d)),
+        // No name and a result anyway: an orphaned `tool_result`, whose `tool_use` is in a file
+        // this one does not contain (§9). It is still a step of the turn, so it keeps its line.
+        None if d.kind == DocKind::ToolCall => {
+            let id = d.tool_use_id.as_deref().unwrap_or("?");
+            format!("result({}){}", truncate(id, 24), skeleton_status(d))
+        }
+        None => {
+            let text = one_line(&skeleton_text(d), SKELETON_LINE);
+            if text.is_empty() {
+                String::new()
+            } else {
+                format!("{}: {text}", d.role)
+            }
+        }
+    }
+}
+
+/// The prose of a message, from the split rather than from `body`: `text` is the markdown minus
+/// its code blocks, which is the half a reader recognises a turn by. `body` is the fallback for
+/// a document that predates the split or never had one (`show`'s hand-built windows, an
+/// attachment).
+///
+/// Thinking is never in a skeleton, at any budget. It is opt-in everywhere else in this crate,
+/// and a rendering that quietly included it would put the model's private reasoning in the one
+/// output built to be pasted somewhere else.
+fn skeleton_text(d: &Doc) -> String {
+    let joined = d.text.join(" ");
+    if !joined.trim().is_empty() {
+        return joined;
+    }
+    d.body.clone()
+}
+
+/// `key=value` pairs of a call's input, as `tool_params` picks them: the parameters that say
+/// what the call was *on*. Two of them, not six — a signature, not a rendering of the input.
+fn skeleton_params(d: &Doc) -> String {
+    match d.tool_input.as_ref() {
+        Some(input) => one_line(&param_pairs(input, 2).join(", "), SKELETON_LINE),
+        None => String::new(),
+    }
+}
+
+/// How a call ended, and — only when it failed — why.
+///
+/// **The one place output text earns a slot in a skeleton.** `doc_body` already leads a failed
+/// call with its result for the same reason: the error is the answer and the command that
+/// failed is only context, which is the whole point of `--errors-only`.
+fn skeleton_status(d: &Doc) -> String {
+    let output = d.tool_output.as_deref().filter(|o| !o.trim().is_empty());
+    match (d.is_error, output) {
+        (true, Some(output)) => format!(" -> error: {}", first_line(output, SKELETON_ERROR)),
+        // Flagged an error with nothing to show for it: still an error, and saying so beats
+        // rendering it as a success.
+        (true, None) => " -> error".to_string(),
+        (false, Some(_)) => " -> ok".to_string(),
+        // No result in the index: the call was still running when the transcript was captured,
+        // or its result was spilled to a file `--no-spilled-results` kept out. Neither is "ok".
+        (false, None) => " -> no result".to_string(),
+    }
+}
+
+/// The first non-empty line of `text`, capped. Deliberately not `one_line`, which folds a whole
+/// stack trace into one paragraph: what names a failure is its first line, and everything under
+/// it is the frames.
+fn first_line(text: &str, max: usize) -> String {
+    let first = text.lines().find(|l| !l.trim().is_empty()).unwrap_or("");
+    one_line(first, max)
+}
+
+fn skeleton_json(skeleton: &Skeleton) -> Value {
+    json!({
+        "lines": skeleton.lines,
+        "dropped": skeleton.dropped,
+        "bytes": skeleton.bytes(),
+    })
+}
+
+/// The skeleton under a hit, indented to sit where `write_context` would have.
+fn write_skeleton(w: &mut impl Write, docs: &[Doc], ink: Ink, cols: usize) -> Result<()> {
+    let skeleton = turn_skeleton(docs, SKELETON_BUDGET);
+    for line in &skeleton.lines {
+        writeln!(w, "      {}", ink.paint(&truncate(line, cols), dim()))?;
+    }
+    if skeleton.dropped > 0 {
+        let note = format!(
+            "… +{} more doc(s) over the skeleton budget",
+            skeleton.dropped
+        );
+        writeln!(w, "      {}", ink.paint(&note, bar_style()))?;
     }
     Ok(())
 }
@@ -653,6 +889,48 @@ pub fn turn_view(w: &mut impl Write, docs: &[Doc], span: TurnSpan, o: &OutputOpt
     docs_view(w, docs, Some(span), o)
 }
 
+/// [`turn_view`] as a skeleton (`show --around ... --turn --skeleton`): the same window and the
+/// same cap line, with the documents rendered as their signatures instead of their bodies.
+pub fn turn_skeleton_view(
+    w: &mut impl Write,
+    docs: &[Doc],
+    span: TurnSpan,
+    o: &OutputOpts,
+) -> Result<()> {
+    let skeleton = turn_skeleton(docs, SKELETON_BUDGET);
+    if o.json {
+        return json_line(
+            w,
+            &json!({
+                "count": docs.len(),
+                "turn": turn_json(span, docs.len()),
+                "skeleton": skeleton_json(&skeleton),
+            }),
+        );
+    }
+
+    let ink = Ink::new(o.color);
+    let cols = o.cols();
+    let Some(lead) = docs.first() else {
+        writeln!(w, "{}", ink.paint("no documents", dim()))?;
+        return Ok(());
+    };
+    write_session_header(w, lead, None, "hit", ink, cols)?;
+    writeln!(w, "▌ {}", ink.paint(&span.label(docs.len()), bar_style()))?;
+    writeln!(w)?;
+    for line in &skeleton.lines {
+        writeln!(w, "{}", truncate(line, cols))?;
+    }
+    if skeleton.dropped > 0 {
+        let note = format!(
+            "… +{} more doc(s) over the skeleton budget",
+            skeleton.dropped
+        );
+        writeln!(w, "{}", ink.paint(&note, bar_style()))?;
+    }
+    Ok(())
+}
+
 fn docs_view(
     w: &mut impl Write,
     docs: &[Doc],
@@ -679,7 +957,7 @@ fn docs_view(
         writeln!(w, "{}", ink.paint("no documents", dim()))?;
         return Ok(());
     };
-    write_session_header(w, lead, None, ink, cols)?;
+    write_session_header(w, lead, None, "hit", ink, cols)?;
     // Directly under the session header, where the reader is still looking: a capped turn that
     // announces itself at the bottom of two hundred documents announces itself to nobody.
     if let Some(span) = span {
@@ -1276,6 +1554,7 @@ mod tests {
             snippet: snippet.into(),
             snippet_field: crate::search::SnippetSource::Text,
             snippet_marks: Vec::new(),
+            collapsed: 0,
         }
     }
 
@@ -1285,6 +1564,7 @@ mod tests {
             hits,
             facets: BTreeMap::new(),
             elapsed_ms: 7,
+            grouped: false,
         }
     }
 
@@ -2326,5 +2606,296 @@ mod tests {
         let out = render(|w| session_view(w, &docs, &json_opts()));
         let v: Value = serde_json::from_str(&out).unwrap();
         assert!(v.get("turn").is_none());
+    }
+
+    // -----------------------------------------------------------------------
+    // turn skeletons
+    // -----------------------------------------------------------------------
+
+    /// The turn a token budget is spent on: a prompt, some prose, and a run of tool calls whose
+    /// results are the overwhelming majority of the bytes and close to none of the intent.
+    fn build_turn(turn_seq: u64) -> Vec<Doc> {
+        let output = |doc: Doc, text: &str| Doc {
+            tool_output: Some(text.into()),
+            ..doc
+        };
+        let mut docs = vec![
+            doc(0, "user", "why did the release build start failing?"),
+            doc(1, "assistant", "Checking what the last green run did."),
+            output(
+                tool_doc(
+                    2,
+                    "Bash",
+                    json!({ "command": "cargo build --release", "description": "Reproduce it" }),
+                    "Bash\ncargo build --release",
+                ),
+                // 40 KB of it in a real transcript; the point is that none of it is here.
+                "   Compiling session-search v0.1.0\nerror[E0433]: failed to resolve\n …",
+            ),
+            output(
+                tool_doc(
+                    3,
+                    "Read",
+                    json!({ "file_path": "/home/user/session-search/src/tokenizer.rs" }),
+                    "Read\nsrc/tokenizer.rs",
+                ),
+                "     1\tuse tantivy::tokenizer::…",
+            ),
+            output(
+                tool_doc(
+                    4,
+                    "Grep",
+                    json!({ "pattern": "register_tokenizer", "path": "src" }),
+                    "Grep\nregister_tokenizer",
+                ),
+                "src/tokenizer.rs:41\nsrc/index.rs:88",
+            ),
+            doc(
+                5,
+                "assistant",
+                "The analyzer was renamed, so every field's tokenizer is missing.",
+            ),
+        ];
+        for d in &mut docs {
+            d.turn_seq = turn_seq;
+            d.seq += turn_seq;
+        }
+        docs
+    }
+
+    /// The same turn with the reproduction failing, which is the case the skeleton makes an
+    /// exception for: the error's first line rides *in* the skeleton, because the error is the
+    /// answer and the command that failed is only context.
+    fn failing_turn(turn_seq: u64) -> Vec<Doc> {
+        let mut docs = build_turn(turn_seq);
+        docs[2].is_error = true;
+        docs[2].tool_output = Some(
+            "error[E0433]: failed to resolve: use of undeclared crate or module `tokenizer`\n \
+             --> src/index.rs:88:14\n  |\n88 |     tokenizer::register(&index);\n  |     \
+             ^^^^^^^^^ use of undeclared crate"
+                .into(),
+        );
+        docs
+    }
+
+    #[test]
+    fn a_skeleton_is_the_calls_without_their_output() {
+        let skeleton = turn_skeleton(&build_turn(10), SKELETON_BUDGET);
+        assert_eq!(
+            skeleton.lines,
+            vec![
+                "user: why did the release build start failing?",
+                "assistant: Checking what the last green run did.",
+                "Bash(command=cargo build --release, description=Reproduce it) -> ok",
+                "Read(file_path=/home/user/session-search/src/tokenizer.rs) -> ok",
+                "Grep(path=src, pattern=register_tokenizer) -> ok",
+                "assistant: The analyzer was renamed, so every field's tokenizer is missing.",
+            ]
+        );
+        assert_eq!(skeleton.dropped, 0);
+        // The claim the whole feature rests on, asserted rather than asserted-to: nothing that
+        // came *back* from a successful call is in here.
+        let rendered = skeleton.lines.join("\n");
+        assert!(!rendered.contains("Compiling"), "{rendered}");
+        assert!(!rendered.contains("use tantivy"), "{rendered}");
+        assert!(!rendered.contains("src/index.rs:88"), "{rendered}");
+    }
+
+    /// The one exception, and the reason it is one. `--errors-only` retrieves exactly the right
+    /// documents and a skeleton without this would preview the command that failed rather than
+    /// the reason it broke.
+    #[test]
+    fn a_failed_call_carries_the_first_line_of_its_error() {
+        let skeleton = turn_skeleton(&failing_turn(10), SKELETON_BUDGET);
+        assert!(
+            skeleton.lines[2].starts_with("Bash(command=cargo build --release"),
+            "{:?}",
+            skeleton.lines[2]
+        );
+        assert!(
+            skeleton.lines[2].contains("-> error: error[E0433]: failed to resolve"),
+            "{:?}",
+            skeleton.lines[2]
+        );
+        // The first line of it, not the frames under it: `show` is where the rest lives.
+        assert!(!skeleton.lines[2].contains("src/index.rs:88:14"));
+        assert!(!skeleton.lines[2].contains("tokenizer::register"));
+        // Every other call still says only that it succeeded.
+        assert!(skeleton.lines[3].ends_with("-> ok"));
+    }
+
+    /// Three endings, three markers. A call with no result in the index — still running when
+    /// the transcript was captured, or spilled to a file `--no-spilled-results` kept out — is
+    /// not a success, and rendering it as one would be the skeleton's one lie.
+    #[test]
+    fn every_call_says_how_it_ended() {
+        let mut docs = build_turn(0);
+        docs[3].tool_output = None;
+        docs[4].is_error = true;
+        docs[4].tool_output = None;
+        let lines = turn_skeleton(&docs, SKELETON_BUDGET).lines;
+        assert!(lines[2].ends_with("-> ok"), "{:?}", lines[2]);
+        assert!(lines[3].ends_with("-> no result"), "{:?}", lines[3]);
+        assert!(lines[4].ends_with("-> error"), "{:?}", lines[4]);
+    }
+
+    /// An orphaned `tool_result` — its `tool_use` is in a file this one does not contain (§9) —
+    /// has no name and no input, and is still a step of the turn.
+    #[test]
+    fn an_orphaned_result_is_a_line_of_its_own() {
+        let mut orphan = doc(6, "user", "");
+        orphan.kind = DocKind::ToolCall;
+        orphan.tool_use_id = Some("toolu_01QtnP3F5Y8o8sPGoePwD6Ug".into());
+        orphan.tool_output = Some("192:pub mod aggregation;".into());
+        orphan.text = Vec::new();
+        assert_eq!(
+            turn_skeleton(&[orphan], SKELETON_BUDGET).lines,
+            vec!["result(toolu_01QtnP3F5Y8o8sPGo…) -> ok"]
+        );
+    }
+
+    /// The budget is per turn and the shortfall is reported. A skeleton that stopped in the
+    /// middle of a turn without saying so would read as a turn that stopped there — the same
+    /// rule `TurnSpan` follows for the document cap above it.
+    #[test]
+    fn the_byte_budget_is_reported_not_swallowed() {
+        let docs = build_turn(0);
+        let skeleton = turn_skeleton(&docs, 100);
+        assert!(skeleton.bytes() <= 100 + SKELETON_LINE);
+        assert_eq!(skeleton.lines.len() + skeleton.dropped, docs.len());
+        assert!(skeleton.dropped > 0);
+
+        // A budget too small even for the prompt still returns the prompt: an empty skeleton
+        // would claim the turn had nothing in it.
+        let one = turn_skeleton(&docs, 1);
+        assert_eq!(one.lines.len(), 1);
+        assert_eq!(one.dropped, docs.len() - 1);
+        assert!(one.lines[0].starts_with("user: why did"));
+    }
+
+    /// Thinking is opt-in everywhere in this crate, and a rendering built to be pasted into
+    /// another context is the last place to make it opt-out by accident.
+    #[test]
+    fn thinking_is_never_in_a_skeleton() {
+        let mut docs = build_turn(0);
+        docs[1].thinking = Some("The user is wrong about the cause; check the lockfile.".into());
+        let rendered = turn_skeleton(&docs, SKELETON_BUDGET).lines.join("\n");
+        assert!(!rendered.contains("lockfile"), "{rendered}");
+    }
+
+    /// `--context skeleton` under a hit: the same window `--context turn` fetches, rendered as
+    /// what happened rather than as what it all said.
+    #[test]
+    fn a_skeleton_renders_under_a_hit() {
+        let docs = build_turn(10);
+        let r = response(vec![hit(docs[2].clone(), 4.25, "")]);
+        let ctx = vec![HitContext::skeleton(docs.clone(), 10, docs.len())];
+        let out = render(|w| search_results_ctx(w, &r, &ctx, &plain()));
+        assert!(out.contains("turn #10 · 6 docs"), "{out}");
+        assert!(
+            out.contains("why did the release build start failing?"),
+            "{out}"
+        );
+        assert!(!out.contains("Compiling session-search"), "{out}");
+        assert_window_snapshot("skeleton_under_a_hit", &out);
+    }
+
+    #[test]
+    fn a_failing_turn_renders_its_error_under_a_hit() {
+        let docs = failing_turn(10);
+        let r = response(vec![hit(docs[2].clone(), 6.10, "")]);
+        let ctx = vec![HitContext::skeleton(docs.clone(), 10, docs.len())];
+        let out = render(|w| search_results_ctx(w, &r, &ctx, &plain()));
+        assert!(out.contains("error: error[E0433]"), "{out}");
+        assert_window_snapshot("skeleton_with_an_error", &out);
+    }
+
+    /// The JSON is where the token budget is actually spent, so the skeleton *replaces* the
+    /// documents rather than joining them: sending both would undo the only thing it is for.
+    #[test]
+    fn the_json_skeleton_replaces_the_context_documents() {
+        let docs = build_turn(10);
+        let r = response(vec![hit(docs[2].clone(), 4.25, "")]);
+        let ctx = vec![HitContext::skeleton(docs.clone(), 10, docs.len())];
+        let out = render(|w| search_results_ctx(w, &r, &ctx, &json_opts()));
+        let v: Value = serde_json::from_str(&out).unwrap();
+        let hit = &v["hits"][0];
+
+        assert!(hit.get("context").is_none(), "the documents are not sent");
+        assert_eq!(hit["context_turn"]["turn_seq"], 10);
+        assert_eq!(hit["skeleton"]["lines"].as_array().unwrap().len(), 6);
+        assert_eq!(hit["skeleton"]["dropped"], 0);
+        assert_eq!(
+            hit["skeleton"]["bytes"].as_u64().unwrap(),
+            turn_skeleton(&docs, SKELETON_BUDGET).bytes() as u64
+        );
+
+        // And it is smaller by the margin the feature claims, in the units a caller pays in.
+        let full = render(|w| {
+            search_results_ctx(
+                w,
+                &r,
+                &[HitContext::turn(docs.clone(), 10, docs.len())],
+                &json_opts(),
+            )
+        });
+        assert!(
+            out.len() * 4 < full.len(),
+            "{} vs {}",
+            out.len(),
+            full.len()
+        );
+    }
+
+    /// `show --around N --turn --skeleton`: the same renderer, the same cap line, and a JSON
+    /// shape that says the same things the search hits do.
+    #[test]
+    fn the_show_skeleton_view_reports_the_same_turn() {
+        let docs = build_turn(10);
+        let span = TurnSpan {
+            turn_seq: 10,
+            total: 347,
+        };
+        let out = render(|w| turn_skeleton_view(w, &docs, span, &plain()));
+        assert!(out.contains("turn #10 · 6 of 347 docs"), "{out}");
+        assert_window_snapshot("show_turn_skeleton", &out);
+
+        let out = render(|w| turn_skeleton_view(w, &docs, span, &json_opts()));
+        let v: Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(v["count"], 6);
+        assert_eq!(v["turn"]["docs_in_turn"], 347);
+        assert_eq!(v["turn"]["truncated"], true);
+        assert_eq!(v["skeleton"]["lines"].as_array().unwrap().len(), 6);
+        assert!(v.get("docs").is_none(), "the bodies are not sent");
+    }
+
+    /// A collapsed hit says what it is standing in for, in both renderings. Without it the
+    /// reader sees a page of unrelated-looking hits and no sign that anything was folded away.
+    #[test]
+    fn a_collapsed_hit_reports_what_it_stood_in_for() {
+        let docs = build_turn(10);
+        let mut r = response(vec![Hit {
+            collapsed: 5,
+            ..hit(docs[0].clone(), 4.25, "the release **build**")
+        }]);
+        r.grouped = true;
+        r.total = 6;
+
+        let out = render(|w| search_results_ctx(w, &r, &[], &plain()));
+        assert!(out.contains("+5 in turn"), "{out}");
+        // And the summary line counts turns, because "1 of 6 hits" would invite the reader to
+        // divide one number by the other.
+        assert!(out.contains("1 turn · 6 matching docs"), "{out}");
+
+        let out = render(|w| search_results_ctx(w, &r, &[], &json_opts()));
+        let v: Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(v["hits"][0]["collapsed"], 5);
+
+        // An ordinary search grows no key: a `0` on every hit of every search is a column of
+        // noise that says nothing happened.
+        let plain_one = response(vec![hit(docs[0].clone(), 4.25, "")]);
+        let out = render(|w| search_results_ctx(w, &plain_one, &[], &json_opts()));
+        let v: Value = serde_json::from_str(&out).unwrap();
+        assert!(v["hits"][0].get("collapsed").is_none());
     }
 }

@@ -18,8 +18,9 @@ cargo test --test eval -- --nocapture
 ```
 
 Each run also writes `target/eval/report.md` (§1), `target/eval/ablation.md` (§2),
-`target/eval/similar.md` (§3), `target/eval/facets.md` (§4), plus `corpus.md`, `hits.md` and
-`similar-hits.md`, which are the per-document listings a person grading a new query reads.
+`target/eval/similar.md` (§3), `target/eval/facets.md` (§4), `target/eval/skeleton.md` (§5),
+plus `corpus.md`, `hits.md` and `similar-hits.md`, which are the per-document listings a person
+grading a new query reads.
 
 **Taken at:** the review-fix commit on `claude/issues-21-23-26-workflow-1lglrp`, which is where these
 numbers were last regenerated. `tests/fixtures/` is byte-identical to `cb810a1`, so the corpus and
@@ -41,7 +42,7 @@ visible in a table above:
 §1, §2 and §4's metrics are therefore identical to `cb810a1`'s.
 
 **Corpus: 65 documents, 6 synthetic transcripts, 39 queries, 33 of them scored.** Read
-[§5](#5-what-these-numbers-cannot-support) before quoting any of it. Two of the four scored
+[§6](#6-what-these-numbers-cannot-support) before quoting any of it. Two of the four scored
 classes cannot move at all on the metric they look best on, and the reason is in the fixture
 rather than in the ranker.
 
@@ -393,7 +394,60 @@ numbers.
 
 ---
 
-## 5. What these numbers cannot support
+## 5. Turn skeletons — issue #25
+
+Not a retrieval metric. This one measures **size**: what a hit's turn context costs as documents
+against what it costs as a skeleton, in the unit a caller actually pays in — the bytes of the
+JSON the response carries. `--context turn --json` sends the turn's documents (`format::doc_json`
+each); `--context skeleton --json` sends the skeleton object instead. Both are rendered by the
+functions the CLI renders them with, so the ratio cannot drift away from the product.
+
+The corpus is wider here than in §1–§4: the two `real_*_slice.jsonl` captures come first,
+because they are what makes this "on a real corpus", and the eval fixtures follow.
+
+One normalisation, and it matters for whether this table can be checked at all: `Doc::source_path`
+is absolute, so it is a property of the *checkout* rather than of the transcript — twenty-odd
+bytes per document more on a CI runner than in a home directory, all of them on the context side.
+It is replaced with the file's own name before measuring. That errs the safe way: a real absolute
+path adds to the context side and nothing to the skeleton, so these ratios understate the saving.
+
+```
+| transcript                                 |     turns |      docs |     ctx B |    skel B |  skel % |
+|--------------------------------------------|-----------|-----------|-----------|-----------|---------|
+| real_main_slice.jsonl                      |         1 |         9 |     14002 |      1596 |    11.4 |
+| real_sidechain_slice.jsonl                 |         1 |        11 |     19541 |      1642 |     8.4 |
+| b20208d8-fbdb-5918-ba69-d203de6ed6dc.jsonl |         3 |        12 |     13008 |      1078 |     8.3 |
+| eval-buildfail.jsonl                       |         3 |        13 |     11831 |      1096 |     9.3 |
+| eval-facets.jsonl                          |         2 |        13 |     12234 |      1261 |    10.3 |
+| eval-notes.jsonl                           |         2 |         9 |      8005 |       954 |    11.9 |
+| eval-tokenizer.jsonl                       |         4 |        12 |     11808 |      1259 |    10.7 |
+| ALL                                        |        16 |        79 |     90429 |      8886 |     9.8 |
+
+mean turn: 5651 B of context, 555 B of skeleton
+worst turn: 19541 B of context, 1642 B of skeleton
+```
+
+Bytes, not tokens: a token count needs a tokenizer this crate does not ship and would not agree
+with whichever model reads the output. Divide by ~4 for an English-and-JSON estimate — the mean
+turn goes from roughly 1400 tokens to 140, and the worst turn in the corpus from roughly 4900
+to 410.
+
+**What the shape of the table says.** The saving is not an average trick: every file lands
+between 8.3% and 11.9%, and the *worst* turn — `real_sidechain_slice.jsonl`, which is a whole
+subagent transcript, because rule 3 of the Turns section makes a sidechain one turn — is also
+the one where the byte cap does the most work. The consistency is the mechanism showing through:
+what a skeleton drops is `tool_output`, and `tool_output` is the overwhelming majority of the
+bytes in every transcript here.
+
+**What it does not measure.** The anchor document of a hit is still sent in full, with its own
+`body` and `tool_output`; this is the cost of a hit's *context*, not of a whole response. And
+the byte cap (`format::SKELETON_BUDGET`, 1600) is not reached by the mean turn at all, so this
+table cannot tell you what the cap does to a turn with two hundred tool calls in it — only that
+such a turn is bounded, which is what the cap is for.
+
+---
+
+## 6. What these numbers cannot support
 
 Stated flatly, because the tables above will be quoted and the caveats will not travel with them
 unless they are this blunt.
@@ -422,6 +476,10 @@ unless they are this blunt.
    fixture's `provenance.real_slices` is empty today and every row says `synthesised`.
 7. **§3 says almost nothing about the similarity tuning.** See the last paragraph of §3: the
    parameter that governs `--similar-to` on a real index is inert at this corpus size.
+8. **§5 is sixteen turns.** The skeleton ratio is consistent across all sixteen and across two
+   real captures, which is why it is quotable as an order of magnitude and not as `9.8%`. A
+   corpus with a forty-call turn in it would move the mean and would be the first real test of
+   the byte cap; there is no such turn in `tests/fixtures/`.
 
 The one claim in this file that the numbers do carry on their own weight is the paraphrase result
 in §2 — and even that is a demonstrated mechanism (documents that were unreachable become
