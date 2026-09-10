@@ -62,7 +62,10 @@ const SESSIONS_FILE: &str = "sessions.json";
 ///         blocks with `body`, `code`, `headings` and `code_lang` beside it, so a state file
 ///         written by an older version cannot be read back into one; and the schema gained
 ///         those fields with two new analyzers besides.
-const STATE_VERSION: u32 = 4;
+/// 4 -> 5: `turn_seq` on every document and `open_turn_seq` in the carry. Without the bump an
+///         index built by an older binary would report `turn_seq = 0` for every document,
+///         which is worse than a rebuild.
+const STATE_VERSION: u32 = 5;
 
 /// Tantivy refuses a per-thread arena below this (`MEMORY_BUDGET_NUM_BYTES_MIN`).
 const MIN_HEAP_BYTES: usize = 15_000_000;

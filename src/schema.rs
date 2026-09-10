@@ -66,6 +66,9 @@ pub struct Fields {
     pub thinking_tokens: tantivy::schema::Field,
     pub timestamp: tantivy::schema::Field,
     pub seq: tantivy::schema::Field,
+    /// The `seq` of the doc that opened this doc's turn. Fast, so turn grouping and a
+    /// pre-filtered scan read it columnar rather than out of the stored payload.
+    pub turn_seq: tantivy::schema::Field,
     pub is_error: tantivy::schema::Field,
     pub is_sidechain: tantivy::schema::Field,
     pub is_meta: tantivy::schema::Field,
@@ -184,6 +187,9 @@ pub fn build_schema() -> (Schema, Fields) {
 
     let timestamp = sb.add_date_field("timestamp", INDEXED | STORED | FAST);
     let seq = sb.add_u64_field("seq", INDEXED | STORED | FAST);
+    // Mirrors `seq`: INDEXED so `context::turn` can term-query it, FAST so grouping by turn is
+    // a columnar read, STORED so `doc_from_stored` hands it back on every hit.
+    let turn_seq = sb.add_u64_field("turn_seq", INDEXED | STORED | FAST);
     // STORED as well as indexed: `search::doc_from_stored` reads these back out of the stored
     // payload, so without it every `Hit`, every `show` document and every `--json` response
     // would report `false` — contradicting the very filter that selected them.
@@ -226,6 +232,7 @@ pub fn build_schema() -> (Schema, Fields) {
         thinking_tokens,
         timestamp,
         seq,
+        turn_seq,
         is_error,
         is_sidechain,
         is_meta,
@@ -337,6 +344,7 @@ pub fn doc_to_json(doc: &Doc, include_thinking: bool) -> Value {
         o.insert("timestamp".to_string(), json!(ts));
     }
     o.insert("seq".to_string(), json!(doc.seq));
+    o.insert("turn_seq".to_string(), json!(doc.turn_seq));
     o.insert("is_error".to_string(), json!(u64::from(doc.is_error)));
     o.insert(
         "is_sidechain".to_string(),
@@ -360,6 +368,7 @@ mod tests {
             kind: DocKind::ToolCall,
             source_path: "/tmp/sess.jsonl".into(),
             seq: 7,
+            turn_seq: 5,
             session_id: "sess".into(),
             agent_id: None,
             agent_type: None,
@@ -427,6 +436,7 @@ mod tests {
             "thinking",
             "timestamp",
             "seq",
+            "turn_seq",
             "is_error",
             "is_sidechain",
             "is_meta",
@@ -478,6 +488,7 @@ mod tests {
         assert_eq!(first(f.kind), "tool_call");
         assert_eq!(first(f.tool_name), "Bash");
         assert_eq!(doc.get_first(f.seq).unwrap().as_u64(), Some(7));
+        assert_eq!(doc.get_first(f.turn_seq).unwrap().as_u64(), Some(5));
         assert_eq!(doc.get_first(f.is_error).unwrap().as_u64(), Some(1));
         assert!(doc.get_first(f.timestamp).unwrap().as_datetime().is_some());
         assert!(doc.get_first(f.project_facet).unwrap().as_facet().is_some());

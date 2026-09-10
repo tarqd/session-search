@@ -285,7 +285,7 @@ overridable with `--index` / `$SESSION_SEARCH_INDEX`.
 
 ```
 <index>/tantivy/        the Tantivy index
-<index>/state.json      { "version": 4, "roots": [...], "thinking_indexed": bool,
+<index>/state.json      { "version": 5, "roots": [...], "thinking_indexed": bool,
                           "files": { "<abs path>": {size, mtime_ms, byte_offset, docs, carry} } }
 <index>/sessions.json   { "<abs transcript path>": SessionInfo }
 ```
@@ -329,6 +329,10 @@ pub struct Doc {
                                  // (or none), and `index.rs` continues numbering with
                                  // `seq_base` = the previously recorded `docs` count, so the
                                  // two only agree if they are both per-doc.
+    /// The conversational turn this doc belongs to: the `seq` of the first doc emitted from
+    /// the record that opened it. See "Turns" below. `#[serde(default)]`: travels in the carry.
+    #[serde(default)]
+    pub turn_seq: u64,
     pub session_id: String,
     pub agent_id: Option<String>,
     pub agent_type: Option<String>,
@@ -422,6 +426,10 @@ pub struct ParseCarry {
                                          // then a late result only suppresses the duplicate.
     pub counted_message_ids: Vec<String>,
     pub tail_line: Option<TailLine>,     // { start: u64, hash: u64 }
+    pub open_turn_seq: Option<u64>,      // the turn open at the last consumed byte, so a tail
+                                         // continues numbering instead of restarting it at
+                                         // its own `seq_base`. `None` (an older state.json)
+                                         // falls back to `seq_base`.
 }
 
 /// Per-file inputs that are not the bytes of the file itself.
@@ -491,6 +499,8 @@ Field names and options:
 | `thinking_tokens` | `U64 \| FAST \| STORED \| INDEXED` — per-message reasoning cost |
 | `timestamp` | date field, `INDEXED \| STORED \| FAST` (tantivy 0.26 has no `DATE` flag const; `add_date_field` takes the numeric flags) |
 | `seq` | `U64 \| STORED \| FAST \| INDEXED` |
+| `turn_seq` | `U64 \| STORED \| FAST \| INDEXED` — mirrors `seq`. INDEXED so `context::turn` can term-query it, FAST so grouping by turn is a columnar read, STORED so every hit reports it |
+| `context_text` | indexed with the `prose` tokenizer, `WithFreqsAndPositions`, **not stored**. A compact context header — session title / opening prompt, project, branch, the turn's opening prompt — prepended at index time so a fragment is findable by what it was *for* (contextual BM25). A default query field; **never a snippet source**; absent from `doc_from_stored` and from `--json`. See "Contextual BM25" below |
 | `is_error`, `is_sidechain`, `is_meta` | `U64 \| FAST \| INDEXED \| STORED` (0/1) — STORED because `search::doc_from_stored` reads them back out of the stored payload |
 | `raw` | `STORED` only |
 
@@ -684,7 +694,44 @@ pub fn around(index: &tantivy::Index, f: &Fields, session_id: &str, agent_id: Op
     -> anyhow::Result<Vec<Doc>>;
 pub fn session(index: &tantivy::Index, f: &Fields, session_id: &str, agent_id: Option<&str>,
                source_path: Option<&str>, limit: usize) -> anyhow::Result<Vec<Doc>>;
+/// Every document of one turn, in `seq` order, capped at `limit` docs. `source_path` is
+/// required, not optional: `turn_seq` is a per-FILE ordinal like `seq`, and two files can share
+/// a `session_id` (§9), so scoping by path is what keeps two transcripts from interleaving. A
+/// `TermQuery` on `source_path` ANDed with a term query on the `turn_seq` fast field.
+pub fn turn(index: &tantivy::Index, f: &Fields, source_path: &str, turn_seq: u64, limit: usize)
+    -> anyhow::Result<Vec<Doc>>;
 ```
+
+### Turns
+
+A **turn** is the span from one human prompt to the next: the prompt, the assistant text answering
+it, and every tool call and result in between. It is the smallest unit that carries its own
+referent — half of all user messages are "yes", "do that", "still broken" — and it is what
+answers "why did the build fail" when the answer spans four documents. One doc per message / per
+tool call stays; the turn is an identifier layered on top, not a replacement.
+
+The transcript format already defines the boundary: conversational order is file order, and the
+boundary is exactly a `user` record that `UserRecord::is_human_turn()` accepts (tool results,
+compaction summaries, meta turns and `isVisibleInTranscriptOnly` records are `user` records too,
+and the predicate excludes every one of them). Three rules pin `turn_seq`:
+
+1. **Definition.** `turn_seq` is the `seq` of the first doc emitted from the record that opened
+   the turn. Every doc in the turn carries it, so a turn is a contiguous `seq` range within one
+   `source_path`, and the opening prompt is the doc whose `seq == turn_seq`.
+2. **A file that opens mid-conversation** (`resetSessionFile()`, a `relocated` sidecar — §9) has
+   assistant records before any human prompt. Those docs get `turn_seq == seq_base` — a synthetic
+   opening turn — so grouping stays total and no consumer handles an `Option`.
+3. **A sidechain is one turn.** A subagent's `user` records are synthesised by the parent, so
+   `origin.kind == "human"` never fires and the whole file shares `turn_seq == seq_base`. That is
+   arguably right — a subagent invocation *is* one turn of its parent — but any window that snaps
+   to a turn has to cap, because "the turn" here is the whole transcript.
+
+`ParseCarry::open_turn_seq` is the non-obvious part. A tail parse sees only the appended bytes,
+and on a live transcript a turn straddles that boundary nearly every time; without the carry every
+tail would restart numbering at its own `seq_base` and the incremental result would stop matching
+`parse_whole`, which the rules above require byte for byte. Replacements keep their original
+`turn_seq` for free — they are rebuilt from the carried `Doc`, and a late result only fills in
+`tool_output`.
 
 `format.rs`:
 

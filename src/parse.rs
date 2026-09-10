@@ -63,6 +63,19 @@ pub struct Doc {
     pub source_path: String,
     /// Monotonic ordinal within the file, continuing from `seq_base`.
     pub seq: u64,
+    /// The conversational turn this doc belongs to: the `seq` of the first doc emitted from the
+    /// record that opened it — the `user` record `UserRecord::is_human_turn()` accepts. A turn
+    /// is that prompt, the assistant text answering it and every tool call and result in
+    /// between, so it is a contiguous `seq` range within one `source_path`.
+    ///
+    /// A file that opens mid-conversation (`resetSessionFile()`, a `relocated` sidecar —
+    /// TRANSCRIPT-FORMAT §9) has no opening prompt; its leading docs get `turn_seq == seq_base`,
+    /// a synthetic turn, so grouping stays total. A subagent file's `user` records are
+    /// synthesised by the parent and never pass the predicate, so a sidechain is one turn.
+    ///
+    /// `#[serde(default)]`: a `Doc` also travels inside [`ParseCarry`] in `state.json`.
+    #[serde(default)]
+    pub turn_seq: u64,
     pub session_id: String,
     pub agent_id: Option<String>,
     pub agent_type: Option<String>,
@@ -242,6 +255,12 @@ pub struct ParseCarry {
     pub charged_message_ids: Vec<String>,
     /// `(start offset, hash)` of the last complete line consumed.
     pub tail_line: Option<TailLine>,
+    /// The turn open at the end of the last consumed byte — the `turn_seq` the next doc of this
+    /// file belongs to unless a human prompt opens a new one. A turn straddles a tail boundary
+    /// nearly every time on a live transcript; without this the tail restarts turn numbering
+    /// at its own `seq_base` and stops matching what a whole-file parse produces. `None` (a
+    /// `state.json` from before this field) falls back to `seq_base`.
+    pub open_turn_seq: Option<u64>,
 }
 
 /// One tool call whose document is in the index but whose result has not been read yet.
@@ -462,6 +481,10 @@ struct Parser<'a> {
     /// First user text of any kind, used when no record passes the human-turn predicate
     /// (subagent transcripts have no `origin` on their opening turn).
     fallback_first_prompt: Option<String>,
+    /// The turn the previous tail parse left open, from [`ParseCarry::open_turn_seq`].
+    carried_open_turn: Option<u64>,
+    /// `turn_seq` for every doc emitted from here on; set by `finish` as it walks the records.
+    current_turn: u64,
 }
 
 impl<'a> Parser<'a> {
@@ -503,6 +526,8 @@ impl<'a> Parser<'a> {
             last_uuid: None,
             tail_line: ctx.carry.tail_line,
             fallback_first_prompt: None,
+            carried_open_turn: ctx.carry.open_turn_seq,
+            current_turn: 0,
         }
     }
 
@@ -810,12 +835,23 @@ impl<'a> Parser<'a> {
         let mut docs: Vec<Doc> = Vec::new();
         let mut seq = seq_base;
         let lines = std::mem::take(&mut self.lines);
+        // A tail continues the turn the last run left open; a whole-file parse — or a file
+        // that opens mid-conversation — starts in a synthetic turn numbered `seq_base`.
+        self.current_turn = self.carried_open_turn.unwrap_or(seq_base);
 
         for line in &lines {
             self.absorb_metadata(&line.parsed);
             let mut emitted: Vec<PartialDoc> = Vec::new();
             match &line.parsed.record {
-                Record::User(u) => self.user_docs(u, &mut emitted),
+                Record::User(u) => {
+                    // A human prompt opens a turn, and `seq` here is what the first doc emitted
+                    // from this record will be numbered. Tool results, compaction summaries
+                    // and meta turns are `user` records too; the predicate excludes them.
+                    if u.is_human_turn() {
+                        self.current_turn = seq;
+                    }
+                    self.user_docs(u, &mut emitted)
+                }
                 Record::Assistant(a) => self.assistant_docs(a, &mut emitted),
                 Record::Attachment(a) => self.attachment_docs(a, &mut emitted),
                 Record::System(s) => self.system_docs(s, &mut emitted),
@@ -911,6 +947,7 @@ impl<'a> Parser<'a> {
             counted_message_ids: tail_of(self.counted_order.clone(), CARRY_CAP),
             charged_message_ids: tail_of(self.charged_order.clone(), CARRY_CAP),
             tail_line: self.tail_line,
+            open_turn_seq: Some(self.current_turn),
         }
     }
 
@@ -1348,6 +1385,7 @@ impl<'a> Parser<'a> {
             kind: p.kind,
             source_path: self.session.source_path.clone(),
             seq,
+            turn_seq: self.current_turn,
             session_id,
             agent_id,
             agent_type,
