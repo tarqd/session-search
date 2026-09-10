@@ -346,7 +346,9 @@ impl SearchBody {
                         "both current={page} and offset={offset} were given; offset wins"
                     ));
                 }
-                let page = if size == 0 { 1 } else { offset / size + 1 };
+                // `size` is 0 on an explicit `resultsPerPage=0`, which asks for totals and
+                // facets and no hits. There is exactly one page of nothing, so it is page 1.
+                let page = offset.checked_div(size).map_or(1, |page| page + 1);
                 (offset, page)
             }
             None => (page.saturating_sub(1).saturating_mul(size), page),
