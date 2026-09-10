@@ -127,17 +127,76 @@ fn role_style(role: &str) -> Style {
 // search results
 // ---------------------------------------------------------------------------
 
+/// The turn a window snapped to, and how big that turn is.
+///
+/// A turn window is capped — one prompt can open a turn hundreds of documents long — so the
+/// count travels with it. Without it the rendering can only show what it was given, and a
+/// truncated turn reads as the whole answer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TurnSpan {
+    pub turn_seq: u64,
+    /// Documents in the turn before the cap.
+    pub total: usize,
+}
+
+impl TurnSpan {
+    fn truncated(&self, shown: usize) -> bool {
+        self.total > shown
+    }
+
+    /// "turn #12 · 200 of 347 docs" — the cap, said out loud, or the plain size when it did not
+    /// bite.
+    fn label(&self, shown: usize) -> String {
+        if self.truncated(shown) {
+            format!("turn #{} · {shown} of {} docs", self.turn_seq, self.total)
+        } else {
+            format!(
+                "turn #{} · {} doc{}",
+                self.turn_seq,
+                self.total,
+                if self.total == 1 { "" } else { "s" }
+            )
+        }
+    }
+}
+
+/// One hit's pre-fetched surroundings, as `cli.rs` assembled them.
+///
+/// `--context N` fills `docs` alone; `--context turn` also fills `turn`, because a window that
+/// snapped to a turn has a size of its own to report and the documents by themselves cannot say
+/// whether any were left out.
+#[derive(Debug, Clone, Default)]
+pub struct HitContext {
+    pub docs: Vec<Doc>,
+    pub turn: Option<TurnSpan>,
+}
+
+impl HitContext {
+    /// A `--context N` window: neighbouring documents, no turn boundary involved.
+    pub fn around(docs: Vec<Doc>) -> Self {
+        HitContext { docs, turn: None }
+    }
+
+    /// A `--context turn` window: the head of the turn, and what the whole turn holds.
+    pub fn turn(docs: Vec<Doc>, turn_seq: u64, total: usize) -> Self {
+        HitContext {
+            docs,
+            turn: Some(TurnSpan { turn_seq, total }),
+        }
+    }
+}
+
 pub fn search_results(w: &mut impl Write, r: &SearchResponse, o: &OutputOpts) -> Result<()> {
     search_results_ctx(w, r, &[], o)
 }
 
 /// [`search_results`] with pre-fetched context turns: `context[i]` is the window around
-/// `r.hits[i]`, as returned by `context::around`. A short slice (or an empty one) simply means
-/// "no context for those hits", which is what `--context 0` produces.
+/// `r.hits[i]`, as returned by `context::around` or `context::turn_window`. A short slice (or an
+/// empty one) simply means "no context for those hits", which is what `--context 0` produces.
 pub fn search_results_ctx(
     w: &mut impl Write,
     r: &SearchResponse,
-    context: &[Vec<Doc>],
+    context: &[HitContext],
     o: &OutputOpts,
 ) -> Result<()> {
     if o.json {
@@ -146,12 +205,16 @@ pub fn search_results_ctx(
     human_search(w, r, context, o)
 }
 
-fn search_json(r: &SearchResponse, context: &[Vec<Doc>]) -> Value {
+fn search_json(r: &SearchResponse, context: &[HitContext]) -> Value {
+    const NONE: &HitContext = &HitContext {
+        docs: Vec::new(),
+        turn: None,
+    };
     let hits: Vec<Value> = r
         .hits
         .iter()
         .enumerate()
-        .map(|(i, hit)| hit_json(hit, context.get(i).map(Vec::as_slice).unwrap_or(&[])))
+        .map(|(i, hit)| hit_json(hit, context.get(i).unwrap_or(NONE)))
         .collect();
     json!({
         "total": r.total,
@@ -162,20 +225,34 @@ fn search_json(r: &SearchResponse, context: &[Vec<Doc>]) -> Value {
     })
 }
 
-fn hit_json(hit: &Hit, context: &[Doc]) -> Value {
+fn hit_json(hit: &Hit, context: &HitContext) -> Value {
     let mut value = doc_json(&hit.doc);
     let object = value
         .as_object_mut()
         .expect("doc_json always builds an object");
     object.insert("score".into(), json!(hit.score));
     object.insert("snippet".into(), json!(hit.snippet));
-    if !context.is_empty() {
+    if !context.docs.is_empty() {
         object.insert(
             "context".into(),
-            Value::Array(context.iter().map(doc_json).collect()),
+            Value::Array(context.docs.iter().map(doc_json).collect()),
         );
     }
+    if let Some(span) = context.turn {
+        object.insert("context_turn".into(), turn_json(span, context.docs.len()));
+    }
     value
+}
+
+/// The turn a window snapped to. `truncated` is the point of it: a consumer that pages through
+/// `context` has no other way to tell a short turn from a capped one.
+fn turn_json(span: TurnSpan, shown: usize) -> Value {
+    json!({
+        "turn_seq": span.turn_seq,
+        "shown": shown,
+        "docs_in_turn": span.total,
+        "truncated": span.truncated(shown),
+    })
 }
 
 /// Whichever body a document actually has. A tool call with no input, and an orphaned
@@ -254,7 +331,7 @@ pub fn doc_json(d: &Doc) -> Value {
 fn human_search(
     w: &mut impl Write,
     r: &SearchResponse,
-    context: &[Vec<Doc>],
+    context: &[HitContext],
     o: &OutputOpts,
 ) -> Result<()> {
     let ink = Ink::new(o.color);
@@ -297,7 +374,14 @@ fn human_search(
                 writeln!(w, "      {}", highlight(&line, ink))?;
             }
             if let Some(around) = context.get(i) {
-                write_context(w, around, hit.doc.seq, ink, cols)?;
+                if let Some(span) = around.turn {
+                    writeln!(
+                        w,
+                        "      {}",
+                        ink.paint(&span.label(around.docs.len()), bar_style())
+                    )?;
+                }
+                write_context(w, &around.docs, hit.doc.seq, ink, cols)?;
             }
         }
     }
@@ -545,14 +629,33 @@ pub fn facet_list(w: &mut impl Write, r: &FacetResult, o: &OutputOpts) -> Result
 // ---------------------------------------------------------------------------
 
 pub fn session_view(w: &mut impl Write, docs: &[Doc], o: &OutputOpts) -> Result<()> {
+    docs_view(w, docs, None, o)
+}
+
+/// [`session_view`] for a window that snapped to a turn (`show --around ... --turn`): the same
+/// rendering, plus the line that says which turn it is and how much of it the cap left out.
+pub fn turn_view(w: &mut impl Write, docs: &[Doc], span: TurnSpan, o: &OutputOpts) -> Result<()> {
+    docs_view(w, docs, Some(span), o)
+}
+
+fn docs_view(
+    w: &mut impl Write,
+    docs: &[Doc],
+    span: Option<TurnSpan>,
+    o: &OutputOpts,
+) -> Result<()> {
     if o.json {
-        return json_line(
-            w,
-            &json!({
-                "count": docs.len(),
-                "docs": docs.iter().map(doc_json).collect::<Vec<_>>(),
-            }),
-        );
+        let mut value = json!({
+            "count": docs.len(),
+            "docs": docs.iter().map(doc_json).collect::<Vec<_>>(),
+        });
+        if let Some(span) = span {
+            value
+                .as_object_mut()
+                .expect("json! built an object")
+                .insert("turn".into(), turn_json(span, docs.len()));
+        }
+        return json_line(w, &value);
     }
 
     let ink = Ink::new(o.color);
@@ -562,6 +665,11 @@ pub fn session_view(w: &mut impl Write, docs: &[Doc], o: &OutputOpts) -> Result<
         return Ok(());
     };
     write_session_header(w, lead, None, ink, cols)?;
+    // Directly under the session header, where the reader is still looking: a capped turn that
+    // announces itself at the bottom of two hundred documents announces itself to nobody.
+    if let Some(span) = span {
+        writeln!(w, "▌ {}", ink.paint(&span.label(docs.len()), bar_style()))?;
+    }
 
     for doc in docs {
         writeln!(w)?;
@@ -1289,6 +1397,10 @@ mod tests {
             hit.get("context").is_none(),
             "context appears only when --context asked for it"
         );
+        assert!(
+            hit.get("context_turn").is_none(),
+            "the turn window and its cap appear only under --context turn"
+        );
 
         assert_eq!(hit["kind"], "tool_call", "kind matches the --kind values");
         assert_eq!(hit["seq"], 41);
@@ -1307,10 +1419,10 @@ mod tests {
     #[test]
     fn context_rides_along_in_json_when_present() {
         let r = sample();
-        let around = vec![vec![
+        let around = vec![HitContext::around(vec![
             doc(40, "user", "before"),
             doc(42, "assistant", "after"),
-        ]];
+        ])];
         let out = render(|w| search_results_ctx(w, &r, &around, &json_opts()));
         let v: Value = serde_json::from_str(&out).unwrap();
         let context = v["hits"][0]["context"].as_array().expect("context array");
@@ -1452,11 +1564,11 @@ mod tests {
     #[test]
     fn context_turns_render_under_the_hit() {
         let r = response(vec![hit(doc(41, "assistant", "body"), 1.0, "body")]);
-        let around = vec![vec![
+        let around = vec![HitContext::around(vec![
             doc(40, "user", "the turn before"),
             doc(41, "assistant", "body"),
             doc(42, "user", "the turn after"),
-        ]];
+        ])];
         let out = render(|w| search_results_ctx(w, &r, &around, &plain()));
         assert!(out.contains("#40"), "{out}");
         assert!(out.contains("the turn before"), "{out}");
@@ -1624,7 +1736,7 @@ mod tests {
         // …and the same document seen as a neighbour in a context window.
         let neighbour = doc(5, "assistant", "and then");
         let r = response(vec![hit(neighbour.clone(), 1.0, "and then")]);
-        let ctx = vec![vec![orphan, neighbour]];
+        let ctx = vec![HitContext::around(vec![orphan, neighbour])];
         let out = render(|w| search_results_ctx(w, &r, &ctx, &plain()));
         assert!(out.contains("Finished dev profile"), "{out}");
     }
@@ -1979,5 +2091,190 @@ mod tests {
         let v = doc_json(&d);
         assert_eq!(v["seq"], 7);
         assert_eq!(v["turn_seq"], 5);
+    }
+
+    /// One turn, numbered the way `parse.rs` numbers one: every document carries the `seq` of
+    /// the document that opened the turn. Built from `search::testkit::blank_doc`, so the
+    /// rendering meets the same shape `search::doc_from_stored` hands back.
+    fn turn_docs(turn_seq: u64, rows: &[(&str, Option<&str>, &str)]) -> Vec<Doc> {
+        rows.iter()
+            .enumerate()
+            .map(|(offset, (role, tool, body))| {
+                let mut d = crate::search::testkit::blank_doc(turn_seq + offset as u64);
+                d.turn_seq = turn_seq;
+                d.role = (*role).into();
+                d.body = (*body).into();
+                if let Some(tool) = tool {
+                    d.kind = DocKind::ToolCall;
+                    d.tool_name = Some((*tool).to_string());
+                }
+                d
+            })
+            .collect()
+    }
+
+    /// A snapshot of rendered text carries three things that are not reproducible across
+    /// machines — clock times, dates and absolute paths — so they are filtered out, per the
+    /// conventions in `docs/DESIGN.md`.
+    fn assert_window_snapshot(name: &str, rendered: &str) {
+        insta::with_settings!({filters => vec![
+            (r"\d{4}-\d{2}-\d{2} \d{2}:\d{2}", "[date]"),
+            (r"\d{2}:\d{2}:\d{2}", "[time]"),
+            (r"/(?:home|tmp)/\S+", "[path]"),
+        ]}, {
+            insta::assert_snapshot!(name, rendered);
+        });
+    }
+
+    /// The turn a debugging hit sits in: the question, the attempt, and the answer.
+    fn debugging_turn(turn_seq: u64) -> Vec<Doc> {
+        turn_docs(
+            turn_seq,
+            &[
+                ("user", None, "why did the release build start failing?"),
+                ("assistant", None, "Checking what the last green run did."),
+                ("assistant", Some("Bash"), "Bash\ncargo build --release"),
+                ("assistant", Some("Read"), "Read\nsrc/tokenizer.rs"),
+                (
+                    "assistant",
+                    None,
+                    "The analyzer was renamed, so every field's tokenizer is missing.",
+                ),
+            ],
+        )
+    }
+
+    /// The case `--context turn` exists for: a hit four documents into a turn. A fixed window
+    /// would show the neighbouring tool calls; the turn shows the prompt that explains them.
+    #[test]
+    fn a_mid_turn_hit_shows_the_prompt_that_opened_the_turn() {
+        let docs = debugging_turn(10);
+        let r = response(vec![hit(docs[3].clone(), 4.25, "")]);
+        let ctx = vec![HitContext::turn(docs.clone(), 10, docs.len())];
+        let out = render(|w| search_results_ctx(w, &r, &ctx, &plain()));
+        assert!(
+            out.contains("why did the release build start failing?"),
+            "{out}"
+        );
+        assert_window_snapshot("mid_turn_hit", &out);
+    }
+
+    /// The hit *is* the prompt: the turn is still the right window, and the hit is not printed
+    /// twice — once as itself and once as its own context.
+    #[test]
+    fn a_hit_on_the_opening_prompt_is_not_repeated_as_context() {
+        let docs = debugging_turn(10);
+        let r = response(vec![hit(docs[0].clone(), 4.25, "")]);
+        let ctx = vec![HitContext::turn(docs.clone(), 10, docs.len())];
+        let out = render(|w| search_results_ctx(w, &r, &ctx, &plain()));
+        assert_eq!(
+            out.matches("why did the release build start failing?")
+                .count(),
+            1,
+            "{out}"
+        );
+        assert_window_snapshot("first_doc_of_turn_hit", &out);
+    }
+
+    /// A turn of 347 documents, shown four at a time. The number the cap is set to belongs to
+    /// `cli.rs`; what matters here is that the rendering says what it left out instead of
+    /// letting a truncated turn read as the whole story.
+    #[test]
+    fn a_runaway_turn_says_what_the_cap_left_out() {
+        let docs = debugging_turn(40);
+        let r = response(vec![hit(docs[2].clone(), 2.0, "")]);
+        let ctx = vec![HitContext::turn(docs[..4].to_vec(), 40, 347)];
+        let out = render(|w| search_results_ctx(w, &r, &ctx, &plain()));
+        assert!(out.contains("turn #40 · 4 of 347 docs"), "{out}");
+        assert_window_snapshot("runaway_turn_cap", &out);
+    }
+
+    /// A subagent's `user` records are synthesised by the parent, so the whole sidechain file is
+    /// one turn (rule 3 of the Turns section) — the case where `show --around N --turn` would
+    /// otherwise print an entire transcript.
+    #[test]
+    fn a_sidechain_file_renders_as_one_capped_turn() {
+        let docs: Vec<Doc> = turn_docs(
+            0,
+            &[
+                ("user", None, "Find every call site of `open_or_create`."),
+                ("assistant", Some("Grep"), "Grep\nopen_or_create"),
+                ("assistant", Some("Read"), "Read\nsrc/index.rs"),
+                ("assistant", None, "Three call sites, all in `index.rs`."),
+            ],
+        )
+        .into_iter()
+        .map(|mut d| {
+            d.doc_id = format!("s1:a2cce0b9f6d21fbd9:{}", d.seq);
+            d.source_path = "/tmp/s1/subagents/agent-a2cce0b9f6d21fbd9.jsonl".into();
+            d.agent_id = Some("a2cce0b9f6d21fbd9".into());
+            d.agent_type = Some("Explore".into());
+            d.is_sidechain = true;
+            d
+        })
+        .collect();
+
+        let span = TurnSpan {
+            turn_seq: 0,
+            total: 128,
+        };
+        let out = render(|w| turn_view(w, &docs, span, &plain()));
+        assert!(out.contains("turn #0 · 4 of 128 docs"), "{out}");
+        assert_window_snapshot("sidechain_file_turn", &out);
+    }
+
+    /// The cap has to survive into the JSON as well: a consumer reading `context` has no other
+    /// way to tell a short turn from a truncated one.
+    #[test]
+    fn a_turn_window_carries_its_cap_into_the_json() {
+        let docs = debugging_turn(10);
+        let r = response(vec![hit(docs[3].clone(), 4.25, "")]);
+        let ctx = vec![HitContext::turn(docs[..4].to_vec(), 10, 347)];
+        let out = render(|w| search_results_ctx(w, &r, &ctx, &json_opts()));
+        let v: Value = serde_json::from_str(&out).unwrap();
+        let hit = &v["hits"][0];
+        assert_eq!(hit["turn_seq"], 10, "the hit reports the turn it sits in");
+        assert_eq!(hit["context_turn"]["turn_seq"], 10);
+        assert_eq!(hit["context_turn"]["shown"], 4);
+        assert_eq!(hit["context_turn"]["docs_in_turn"], 347);
+        assert_eq!(hit["context_turn"]["truncated"], true);
+        assert_eq!(hit["context"].as_array().unwrap().len(), 4);
+
+        // A window that fits reports the same keys, saying nothing was left out.
+        let ctx = vec![HitContext::turn(docs.clone(), 10, docs.len())];
+        let out = render(|w| search_results_ctx(w, &r, &ctx, &json_opts()));
+        let v: Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(v["hits"][0]["context_turn"]["truncated"], false);
+        assert_eq!(v["hits"][0]["context_turn"]["docs_in_turn"], 5);
+
+        // `--context N` carries no turn: the window is document-relative and has no boundary
+        // to report.
+        let ctx = vec![HitContext::around(docs.clone())];
+        let out = render(|w| search_results_ctx(w, &r, &ctx, &json_opts()));
+        let v: Value = serde_json::from_str(&out).unwrap();
+        assert!(v["hits"][0].get("context_turn").is_none());
+    }
+
+    /// `show --around N --turn` renders through `turn_view`, and its JSON says the same thing
+    /// the search hits do.
+    #[test]
+    fn the_show_turn_view_reports_the_cap_too() {
+        let docs = debugging_turn(10);
+        let span = TurnSpan {
+            turn_seq: 10,
+            total: 347,
+        };
+        let out = render(|w| turn_view(w, &docs, span, &json_opts()));
+        let v: Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(v["count"], 5);
+        assert_eq!(v["turn"]["turn_seq"], 10);
+        assert_eq!(v["turn"]["shown"], 5);
+        assert_eq!(v["turn"]["docs_in_turn"], 347);
+        assert_eq!(v["turn"]["truncated"], true);
+
+        // The whole-session view is the same rendering minus the turn, and must not grow the key.
+        let out = render(|w| session_view(w, &docs, &json_opts()));
+        let v: Value = serde_json::from_str(&out).unwrap();
+        assert!(v.get("turn").is_none());
     }
 }

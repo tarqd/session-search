@@ -1,0 +1,21 @@
+---
+source: src/format.rs
+expression: rendered
+---
+▌ s1  agent a2cce0b9f6d21fbd9 · Explore
+▌ [path] · main · [date]
+▌ turn #0 · 4 of 128 docs
+
+#0     [time]  user     
+      Find every call site of `open_or_create`.
+
+#1     [time]  assistant Grep
+      Grep
+      open_or_create
+
+#2     [time]  assistant Read
+      Read
+      src/index.rs
+
+#3     [time]  assistant
+      Three call sites, all in `index.rs`.

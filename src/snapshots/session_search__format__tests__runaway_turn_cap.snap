@@ -1,0 +1,15 @@
+---
+source: src/format.rs
+expression: rendered
+---
+1 of 1 hit · 7 ms
+
+▌ s1  (1 hit)
+▌ [path] · main · [date]
+
+   1. [time]  assistant Bash  #42  2.00
+      Bash cargo build --release
+      turn #40 · 4 of 347 docs
+      #40    user                 why did the release build start failing?
+      #41    assistant            Checking what the last green run did.
+      #43    assistant Read       Read src/tokenizer.rs
