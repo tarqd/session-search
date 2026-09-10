@@ -17,12 +17,25 @@ errors. A CLI now; an `mcp` subcommand serving the same operations over stdio ne
 - **One doc per message, one doc per tool call.** Hits are precise and facetable; the CLI
   expands a hit to surrounding turns on demand.
 - **Indexed text:** user prompts, assistant text, tool inputs, tool results (size-capped).
+  A tool call's result lives in its own `tool_output` field rather than being concatenated
+  onto `text`, so `tool_output:"No such file"` asks about what a tool *returned* and
+  `text:...` about what it was asked to do. Both are default query fields, so a bare query
+  still spans the pair.
   Assistant **thinking is stored but not indexed** — `--include-thinking` opts in, default off.
 - **A message body is split by kind before it is indexed.** Its prose goes to `text`, its
   fenced blocks and inline spans to `code`, its headings to `headings` — because prose and code
   want opposite analysis. The body it was written as is kept whole in `body`, stored and never
   indexed, because the split cannot be undone and `body` is what every renderer prints. See
-  "The markdown split" below.
+  "The markdown split" below. A tool call's *result* is in neither half: it is `tool_output`.
+- **Bash commands are indexed structurally as well as textually.** Every `Bash` tool-call
+  document carries `bash_cmd` — `{"program": [...], "args": [...]}`, the `argv[0]` of *every*
+  simple command in the script (pipelines, `&&` chains, subshells, loop and function bodies)
+  plus every suffix word — parsed with `brush-parser` (`src/bash.rs`). It is tokenized **raw**,
+  unlike `tool_input`: these are exact-match facts, so `--release` stays `--release` rather
+  than being split into `release`, and matching is case-sensitive (`Cargo` is not `cargo`).
+  That is what lets `--program cargo` mean "ran cargo" instead of "the command text mentions
+  cargo somewhere", which also matches `--cargo-flag` or a path segment. A command the shell
+  grammar rejects gets no `bash_cmd` at all; there is no heuristic fallback.
 - **Incremental one-shot indexing** keyed on (size, mtime, byte offset) per file.
   The read commands (`search`, `facets`, `show`, `sessions`) auto-refresh unless `--no-refresh`;
   `stats` never opens the index at all. `--include-thinking` is an *index-time* choice — turning
@@ -87,7 +100,7 @@ Two registered analyzers, one per kind of text:
 
 | analyzer | fields | pipeline |
 | --- | --- | --- |
-| `code` | `code`, `thinking`, `tool_input` | `WordTokenizer -> SplitIdentifiers -> LowerCaser -> RemoveLongFilter(255)` |
+| `code` | `code`, `tool_output`, `thinking`, `tool_input` | `WordTokenizer -> SplitIdentifiers -> LowerCaser -> RemoveLongFilter(255)` |
 | `prose` | `text`, `headings` | `WordTokenizer -> SplitIdentifiers -> LowerCaser -> Stemmer(English) -> RemoveLongFilter(255)` |
 
 `prose` is `code` plus an English stemmer, and the stemmer is the whole difference: `compiling`
@@ -102,8 +115,9 @@ split at all. Tokenizing those the stock way would index `SnippetGenerator` as o
 and leave `snippet` unable to find it, which is the hole the `code` analyzer exists to close.
 A plain English word still emits once, stemmed. `thinking` keeps `code`: it is
 prose and snippets interleaved with no marker between them, so there is no split to make, and
-the analyzer that keeps identifiers intact loses least. `tool_input` keeps `code` for the same
-reason it always had it — its values are commands and paths.
+the analyzer that keeps identifiers intact loses least. `tool_output` keeps `code` for the same
+reason — a result is diagnostics, paths and program output, never a markdown message. And
+`tool_input` keeps `code` for the reason it always had it: its values are commands and paths.
 
 The rest of this section is the `code` analyzer.
 
@@ -159,12 +173,20 @@ reindex**: `index::open_or_create` sees `SchemaError`, discards the index togeth
 without changing its name does **not** trip that check — bump the registered name too, or the
 old terms stay on disk.
 
-Snippets: one `SnippetGenerator` per response for `text`, one for `code` and, under
-`--include-thinking`, one for `thinking`. The first of those with something to highlight wins —
-prose, then code, then thinking — and a hit with nothing highlighted anywhere falls back to the
-head of its body (prose if it has any, else code, else thinking). The code generator is not
-optional: a tool call keeps its output in `code`, so most tool-call hits have nothing in `text`
-to mark.
+Snippets: one `SnippetGenerator` per response for `text`, one for `code`, one for `tool_output`
+and, under `--include-thinking`, one for `thinking`. The first of those with something to
+highlight wins — prose, then code, then the tool result, then thinking — and a hit with nothing
+highlighted anywhere falls back to the head of its body. The extra generators are not optional:
+a tool call keeps its result in `tool_output` and its file-content payloads in `code`, so most
+tool-call hits have nothing in `text` to mark.
+
+The no-snippet fallback has one rule of its own: **a failed call leads with its error.**
+`--errors-only` carries no free-text query and so lands there every time, and it otherwise
+showed the command that failed rather than the reason it broke — on a real corpus the error sat
+1,000–2,400 characters into the body, past a heredoc. This is a rendering rule
+(`format::doc_body` and `search::fallback_body`), not a storage one: with the result in a field
+of its own there is no ordering inside a body to get wrong, and nothing is reordered underneath
+a query.
 
 Each generator is built from the **whole** terms of the query only (`search::snippet_generator`).
 `SnippetGenerator::create` weighs every term of the parsed query alike and scores a fragment by
@@ -212,21 +234,24 @@ cap a body *before* splitting it.
 `parse.rs` applies it to `user` and `assistant` **message** docs only:
 
 - a **tool call is never parsed as markdown** — a `Bash` script is full of `#`, `*` and `>` that
-  mean nothing of the sort. Its name and input strings stay in `text` as they always were; its
-  **output** moves to `code`, and so do the `old_string` / `new_string` / `content` leaves of an
-  `Edit`/`Write`/`MultiEdit`, which are file contents (the key decides, at any depth);
+  mean nothing of the sort. Its name and input strings stay in `text` as they always were; the
+  `old_string` / `new_string` / `content` leaves of an `Edit`/`Write`/`MultiEdit` go to `code`,
+  because they are file contents (the key decides, at any depth); and its **result** goes to
+  `tool_output`, which is neither half of the split;
 - attachments, `system` records and a non-text `user` payload stay whole in `text` — one value,
   unsplit. They are not markdown, and the `prose` analyzer splits identifiers, so a rendered
   file, a diagnostic or a hook's output is still searchable by the parts of the names in it;
-- `max_text_bytes` still bounds one document's body: a message is truncated *before* the split,
-  and a tool call spends the same budget across `text` then `code`. `ParseOutput::replacements`
-  appends a late result as the last `code` entry against that same budget, so a completed tail
-  parse stays byte-identical to a whole-file one;
+- `max_text_bytes` bounds one document's body: a message is truncated *before* the split, and a
+  tool call spends one budget across `text` then `code` — with the input strings capped at a
+  quarter of it and never more than `INPUT_LEAVES_CAP`, so the copy does not scale with the cap.
+  `tool_output` is capped separately at the same number, because it is a field of its own rather
+  than a share of one body. `ParseOutput::replacements` only fills in `tool_output`, so a
+  completed tail parse stays byte-identical to a whole-file one without rebuilding anything;
 - every doc also carries `body`: the message's markdown as it was written (after the cap), or a
-  tool call's name, input strings and output in the order they were built. It is what `show`,
-  `--context` and `--json` print. The indexed halves cannot be reassembled into it — the split
-  drops link destinations, repeats every inline span in both halves, and knows nothing of where
-  a fence sat relative to the paragraphs around it.
+  tool call's name, input strings and file-content payloads in the order they were built. It is
+  what `show`, `--context` and `--json` print, beside `tool_output`. The indexed halves cannot
+  be reassembled into it — the split drops link destinations, repeats every inline span in both
+  halves, and knows nothing of where a fence sat relative to the paragraphs around it.
 
 ## Layout
 
@@ -234,6 +259,7 @@ cap a body *before* splitting it.
 src/
   lib.rs         re-exports; `pub mod` declarations only
   model.rs       raw serde types for transcript records          [Foundation]
+  media.rs       describe binary payloads, never index them       [Foundation]
   discovery.rs   locate roots, enumerate transcripts + sidechains [Foundation]
   parse.rs       records -> Vec<Doc>                              [Foundation]
   markdown.rs    markdown body -> prose / code / headings          [Foundation]
@@ -258,7 +284,8 @@ overridable with `--index` / `$SESSION_SEARCH_INDEX`.
 
 ```
 <index>/tantivy/        the Tantivy index
-<index>/state.json      { "files": { "<abs path>": {size, mtime_ms, byte_offset, docs, carry} }, "version": 1 }
+<index>/state.json      { "version": 4, "roots": [...], "thinking_indexed": bool,
+                          "files": { "<abs path>": {size, mtime_ms, byte_offset, docs, carry} } }
 <index>/sessions.json   { "<abs transcript path>": SessionInfo }
 ```
 
@@ -314,6 +341,12 @@ pub struct Doc {
     pub tool_name: Option<String>,
     pub tool_use_id: Option<String>,
     pub tool_input: Option<serde_json::Value>,
+    pub tool_output: Option<String>, // the joined tool_result, indexed in its own right
+    /// `bash::extract(tool_input.command).to_json()` for a `Bash` call whose command parses;
+    /// `None` for every other tool and for a command the shell grammar rejects.
+    /// `#[serde(default)]`: a `Doc` also travels inside `ParseCarry` in `state.json`.
+    #[serde(default)]
+    pub bash_cmd: Option<serde_json::Value>,
     pub is_error: bool,
     pub is_sidechain: bool,
     pub is_meta: bool,           // compaction summaries, meta turns — excluded from "human prompt"
@@ -325,11 +358,12 @@ pub struct Doc {
     pub text: Vec<String>,       // the prose half, ONE ENTRY PER BLOCK: a message's markdown
                                  // minus its code blocks, or a tool call's name + input strings
     pub code: Vec<String>,       // the code half: one entry per code block or inline span of a
-                                 // message, or a tool call's OUTPUT and file-content inputs
+                                 // message, or a tool call's file-content inputs. NOT its
+                                 // result — that is `tool_output`, above
     pub headings: Vec<String>,   // a message's markdown headings (also present in `text`)
     pub code_langs: Vec<String>, // fence info words, deduped
     pub thinking: Option<String>,// stored, indexed only with include_thinking
-    pub raw: String,             // original JSONL line
+    pub raw: String,             // the JSONL line, minus any base64 payload (`media::scrub`)
 }
 
 #[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
@@ -445,27 +479,55 @@ Field names and options:
 | `session_id`, `agent_id`, `agent_type`, `project`, `git_branch`, `role`, `kind`, `model`, `tool_name`, `entrypoint`, `permission_mode`, `version`, `slug` | `STRING \| STORED \| FAST` |
 | `project_facet` | `FacetOptions` — hierarchical, `/home/user/session-search` |
 | `tool_input` | JSON, indexed with the `code` tokenizer + `set_fast(Some("raw"))` + `set_expand_dots_enabled()` + stored |
+| `bash_cmd` | JSON, stored + indexed with tokenizer `"raw"` / `IndexRecordOption::Basic` + `set_fast(Some("raw"))` + `set_expand_dots_enabled()`. `{"program": [..], "args": [..]}` from `bash::extract`; emitted only when `Some`. The `raw` tokenizer is the point: exact-match facts, so `--release` stays `--release` and matching is case-sensitive |
 | `body` | `STORED` only — the body as it was written, which is what gets rendered |
 | `text` | stored, indexed with the `prose` tokenizer, `WithFreqsAndPositions` (`TEXT \| STORED` but for the tokenizer); **multi-valued** — one value per prose block, so a position gap stands where a code block was lifted out |
 | `headings` | same as `text`; **multi-valued** — one value per markdown heading |
-| `code` | same options, but the `code` tokenizer; **multi-valued** — one value per code block or inline span |
+| `code` | same options, but the `code` tokenizer; **multi-valued** — one value per code block or inline span of a message, and the `Edit`/`Write` file contents of a tool call |
 | `code_lang` | `STRING \| STORED \| FAST`; **multi-valued** — the info word of each fence, lowercased |
+| `tool_output` | same options as `code`, single-valued — what the tool returned, analyzed as code |
 | `thinking` | stored, indexed with the `code` tokenizer (only populated when `include_thinking`) |
+| `thinking_tokens` | `U64 \| FAST \| STORED \| INDEXED` — per-message reasoning cost |
 | `timestamp` | date field, `INDEXED \| STORED \| FAST` (tantivy 0.26 has no `DATE` flag const; `add_date_field` takes the numeric flags) |
 | `seq` | `U64 \| STORED \| FAST \| INDEXED` |
 | `is_error`, `is_sidechain`, `is_meta` | `U64 \| FAST \| INDEXED \| STORED` (0/1) — STORED because `search::doc_from_stored` reads them back out of the stored payload |
 | `raw` | `STORED` only |
 
+### Images are described, never indexed
+
+A pasted screenshot, a `Read` of a PNG and a `Bash` command with `isImage` all put base64 in
+the same fields prose lives in — ~300 KB per phone photo. None of it is text: it matches no
+query, it dilutes term statistics, and it costs its own size again in the index. `media.rs`
+replaces every payload with a placeholder describing it — `[image/jpeg 230 KiB]` — which
+tokenizes into terms someone would actually search, while the path stays where it always was,
+on the tool call. Two layers, because the transcript format is open:
+
+1. `describe_block` / `describe_payload` recognise today's shapes and render the placeholder
+   from the metadata beside the bytes.
+2. `scrub` / `redacted` recognise a base64 blob *by looking at it* — an unbroken run of ≥512
+   `[A-Za-z0-9+/=]` carrying both cases and a digit — wherever it turns up. `parse::build_doc`
+   runs it over `body`, every entry of `text`, `code` and `headings`, and over `tool_output`
+   and `thinking`, so the guarantee holds at one point rather than shape by shape — per entry,
+   because the split routes a blob to whichever half it was written in. The earlier passes
+   exist so the byte budget is spent on text.
+
+`raw` is scrubbed too. It is stored, never indexed and never returned, so a payload there is
+pure weight — it inflates the index by the size of the transcript's images and can push a
+pending tool call past `PENDING_DOC_CAP`. The elision is lexical and a base64 run cannot span
+a quote or a brace, so the line stays valid JSON and every other byte of it survives.
+
 `index.rs`:
 
 ```rust
 pub struct IndexOptions {
-    pub full: bool, pub jobs: Option<usize>, pub include_thinking: bool,
+    pub full: bool, pub jobs: Option<usize>,
+    pub include_thinking: bool,   // default TRUE; `index --no-thinking` opts out
     pub load_spilled_results: bool,  // default TRUE — follow `Full output saved to: <path>`
                                      // into `tool-results/<id>.txt`, else an oversized tool
                                      // result is only its "output too large" stub. CLI:
                                      // `index --no-spilled-results` opts out.
-    pub max_text_bytes: usize,   // default 32 * 1024, and it caps the spill too
+    pub max_text_bytes: usize,   // per body field, 1 MiB default; caps the spill too.
+                                 // CLI: `index --max-text-bytes N`
     pub heap_bytes: usize,       // default 200 MB
 }
 pub struct IndexStats {
@@ -477,6 +539,35 @@ pub fn open_or_create(index_dir: &Path) -> anyhow::Result<(tantivy::Index, Field
 pub fn run(index_dir: &Path, roots: &[PathBuf], opts: &IndexOptions) -> anyhow::Result<IndexStats>;
 pub fn load_sessions(index_dir: &Path) -> anyhow::Result<BTreeMap<String, SessionInfo>>;
 ```
+
+An index is **bound to its corpus**: `state.json` records the roots it was built from, and
+`run()` refuses a different set unless `--full` re-points it. Auto-refresh follows the recorded
+roots, never the default one — resolving the default here silently merged a second corpus into an
+index built over a snapshot, and every count then described the union.
+
+Thinking is indexed by **default** (`index --no-thinking` opts out) and the choice is recorded, so
+a query-time `--include-thinking` against an index built without it warns instead of silently
+matching nothing.
+
+`usage.output_tokens_details.thinking_tokens` is indexed as a fast field, because it survives on
+transcripts whose thinking *text* was stripped before it reached disk. It is a per-message total
+that appears on only some of the message's block records — usually the `tool_use` one, not the
+first to emit — repeated with the same value on up to four of them, so it is charged once per
+`message.id` on a record that actually carries it (`ParseCarry::charged_message_ids` keeps that
+true across an incremental boundary). Filter with `--min-thinking N`.
+
+A tool-call document is three fields: `text` is `name` plus the input's own strings, `code` is
+its `Edit`/`Write` file-content payloads, and `tool_output` is the result. A document finished
+across an incremental boundary must be byte-identical to one a whole-file parse produced —
+which is now straightforward, since `text` and `code` are both the call side and the arriving
+result only fills in `tool_output`.
+
+**A failed call previews its result first.** `--errors-only` otherwise retrieves exactly the
+right documents and shows the command that failed rather than the reason it broke — on a real
+corpus the error sat 1,000–2,400 characters into the body, past a heredoc. This is a rendering
+rule (`format::doc_body`, and the no-snippet fallback in `search`), not a storage one: with the
+result in a field of its own there is no ordering inside a body to get wrong, and nothing is
+reordered underneath a query.
 
 Incremental rules:
 - Watermark per file: `{size, mtime_ms, byte_offset, docs, carry}`.
@@ -504,6 +595,8 @@ Incremental rules:
 #[derive(Debug, Clone, Default)]
 pub struct Filters {
     pub project: Option<String>, pub tool: Vec<String>, pub tool_input: Vec<String>, // "key=value"
+    pub tool_output: Vec<String>,   // phrases the result must contain, ANDed
+    pub program: Vec<String>,    // any simple command's argv[0] in a Bash script; repeatable, OR
     pub lang: Vec<String>,       // fence languages, matched against `code_lang` (--lang)
     pub branch: Option<String>, pub model: Option<String>, pub role: Option<String>,
     pub kind: Option<String>, pub session: Option<String>, pub agent_type: Option<String>,
@@ -513,7 +606,8 @@ pub struct Filters {
 pub struct SearchRequest {
     pub query: Option<String>, pub filters: Filters,
     pub limit: usize, pub offset: usize,
-    pub facets: Vec<String>,     // "tool_name", "code_lang", "project", or any JSON path e.g. "tool_input.file_path"
+    pub facets: Vec<String>,     // "tool_name", "code_lang", "project", or any JSON path
+                                 // e.g. "tool_input.file_path", "bash_cmd.program"
     pub facet_top: usize, pub snippet_chars: usize, pub include_thinking: bool,
 }
 pub struct FacetCount { pub value: String, pub count: u64 }
@@ -525,8 +619,9 @@ pub struct FacetResult {
     pub matching_docs: u64,      // docs matching query+filters; NOT the sum of `values`
     pub docs_with_value: u64,    // of those, the DOCUMENTS carrying a value for this field —
                                  // a second Count over `query AND ExistsQuery(field)`, because
-                                 // summing the buckets counts values, and `code_lang` is
-                                 // multi-valued: one answer with a rust fence and a bash fence
+                                 // summing the buckets counts values, and `code_lang` and
+                                 // `bash_cmd.program` are multi-valued: one answer with a
+                                 // rust fence and a bash fence
                                  // is one document in two buckets
     pub other_docs: u64,         // sum_other_doc_count: values outside the returned buckets
     pub distinct: Option<u64>,   // approximate distinct values (cardinality agg)
@@ -549,19 +644,27 @@ pub fn facets(index: &tantivy::Index, f: &Fields, field: &str, req: &SearchReque
     -> anyhow::Result<FacetResult>;
 ```
 
-Query semantics: the free-text query goes through `QueryParser` over `text`, `code` and
-`headings` (+ `thinking` when opted in, + `tool_input`), so phrases, booleans and `field:value`
-all work. `QueryParser` applies each field's own analyzer to the query, so one word is stemmed
-against the prose fields and split into identifier parts against the code ones — and a word that
-expands into several terms becomes a positional query, which is why every full-text field is
-indexed `WithFreqsAndPositions`. `headings` carries `set_field_boost(2.0)`: a section title says
-what the section is about, so a term in one is a better answer than the same term in the middle
-of a paragraph. **There is no fuzzy operator**: `~` is phrase slop in Tantivy 0.26 and `set_field_fuzzy` is deliberately not wired
+Query semantics: the free-text query goes through `QueryParser` over `text`, `code`, `headings`
+and `tool_output` (+ `thinking` when opted in, + `tool_input`), so phrases, booleans and
+`field:value` all work. `tool_output` is a *default* field, not an opt-in one: the result text
+used to live in `text`, and leaving it out would make a bare query stop matching what it always
+matched; `code` and `headings` are default for the mirror-image reason, since the split moved a
+message's snippets and titles out of `text`. `QueryParser` applies each field's own analyzer to
+the query, so one word is stemmed against the prose fields and split into identifier parts
+against the code ones — and a word that expands into several terms becomes a positional query,
+which is why every full-text field is indexed `WithFreqsAndPositions`. `headings` carries
+`set_field_boost(2.0)`: a section title says what the section is about, so a term in one is a
+better answer than the same term in the middle of a paragraph. **There is no fuzzy operator**:
+`~` is phrase slop in Tantivy 0.26 and `set_field_fuzzy` is deliberately not wired
 up, so do not advertise `term~1`. A query that fails to parse falls back to
 `parse_query_lenient`, and the discarded errors are logged at WARN — a typo'd field name must
 not look like an empty corpus. Filters are ANDed on top as term/range queries. `--tool-input
-k=v` becomes a term query on `tool_input.k` for `v`; an empty key *or value* is an error, not a
-silent zero. `project` matches by prefix **on a path boundary**, so `-p ~/code` catches
+k=v` becomes a term query on `tool_input.k` for `v`; `--tool-output TEXT` becomes a phrase
+query on `tool_output`, repeatable and ANDed; an empty key *or value* is an error, not a
+silent zero. `--program NAME` is the `--tool-input` construction over `bash_cmd.program`, ORed
+across repeats and ANDed with everything else; because `bash_cmd` is tokenized `raw` the value
+matches whole and case-sensitively, and empty values are skipped rather than rejected.
+`project` matches by prefix **on a path boundary**, so `-p ~/code` catches
 subdirectories but `-p ~/code` does not catch `~/code-scratch`; `--session` is a bare character
 prefix, so the leading block of a uuid is enough (`show` resolves an unambiguous id prefix the
 same way, and errors when it is ambiguous). `--limit 0` returns totals and facets with no hits,
@@ -598,10 +701,11 @@ pub fn session_list(w: &mut impl Write, s: &[SessionInfo], o: &OutputOpts) -> an
 pub fn stats(w: &mut impl Write, s: &IndexStats, o: &OutputOpts) -> anyhow::Result<()>;
 ```
 
-Anything that prints a document's body prints its stored `body`: the split is for retrieval and
-cannot be undone, so rendering from `text` + `code` would print every inline span twice and move
-a fenced block to the end of the message. `doc_json` carries `body`, `text`, `code`, `headings`
-and `code_lang`.
+Anything that prints a document's body prints its stored `body`, with `tool_output` beside it:
+the split is for retrieval and cannot be undone, so rendering from `text` + `code` would print
+every inline span twice and move a fenced block to the end of the message. The one reordering is
+the rule above — a failed call previews its error first. `doc_json` carries `body`, `text`,
+`code`, `headings`, `code_lang` and `tool_output`.
 
 ## CLI surface
 
@@ -617,7 +721,8 @@ session-search show <SESSION_ID> [--agent AGENT_ID] [--around UUID|SEQ]
 session-search sessions [FILTERS] [--limit N] [--json] [--no-refresh]
 session-search stats [--json]
 
-FILTERS: -p/--project P  -t/--tool T  --tool-input k=v  --branch B  --model M
+FILTERS: -p/--project P  -t/--tool T  --tool-input k=v  --tool-output TEXT  --program NAME
+         --lang LANG  --branch B  --model M
          --role R  --kind message|tool_call  --session S  --agent-type A
          --since D  --until D  --errors-only  --no-sidechains  --sidechains-only
 ```
@@ -625,8 +730,13 @@ FILTERS: -p/--project P  -t/--tool T  --tool-input k=v  --branch B  --model M
 Global: `--index DIR` (`$SESSION_SEARCH_INDEX`), `-v/--verbose`, `--no-color` (`$NO_COLOR`).
 
 **`FIELD` for `facets`** is any fast field name (`tool_name`, `project`, `model`,
-`git_branch`, `role`, `kind`, `agent_type`, `entrypoint`) **or any JSON path** such as
-`tool_input.file_path`, `tool_input.command`, `tool_input.pattern`.
+`git_branch`, `role`, `kind`, `agent_type`, `entrypoint`, `code_lang`) **or any JSON path** such
+as `tool_input.file_path`, `tool_input.command`, `tool_input.pattern`, `bash_cmd.program`,
+`bash_cmd.args`. `code_lang` and the `bash_cmd` paths are multi-valued: a script that runs four
+programs lands in four buckets, as does an answer with four fence languages, so the bucket
+counts total *values*, not documents — they can run above the
+match set (many programs per Bash call) or far below it (most matched documents are not Bash
+calls at all). `docs_with_value` is a document count either way, so it never exceeds the match.
 
 ## MCP readiness (next step — do not build now)
 

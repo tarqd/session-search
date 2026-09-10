@@ -178,6 +178,36 @@ fn hit_json(hit: &Hit, context: &[Doc]) -> Value {
     value
 }
 
+/// Whichever body a document actually has. A tool call with no input, and an orphaned
+/// `tool_result`, both carry an empty `text` and everything worth showing in `tool_output`.
+///
+/// **A failed call shows its result first.** `--errors-only` otherwise retrieves exactly the
+/// right documents and previews the command that failed rather than the reason it broke — the
+/// error is the answer there, and the input is only context.
+fn doc_body(d: &Doc) -> String {
+    // A failed call leads with its result: `--errors-only` shows the reason it broke, not the
+    // heredoc that broke. This is a rendering rule, not a storage one — nothing is reordered
+    // underneath a query.
+    let output = d.tool_output.as_deref().filter(|s| !s.trim().is_empty());
+    if d.is_error
+        && let Some(output) = output
+    {
+        return output.to_string();
+    }
+    // Otherwise the body as it was written, which is what the split cannot be undone into.
+    if !d.body.trim().is_empty() {
+        return d.body.clone();
+    }
+    let joined = body(d);
+    if !joined.trim().is_empty() {
+        return joined;
+    }
+    output
+        .or(d.thinking.as_deref())
+        .unwrap_or_default()
+        .to_string()
+}
+
 /// The stable JSON shape of one document. `raw` is deliberately not included.
 pub fn doc_json(d: &Doc) -> Value {
     json!({
@@ -198,6 +228,7 @@ pub fn doc_json(d: &Doc) -> Value {
         "tool_name": d.tool_name,
         "tool_use_id": d.tool_use_id,
         "tool_input": d.tool_input,
+        "bash_cmd": d.bash_cmd,
         "is_error": d.is_error,
         "is_sidechain": d.is_sidechain,
         "is_meta": d.is_meta,
@@ -210,6 +241,7 @@ pub fn doc_json(d: &Doc) -> Value {
         "code": d.code,
         "headings": d.headings,
         "code_lang": d.code_langs,
+        "tool_output": d.tool_output,
         "thinking": d.thinking,
         "source_path": d.source_path,
     })
@@ -250,7 +282,7 @@ fn human_search(
             writeln!(w)?;
             write_hit_line(w, hit, i + 1, ink, cols)?;
             let body = if hit.snippet.trim().is_empty() {
-                one_line(&body(&hit.doc), cols * MAX_SNIPPET_LINES)
+                one_line(&doc_body(&hit.doc), cols * MAX_SNIPPET_LINES)
             } else {
                 one_line(&hit.snippet, usize::MAX)
             };
@@ -392,7 +424,7 @@ fn write_context(
             _ => doc.role.clone(),
         };
         let prefix = format!("      #{:<5} {:<20} ", doc.seq, truncate(&label, 20));
-        let line = one_line(&body(doc), cols.saturating_sub(prefix.chars().count()));
+        let line = one_line(&doc_body(doc), cols.saturating_sub(prefix.chars().count()));
         writeln!(w, "{}", ink.paint(&format!("{prefix}{line}"), dim()))?;
     }
     Ok(())
@@ -560,8 +592,15 @@ pub fn session_view(w: &mut impl Write, docs: &[Doc], o: &OutputOpts) -> Result<
         } else {
             MESSAGE_BUDGET
         };
-        for line in wrap(&clip(&body(doc), budget), cols.saturating_sub(6)) {
+        for line in wrap(&clip(&doc_body(doc), budget), cols.saturating_sub(6)) {
             writeln!(w, "      {line}")?;
+        }
+        // The result gets its own budget and its own indent: on a tool call the interesting
+        // half is usually what came back, and it must not be crowded out by a `Write` payload.
+        if let Some(output) = doc.tool_output.as_deref().filter(|o| !o.trim().is_empty()) {
+            for line in wrap(&clip(output, TOOL_BUDGET), cols.saturating_sub(8)) {
+                writeln!(w, "        {line}")?;
+            }
         }
         if let Some(thinking) = doc.thinking.as_deref().filter(|t| !t.trim().is_empty()) {
             for line in wrap(&clip(thinking, MESSAGE_BUDGET), cols.saturating_sub(8)) {
@@ -668,10 +707,44 @@ fn session_json(info: &SessionInfo) -> Value {
 // ---------------------------------------------------------------------------
 
 pub fn stats(w: &mut impl Write, s: &IndexStats, o: &OutputOpts) -> Result<()> {
+    stats_scoped(w, s, &[], o)
+}
+
+/// [`stats`] that also names the corpus the index is bound to. Worth printing: a count is
+/// meaningless without knowing what it counted over, and an index silently holding a corpus
+/// the caller did not expect is exactly the failure this guards against.
+pub fn stats_scoped(
+    w: &mut impl Write,
+    s: &IndexStats,
+    roots: &[std::path::PathBuf],
+    o: &OutputOpts,
+) -> Result<()> {
     if o.json {
-        return json_line(w, &serde_json::to_value(s)?);
+        let mut value = serde_json::to_value(s)?;
+        if let Some(object) = value.as_object_mut() {
+            object.insert(
+                "roots".into(),
+                json!(
+                    roots
+                        .iter()
+                        .map(|r| r.display().to_string())
+                        .collect::<Vec<_>>()
+                ),
+            );
+        }
+        return json_line(w, &value);
     }
     let ink = Ink::new(o.color);
+    if !roots.is_empty() {
+        for (i, root) in roots.iter().enumerate() {
+            writeln!(
+                w,
+                "  {}  {}",
+                ink.paint(if i == 0 { "corpus" } else { "      " }, dim()),
+                ink.paint(&root.display().to_string(), bold()),
+            )?;
+        }
+    }
     let rows: [(&str, String); 8] = [
         ("files scanned", thousands(s.files_scanned as u64)),
         ("files updated", thousands(s.files_updated as u64)),
@@ -1023,6 +1096,7 @@ mod tests {
             tool_name: None,
             tool_use_id: None,
             tool_input: None,
+            bash_cmd: None,
             is_error: false,
             is_sidechain: false,
             is_meta: false,
@@ -1035,18 +1109,32 @@ mod tests {
             code: Vec::new(),
             headings: Vec::new(),
             code_langs: Vec::new(),
+            tool_output: None,
             thinking: None,
+            thinking_tokens: None,
             raw: "{\"type\":\"user\"}".into(),
         }
     }
 
     fn tool_doc(seq: u64, tool: &str, input: Value, text: &str) -> Doc {
+        // Filled the way `parse::tool_call_doc` fills it, so the JSON rendering is exercised
+        // with the shape the index actually holds.
+        let bash_cmd = (tool == "Bash")
+            .then(|| {
+                input
+                    .get("command")
+                    .and_then(Value::as_str)
+                    .and_then(crate::bash::extract)
+                    .map(|c| c.to_json())
+            })
+            .flatten();
         Doc {
             kind: DocKind::ToolCall,
             role: "assistant".into(),
             tool_name: Some(tool.into()),
             tool_use_id: Some(format!("toolu_{seq}")),
             tool_input: Some(input),
+            bash_cmd,
             model: Some("claude-opus-5".into()),
             ..doc(seq, "assistant", text)
         }
@@ -1165,6 +1253,7 @@ mod tests {
             "tool_name",
             "tool_use_id",
             "tool_input",
+            "bash_cmd",
             "is_error",
             "is_sidechain",
             "is_meta",
@@ -1173,6 +1262,7 @@ mod tests {
             "version",
             "slug",
             "text",
+            "tool_output",
             "thinking",
             "source_path",
             "score",
@@ -1198,6 +1288,9 @@ mod tests {
         assert_eq!(hit["timestamp_ms"], T0 + 41_000);
         assert_eq!(hit["tool_name"], "Bash");
         assert_eq!(hit["tool_input"]["command"], "cargo build --release");
+        // The structured view rides along beside the raw input, verbatim.
+        assert_eq!(hit["bash_cmd"]["program"], json!(["cargo"]));
+        assert_eq!(hit["bash_cmd"]["args"], json!(["build", "--release"]));
         assert_eq!(hit["agent_id"], Value::Null);
         assert_eq!(hit["is_error"], false);
         assert_eq!(v["hits"][1]["kind"], "message");
@@ -1434,6 +1527,98 @@ mod tests {
         assert_eq!(col(lines[1]), col(lines[2]));
         assert_eq!(col(lines[2]), col(lines[3]));
         assert!(lines[3].contains('…'), "long values are truncated: {out}");
+    }
+
+    #[test]
+    fn session_view_renders_the_result_under_the_call() {
+        let mut tool = tool_doc(
+            2,
+            "Bash",
+            json!({"command": "cargo build"}),
+            "Bash\ncargo build",
+        );
+        tool.tool_output = Some("error: linker `cc` not found".into());
+        let out = render(|w| session_view(w, &[tool], &plain()));
+        assert!(out.contains("cargo build"), "{out}");
+        assert!(out.contains("error: linker `cc` not found"), "{out}");
+        // Indented one step deeper than the call it answers.
+        let result_line = out
+            .lines()
+            .find(|l| l.contains("linker"))
+            .expect("the result is rendered");
+        assert!(result_line.starts_with("        "), "{result_line:?}");
+
+        // A result that never arrived adds no blank line.
+        let mut pending = tool_doc(3, "Bash", json!({"command": "ls"}), "Bash\nls");
+        pending.tool_output = None;
+        let out = render(|w| session_view(w, &[pending], &plain()));
+        assert!(!out.contains("\n\n\n"), "{out:?}");
+    }
+
+    /// The behaviour `6fc7afe` won by reordering the stored body, now kept at the render
+    /// layer: a failed call previews the error, not the heredoc that failed. `--errors-only`
+    /// carries no free-text query, so it lands in the no-snippet fallback every time.
+    #[test]
+    fn a_failed_tool_call_previews_its_error() {
+        let long = format!("cat > f <<'PY'\n{}", "x".repeat(600));
+        let mut failed = tool_doc(
+            9,
+            "Bash",
+            json!({ "command": long.clone() }),
+            &format!("Bash\n{long}"),
+        );
+        failed.is_error = true;
+        failed.tool_output = Some("InputValidationError: JSON parse failed".into());
+
+        assert!(
+            doc_body(&failed).starts_with("InputValidationError"),
+            "{:?}",
+            doc_body(&failed)
+        );
+
+        // An empty snippet is what a filter-only search such as `--errors-only` produces. The
+        // hit *header* still identifies the call by its params — it is the body that must not
+        // be the heredoc, so the assertion is on the body line, not on the whole render.
+        let r = response(vec![hit(failed.clone(), 1.0, "")]);
+        let out = render(|w| search_results(w, &r, &plain()));
+        let body = out
+            .lines()
+            .skip_while(|l| !l.contains("#9"))
+            .nth(1)
+            .expect("a body line under the hit");
+        assert!(body.contains("InputValidationError"), "{out}");
+        assert!(!body.contains("cat > f"), "{out}");
+
+        // A call that succeeded is unchanged: the command leads, as it always did.
+        let mut ok = failed.clone();
+        ok.is_error = false;
+        ok.tool_output = Some("Finished dev profile".into());
+        assert!(
+            doc_body(&ok).starts_with("Bash\ncat > f"),
+            "{:?}",
+            doc_body(&ok)
+        );
+    }
+
+    /// A document whose whole body is its output — an orphaned `tool_result` — must not render
+    /// as a blank row in the hit list or in a context window.
+    #[test]
+    fn an_output_only_document_renders_its_output() {
+        let mut orphan = doc(4, "user", "");
+        orphan.kind = DocKind::ToolCall;
+        orphan.tool_use_id = Some("toolu_orphan".into());
+        orphan.tool_output = Some("Finished dev profile".into());
+
+        let r = response(vec![hit(orphan.clone(), 1.0, "")]);
+        let out = render(|w| search_results(w, &r, &plain()));
+        assert!(out.contains("Finished dev profile"), "{out}");
+
+        // …and the same document seen as a neighbour in a context window.
+        let neighbour = doc(5, "assistant", "and then");
+        let r = response(vec![hit(neighbour.clone(), 1.0, "and then")]);
+        let ctx = vec![vec![orphan, neighbour]];
+        let out = render(|w| search_results_ctx(w, &r, &ctx, &plain()));
+        assert!(out.contains("Finished dev profile"), "{out}");
     }
 
     #[test]

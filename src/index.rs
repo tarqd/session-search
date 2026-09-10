@@ -51,10 +51,18 @@ use crate::schema::{Fields, build_schema, doc_to_json};
 const TANTIVY_SUBDIR: &str = "tantivy";
 const STATE_FILE: &str = "state.json";
 const SESSIONS_FILE: &str = "sessions.json";
-/// Bumped when the shape of what `state.json` carries changes. A carried tool-call document
-/// holds `text` as a list of blocks and a `body` beside it, so a file written by version 1
-/// cannot be read back into one — and a version mismatch reindexes, which is what that needs.
-const STATE_VERSION: u32 = 2;
+/// Bumped whenever the *shape* of an indexed document changes, because the watermarks in
+/// `state.json` otherwise say "nothing changed" and no existing index would ever gain the new
+/// field. A mismatch makes [`load_state`] start from an empty state, which reindexes every
+/// file from byte zero.
+///
+/// 1 -> 2: `roots` and `thinking_indexed` joined the state file.
+/// 2 -> 3: the `bash_cmd` field. Existing indexes are fully reindexed on the next run.
+/// 3 -> 4: the markdown split. A carried tool-call document now holds `text` as a list of
+///         blocks with `body`, `code`, `headings` and `code_lang` beside it, so a state file
+///         written by an older version cannot be read back into one; and the schema gained
+///         those fields with two new analyzers besides.
+const STATE_VERSION: u32 = 4;
 
 /// Tantivy refuses a per-thread arena below this (`MEMORY_BUDGET_NUM_BYTES_MIN`).
 const MIN_HEAP_BYTES: usize = 15_000_000;
@@ -71,6 +79,8 @@ pub struct IndexOptions {
     /// Follow `Full output saved to: <path>` pointers into `tool-results/<id>.txt`, so an
     /// oversized tool result is searchable rather than just its "output too large" stub.
     pub load_spilled_results: bool,
+    /// Cap on each indexed body field of one document. See [`crate::parse::ParseOptions`] for
+    /// why the default is where it is.
     pub max_text_bytes: usize,
     pub heap_bytes: usize,
 }
@@ -80,9 +90,9 @@ impl Default for IndexOptions {
         IndexOptions {
             full: false,
             jobs: None,
-            include_thinking: false,
+            include_thinking: true,
             load_spilled_results: true,
-            max_text_bytes: 32 * 1024,
+            max_text_bytes: 1024 * 1024,
             heap_bytes: 200 * 1024 * 1024,
         }
     }
@@ -120,8 +130,19 @@ struct FileState {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
 struct State {
     version: u32,
+    /// The transcript roots this index was built from, canonicalized.
+    ///
+    /// An index is bound to its corpus. Without this, an auto-refresh resolves the *default*
+    /// root and silently merges a second corpus into the index — which is exactly how an index
+    /// built over a 12-file snapshot came to report 32 files and answer questions about
+    /// sessions that were not in the snapshot at all.
+    roots: Vec<String>,
+    /// Whether thinking text was indexed. A query-time `--include-thinking` against an index
+    /// built without it silently matches nothing, so the query side warns instead.
+    thinking_indexed: bool,
     files: BTreeMap<String, FileState>,
 }
 
@@ -129,6 +150,8 @@ impl Default for State {
     fn default() -> Self {
         State {
             version: STATE_VERSION,
+            roots: Vec::new(),
+            thinking_indexed: false,
             files: BTreeMap::new(),
         }
     }
@@ -235,9 +258,29 @@ pub fn run(index_dir: &Path, roots: &[PathBuf], opts: &IndexOptions) -> Result<I
         .iter()
         .map(|r| std::fs::canonicalize(r).unwrap_or_else(|_| r.clone()))
         .collect();
-    let files = discover(&roots)?;
-
     let mut state = load_state(index_dir);
+
+    // An index belongs to one corpus. Pointing a second corpus at it would merge the two with
+    // no way to tell them apart afterwards, and every count the tool reports would silently
+    // describe a union nobody asked for.
+    let requested: Vec<String> = roots.iter().map(|r| r.display().to_string()).collect();
+    if !state.roots.is_empty() && state.roots != requested {
+        if opts.full {
+            // A full rebuild drops every document anyway, so re-pointing is well defined.
+            tracing::info!(from = ?state.roots, to = ?requested, "rebuilding index against new roots");
+        } else {
+            anyhow::bail!(
+                "this index was built from {} but you asked to index {}.\n\
+                 Merging two corpora into one index would make every count describe their union.\n\
+                 Use a different --index for the new corpus, or `index --full` to rebuild this \
+                 one against it.",
+                state.roots.join(", "),
+                requested.join(", "),
+            );
+        }
+    }
+
+    let files = discover(&roots)?;
     let mut sessions = match load_sessions(index_dir) {
         Ok(sessions) => sessions,
         Err(err) => {
@@ -381,6 +424,11 @@ pub fn run(index_dir: &Path, roots: &[PathBuf], opts: &IndexOptions) -> Result<I
     prune_vanished(&mut writer, &fields, &mut state, &mut sessions, &mut stats);
 
     writer.commit().context("committing the tantivy index")?;
+
+    // Bind the index to the corpus it now holds, so a later auto-refresh cannot wander off to
+    // the default root and merge a second one in.
+    state.roots = requested;
+    state.thinking_indexed = opts.include_thinking;
 
     // Written after the commit: the watermark must never claim documents the index does not
     // yet hold. A crash in this window costs a re-parse, never a lost document.
@@ -687,6 +735,26 @@ fn merge_session(dst: &mut SessionInfo, src: SessionInfo) {
 // state files
 // ---------------------------------------------------------------------------
 
+/// What an existing index is bound to. Lets the query side refresh the *right* corpus, warn
+/// when `--include-thinking` cannot possibly match, and report its own scope.
+#[derive(Debug, Clone, Default)]
+pub struct IndexMeta {
+    pub roots: Vec<PathBuf>,
+    pub thinking_indexed: bool,
+    pub files: usize,
+}
+
+/// Read an index's binding without opening the Tantivy index. An index that does not exist yet
+/// reports empty roots, which callers read as "not bound to anything".
+pub fn meta(index_dir: &Path) -> IndexMeta {
+    let state = load_state(index_dir);
+    IndexMeta {
+        roots: state.roots.iter().map(PathBuf::from).collect(),
+        thinking_indexed: state.thinking_indexed,
+        files: state.files.len(),
+    }
+}
+
 /// A missing, unreadable, malformed or wrong-version `state.json` all mean the same thing:
 /// index everything again. That is safe because a file with no watermark is a `Reset`, and a
 /// reset deletes by `source_path` before it adds.
@@ -865,6 +933,89 @@ mod tests {
         fn sessions(&self) -> BTreeMap<String, SessionInfo> {
             load_sessions(&self.index_dir).unwrap()
         }
+    }
+
+    /// The bug this guards, found by an A/B eval whose corpus it silently corrupted: an index
+    /// built over one corpus was refreshed against the *default* root, merging a second corpus
+    /// in. Counts then described the union — 32 files where the corpus had 12, "28 subagent
+    /// sessions" where there were 11 — with nothing in the output admitting it.
+    #[test]
+    fn an_index_refuses_a_second_corpus() {
+        let a = Fixture::new();
+        a.index();
+
+        // A different root, same index directory.
+        let other = tempfile::tempdir().unwrap();
+        let root_b = other.path().join("claude/projects/-home-user-other");
+        std::fs::create_dir_all(&root_b).unwrap();
+        std::fs::write(root_b.join("sess-2.jsonl"), base_transcript()).unwrap();
+        let root_b = other.path().join("claude/projects");
+
+        let err = run(
+            &a.index_dir,
+            std::slice::from_ref(&root_b),
+            &IndexOptions::default(),
+        )
+        .expect_err("indexing a second corpus into one index must fail");
+        let msg = format!("{err:#}");
+        assert!(msg.contains("built from"), "{msg}");
+        assert!(msg.contains("--index"), "unhelpful message: {msg}");
+
+        // The index is untouched by the refusal.
+        assert_eq!(meta(&a.index_dir).roots.len(), 1);
+
+        // --full re-points it, because a rebuild drops everything anyway.
+        run(
+            &a.index_dir,
+            std::slice::from_ref(&root_b),
+            &IndexOptions {
+                full: true,
+                ..IndexOptions::default()
+            },
+        )
+        .expect("--full may re-point an index at a new corpus");
+        assert_eq!(
+            meta(&a.index_dir).roots,
+            [std::fs::canonicalize(&root_b).unwrap()]
+        );
+    }
+
+    /// Re-indexing the same corpus, spelled differently, is not a second corpus.
+    #[test]
+    fn re_indexing_the_same_root_is_not_a_conflict() {
+        let fx = Fixture::new();
+        fx.index();
+        let before = fx.live();
+        // A trailing slash and a `.` component spell the same directory.
+        let noisy = fx.root.join(".");
+        run(
+            &fx.index_dir,
+            std::slice::from_ref(&noisy),
+            &IndexOptions::default(),
+        )
+        .expect("the same root spelled differently must not conflict");
+        assert_eq!(fx.live(), before, "no documents added on a no-op re-run");
+    }
+
+    /// Thinking is indexed by default now, and the index records the choice so the query side
+    /// can tell a caller why `--include-thinking` is matching nothing.
+    #[test]
+    fn thinking_is_indexed_by_default_and_the_choice_is_recorded() {
+        assert!(
+            IndexOptions::default().include_thinking,
+            "thinking should be indexed unless opted out"
+        );
+
+        let fx = Fixture::new();
+        fx.index();
+        assert!(meta(&fx.index_dir).thinking_indexed);
+
+        let opted_out = Fixture::new();
+        opted_out.index_with(&IndexOptions {
+            include_thinking: false,
+            ..IndexOptions::default()
+        });
+        assert!(!meta(&opted_out.index_dir).thinking_indexed);
     }
 
     #[test]
@@ -1175,8 +1326,8 @@ mod tests {
     }
 
     /// A field's tokenizer name is part of the schema, so naming an analyzer on `text`,
-    /// `code`, `headings`, `thinking` and `tool_input` makes every index an older build wrote
-    /// unreadable. The recovery has to be automatic — nobody is going to be told to delete a
+    /// `code`, `headings`, `tool_output`, `thinking` and `tool_input` makes every index an
+    /// older build wrote unreadable. The recovery has to be automatic — nobody is going to be told to delete a
     /// directory — so `open_or_create` must notice, discard it, and hand back a clean index
     /// that the next `run` refills.
     #[test]
@@ -1319,9 +1470,16 @@ mod tests {
         assert_eq!(doc.tool_name.as_deref(), Some("Bash"));
         assert_eq!(doc.tool_input.as_ref().unwrap()["command"], "cargo build");
         assert!(
-            doc.code.iter().any(|c| c.contains("Finished")),
-            "the result is carried as code: {:?}",
-            doc.code
+            doc.text.iter().any(|t| t.contains("cargo build")),
+            "{:?}",
+            doc.text
+        );
+        assert!(
+            doc.tool_output
+                .as_deref()
+                .is_some_and(|o| o.contains("Finished")),
+            "the result is carried as tool_output: {:?}",
+            doc.tool_output
         );
 
         // A third run with nothing new must still add nothing.
@@ -1668,7 +1826,9 @@ mod tests {
             "live indexing must converge on the one-shot result"
         );
         // Not just the same number of documents — the same documents.
-        let by_id = |dir: &Path| -> BTreeMap<String, String> { indexed_texts_by_id(dir) };
+        let by_id = |dir: &Path| -> BTreeMap<String, (String, String, String)> {
+            indexed_bodies_by_id(dir)
+        };
         assert_eq!(
             by_id(&live_dir),
             by_id(&once_dir),
@@ -1676,9 +1836,15 @@ mod tests {
         );
     }
 
-    /// Every document in an index, as `doc_id -> text`.
-    fn indexed_texts_by_id(index_dir: &Path) -> BTreeMap<String, String> {
-        use tantivy::schema::Value as _;
+    /// Every document in an index, as `doc_id -> (body, tool_output, bash_cmd)`.
+    ///
+    /// Read back through [`crate::search::doc_from_stored`], the one reader of the stored
+    /// payload, so the comparison covers the structured `bash_cmd` too: a tool call completed
+    /// across an incremental boundary is rebuilt from a carried document, and losing its
+    /// `bash_cmd` there would leave `--program` blind to exactly the live sessions people
+    /// search most. `body` stands in for the split halves: it is the whole a renderer prints,
+    /// and the split is a pure function of it.
+    fn indexed_bodies_by_id(index_dir: &Path) -> BTreeMap<String, (String, String, String)> {
         let (index, fields) = open_or_create(index_dir).unwrap();
         let searcher = index.reader().unwrap().searcher();
         let limit = (searcher.num_docs() as usize).max(1);
@@ -1691,13 +1857,17 @@ mod tests {
         found
             .into_iter()
             .map(|(_, address)| {
-                let doc: TantivyDocument = searcher.doc(address).unwrap();
-                let field = |f| {
-                    doc.get_first(f)
-                        .and_then(|v| v.as_str().map(str::to_string))
-                        .unwrap_or_default()
-                };
-                (field(fields.doc_id), field(fields.body))
+                let stored: TantivyDocument = searcher.doc(address).unwrap();
+                let doc = crate::search::doc_from_stored(&fields, &stored);
+                let bash_cmd = doc
+                    .bash_cmd
+                    .as_ref()
+                    .map(ToString::to_string)
+                    .unwrap_or_default();
+                (
+                    doc.doc_id,
+                    (doc.body, doc.tool_output.unwrap_or_default(), bash_cmd),
+                )
             })
             .collect()
     }
