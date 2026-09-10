@@ -71,6 +71,11 @@ pub enum Command {
         /// index only the "output too large" stub the transcript carries inline.
         #[arg(long)]
         no_spilled_results: bool,
+        /// Cap on each indexed body field of one document, in bytes. Defaults to 1 MiB, which
+        /// is far above anything a transcript carries; lower it to keep a pathological
+        /// `cat` of a binary out of the term dictionary. Changing it needs `index --full`.
+        #[arg(long = "max-text-bytes", value_name = "BYTES")]
+        max_text_bytes: Option<usize>,
     },
     /// Full-text search.
     Search {
@@ -215,6 +220,7 @@ fn dispatch(
             jobs,
             no_thinking,
             no_spilled_results,
+            max_text_bytes,
         } => {
             // An explicit --root wins; otherwise stay with whatever corpus this index already
             // holds, and only fall back to the default root for a brand-new index.
@@ -236,6 +242,11 @@ fn dispatch(
                     jobs,
                     include_thinking: !no_thinking,
                     load_spilled_results: !no_spilled_results,
+                    // A cap of 0 would index no body at all, which is never what anyone means
+                    // by passing the flag; the default stands in for it.
+                    max_text_bytes: max_text_bytes
+                        .filter(|n| *n > 0)
+                        .unwrap_or(IndexOptions::default().max_text_bytes),
                     ..IndexOptions::default()
                 },
             )?;
@@ -946,6 +957,7 @@ mod tests {
             jobs,
             no_thinking,
             no_spilled_results,
+            max_text_bytes,
         } = parse(&[
             "session-search",
             "index",
@@ -957,6 +969,8 @@ mod tests {
             "--jobs",
             "4",
             "--no-thinking",
+            "--max-text-bytes",
+            "4096",
         ])
         .command
         else {
@@ -970,6 +984,7 @@ mod tests {
             [PathBuf::from("/a/projects"), PathBuf::from("/b/projects")]
         );
         assert_eq!(jobs, Some(4));
+        assert_eq!(max_text_bytes, Some(4096));
 
         let Command::Facets {
             field,

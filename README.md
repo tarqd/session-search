@@ -951,6 +951,14 @@ pointer, which the indexer follows by default (`index --no-spilled-results` opts
 content-directed file I/O — fine for your own `~/.claude` tree, worth remembering if you ever
 index transcripts from elsewhere.
 
+**Bodies are capped, and the cut is silent.** Each indexed body field of a document is truncated
+at `index --max-text-bytes N`, 1 MiB by default, at a UTF-8 boundary with no marker. The default
+is far above anything a transcript carries — Claude Code bounds tool output before it reaches
+disk, and on a real corpus the largest inline result measured 18.7 KB — so in practice nothing is
+cut. Lower it if you want a `cat` of a minified bundle kept out of the term dictionary. Note that
+`raw` and `tool_input` are stored uncapped regardless, so a large input is always searchable
+through `tool_input.<key>` even when `text` did not copy all of it.
+
 **Everything is local and single-user.** No daemon, no watch mode, no incremental commit while a
 session is in flight; the index is refreshed at query time. There is no ranking tuning, no
 stemming beyond Tantivy's default tokenizer, and no cross-machine sync.

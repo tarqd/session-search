@@ -310,7 +310,8 @@ pub struct IndexOptions {
                                      // into `tool-results/<id>.txt`, else an oversized tool
                                      // result is only its "output too large" stub. CLI:
                                      // `index --no-spilled-results` opts out.
-    pub max_text_bytes: usize,   // default 32 * 1024, and it caps the spill too
+    pub max_text_bytes: usize,   // per body field, 1 MiB default; caps the spill too.
+                                 // CLI: `index --max-text-bytes N`
     pub heap_bytes: usize,       // default 200 MB
 }
 pub struct IndexStats {

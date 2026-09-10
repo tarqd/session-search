@@ -250,10 +250,27 @@ pub fn file_tag(source_path: &str) -> String {
     format!("{:08x}", fnv1a(source_path.as_bytes()) as u32)
 }
 
+/// The `text` copy of a tool call's input never needs the full budget: every input is already
+/// indexed whole and uncapped in `tool_input`, which is one of the default query fields, so this
+/// copy exists for matching `Bash cargo build` as prose and for previews — not for coverage.
+/// Bounding it also keeps a tool-call document small enough to stay carryable across an
+/// incremental boundary (see [`PENDING_DOC_CAP`]), which raising [`ParseOptions::max_text_bytes`]
+/// would otherwise quietly stop happening.
+const INPUT_LEAVES_CAP: usize = 64 * 1024;
+
 #[derive(Debug, Clone)]
 pub struct ParseOptions {
     /// Cap on the indexed body of one doc. `tool_output` is capped separately, at the same
     /// number: a tool call's input and its result are two fields now, not one shared budget.
+    ///
+    /// The default is deliberately far above what a transcript actually carries. Claude Code
+    /// bounds tool output before it reaches disk — anything oversized is spilled to
+    /// `tool-results/<id>.txt` and referenced by a stub — so on a real corpus the largest
+    /// inline result measured 18.7 KB and *nothing* reached the old 32 KiB cap. The one place
+    /// that cap did bite was the spill path, which exists to go and fetch precisely the outputs
+    /// too big to inline: a 54.5 KB spill lost 40% of itself on the way in. A cap this size
+    /// still bounds a `cat` of something enormous, without cutting any output a person would
+    /// call reasonable.
     pub max_text_bytes: usize,
     /// Follow `<persisted-output>` pointers into `tool-results/<id>.txt`.
     pub load_spilled_results: bool,
@@ -262,7 +279,7 @@ pub struct ParseOptions {
 impl Default for ParseOptions {
     fn default() -> Self {
         ParseOptions {
-            max_text_bytes: 32 * 1024,
+            max_text_bytes: 1024 * 1024,
             load_spilled_results: false,
         }
     }
@@ -1108,9 +1125,10 @@ impl<'a> Parser<'a> {
     /// (`format::doc_body`, and the snippet fallback in `search`), which reaches the previews
     /// that motivated it without reordering bytes anyone might later search.
     fn tool_call_body(&self, name: Option<&str>, input: Option<&serde_json::Value>) -> String {
-        // A quarter of the budget, as before this field existed: `text` no longer shares its
-        // budget with the result, but a `Write` payload is still not worth 32 KB of it.
-        let input_budget = self.opts.max_text_bytes / 4;
+        // A quarter of the budget, as before this field existed, but never more than
+        // `INPUT_LEAVES_CAP`: a `Write` payload is not worth a quarter of a megabyte of `text`
+        // when `tool_input` already carries it whole.
+        let input_budget = (self.opts.max_text_bytes / 4).min(INPUT_LEAVES_CAP);
         let name = name.unwrap_or_default();
         let input = input
             .map(|i| truncate(&string_leaves(i).join("\n"), input_budget))
@@ -1605,6 +1623,77 @@ mod tests {
 
         let charged: Vec<u64> = out.docs.iter().filter_map(|d| d.thinking_tokens).collect();
         assert_eq!(charged, [300], "one message, one charge, on the carrier");
+    }
+
+    /// The cap exists to bound a pathological `cat`, not to cut real output. The old 32 KiB
+    /// ceiling was below the size of the spilled results the indexer deliberately goes and
+    /// fetches — the README's own example is 54.5 KB — so the one path that reaches for large
+    /// output was also the one guaranteed to lose it.
+    #[test]
+    fn a_result_larger_than_the_old_cap_survives_whole() {
+        let dir = tempfile::tempdir().unwrap();
+        let big = "quokkatron ".repeat(6_000); // 66 KB: past 32 KiB, a plausible build log
+        let body = format!(
+            concat!(
+                r#"{{"type":"assistant","uuid":"a1","sessionId":"s","cwd":"/p","message":{{"role":"assistant","id":"m1","content":[{{"type":"tool_use","id":"t1","name":"Bash","input":{{"command":"cargo build"}}}}]}}}}"#,
+                "\n",
+                r#"{{"type":"user","uuid":"u1","sessionId":"s","cwd":"/p","message":{{"role":"user","content":[{{"type":"tool_result","tool_use_id":"t1","content":"{big}"}}]}}}}"#,
+                "\n",
+            ),
+            big = big
+        );
+        let out = parse_body(dir.path(), "big.jsonl", &body);
+        let call = out
+            .docs
+            .iter()
+            .find(|d| d.tool_use_id.as_deref() == Some("t1"))
+            .expect("a tool call");
+        assert_eq!(
+            call.tool_output.as_deref().map(str::len),
+            Some(big.len()),
+            "the result is indexed whole, not clipped at the old 32 KiB"
+        );
+    }
+
+    /// Raising `max_text_bytes` must not drag the `text` copy of the input up with it: the
+    /// input is already indexed whole in `tool_input`, so a huge `Write` payload would be
+    /// duplicated for nothing — and would push the document past `PENDING_DOC_CAP`, silently
+    /// costing it the ability to be completed across an incremental boundary.
+    #[test]
+    fn the_input_copy_stays_bounded_however_high_the_cap_goes() {
+        let dir = tempfile::tempdir().unwrap();
+        let payload = "z".repeat(300_000);
+        let body = format!(
+            concat!(
+                r#"{{"type":"assistant","uuid":"a1","sessionId":"s","cwd":"/p","message":{{"role":"assistant","id":"m1","content":[{{"type":"tool_use","id":"t1","name":"Write","input":{{"content":"{payload}"}}}}]}}}}"#,
+                "\n",
+            ),
+            payload = payload
+        );
+        std::fs::write(dir.path().join("w.jsonl"), &body).unwrap();
+        let opts = ParseOptions {
+            max_text_bytes: 8 * 1024 * 1024,
+            ..ParseOptions::default()
+        };
+        let out = parse_whole(&dir.path().join("w.jsonl"), &opts).unwrap();
+        let call = out
+            .docs
+            .iter()
+            .find(|d| d.kind == DocKind::ToolCall)
+            .unwrap();
+        assert!(
+            call.text.len() <= INPUT_LEAVES_CAP + 16,
+            "input copy grew to {} bytes",
+            call.text.len()
+        );
+        // ...and nothing was actually lost: `tool_input` still carries the whole payload.
+        assert_eq!(
+            call.tool_input.as_ref().unwrap()["content"]
+                .as_str()
+                .unwrap()
+                .len(),
+            payload.len()
+        );
     }
 
     /// A failed call's error must be reachable without digging past the command that failed.
