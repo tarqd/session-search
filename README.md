@@ -26,16 +26,18 @@ cargo build --release
 # binary at ./target/release/session-search
 ```
 
-That is the whole tool. Two extra features — a browser UI and the HTTP API under it — are
-**off by default** and have to be asked for, because they bind a port and serve your transcripts
-verbatim:
+That is the whole tool. Three extra features are **off by default** and have to be asked for: a
+browser UI and the HTTP API under it, which bind a port and serve your transcripts verbatim, and an
+MCP server, which binds nothing but adds `rmcp` and `tokio` to a build that otherwise has neither:
 
 ```bash
 cargo build --release --features web-ui     # UI + API
 cargo build --release --features http-api   # API only
+cargo build --release --features mcp        # MCP server on stdio, for agents
 ```
 
-See [The web UI and the HTTP API](#the-web-ui-and-the-http-api).
+See [The web UI and the HTTP API](#the-web-ui-and-the-http-api) and
+[The MCP server](#the-mcp-server).
 
 Or install it onto your `PATH`:
 
@@ -1371,7 +1373,8 @@ reads the state file.
 ### `--json`
 
 Every read command takes `--json` and emits exactly one JSON object on stdout, machine-first
-(logs go to stderr, broken pipes exit cleanly). This is the surface the MCP server will reuse.
+(logs go to stderr, broken pipes exit cleanly). This is the surface
+[the MCP server](#the-mcp-server) reuses.
 
 ```bash
 session-search facets tool_input.file_path --top 3 --json
@@ -1881,29 +1884,119 @@ which is the half that does the work.
 
 ---
 
-## What's next: the MCP server
+## The MCP server
 
-The CLI is stage one. Stage two is an `mcp` subcommand that serves the same operations to agents
-over stdio, so Claude Code can search its own history mid-task: one `#[tool]` per subcommand,
-taking and returning the *same* structs the CLI already derives. `search.rs` was written with that
-in mind — `Filters` derives `clap::Args` and `serde::Deserialize` side by side over plain
-`Option<String>`/`Vec<String>` fields, `SearchRequest` is pure serde data, and `--json` already
-emits the exact payloads the tools will return.
+The CLI is for you; `session-search mcp` is the same index for the agent sitting next to you. It
+speaks MCP over stdio, so Claude Code can search its own history mid-task — "have I hit this error
+before?", "what was the command that actually worked?", "which files did I touch in that session?"
+— without shelling out and parsing terminal output.
 
-`--group-by-turn` and `--context skeleton` were built for that surface before it exists. An agent
-pays for a search in context window, and the two together are what make a page of twenty results
-affordable: one hit per turn instead of four documents describing one moment, and each turn's
-context as a few hundred bytes of call signatures instead of its tool output in full.
+**It is a cargo feature, off by default**, for the same reason `http-api` is: a plain build stays a
+plain build, with no `rmcp`, no `tokio` and no `mcp` in `--help`. Unlike `serve` it binds no port
+and opens no socket — the transport is stdin and stdout — and every tool is read-only: nothing
+writes to a transcript, and nothing writes to the index.
 
-The [`http-api` feature](#the-web-ui-and-the-http-api) is the first instalment of that plan, and
-it worked: `serve` decodes a request into the same `SearchRequest` the CLI builds, hands it to the
-same `search::search`, and renders the same `SearchResponse`. So the MCP server is a third front
-end over one struct rather than a third implementation of search — and the wire shapes the HTTP
-API had to pin down (a hit's document, a facet's honesty numbers, a sort that is not relevance)
-are the ones the tools will return.
+```bash
+cargo build --release --features mcp
+```
 
-Design note: [`docs/MCP.md`](docs/MCP.md). The HTTP one is
-[`docs/WEB-UI.md`](docs/WEB-UI.md).
+Point a client at the binary. For Claude Code:
+
+```bash
+claude mcp add session-search -- /path/to/session-search mcp
+```
+
+or, in an `.mcp.json` that a whole project shares:
+
+```json
+{
+  "mcpServers": {
+    "session-search": {
+      "command": "/path/to/session-search",
+      "args": ["mcp"]
+    }
+  }
+}
+```
+
+The index it serves is the ordinary global `--index` / `$SESSION_SEARCH_INDEX` — pass `--index DIR`
+before `mcp` if the host's environment is not yours. Because an agent host hands a server whatever
+environment it likes, the server reports the directory it actually opened, and the corpus counts it
+found there, back in its `instructions` where the model can see them.
+
+```
+Serve the index to an agent over MCP on stdio.
+
+The transport owns stdout: one JSON-RPC message per line and nothing else. Diagnostics go to stderr
+as they always do, and no renderer in this crate is called on this path.
+
+The index this serves is the global `--index` / `$SESSION_SEARCH_INDEX`, resolved before dispatch
+like every other command — an MCP server started by an agent host inherits whatever environment the
+host gives it, so the server reports the directory it actually opened back in its `instructions`,
+where the model can see it.
+
+Usage: session-search mcp [OPTIONS]
+
+Options:
+      --index <DIR>
+          Index directory. Defaults to `$XDG_DATA_HOME/session-search`
+          
+          [env: SESSION_SEARCH_INDEX=]
+
+      --refresh-secs <N>
+          Re-index at most every N seconds while the server runs. 0 never re-indexes after startup.
+          Unlike the one-shot commands, a long-lived server cannot afford an index scan on every
+          request
+          
+          [default: 300]
+
+      --no-refresh
+          Skip the startup refresh too, and serve the index exactly as it stands
+
+  -v, --verbose...
+          Raise the log level on stderr; repeatable (`-v` info, `-vv` debug, `-vvv` trace)
+
+      --no-color
+          Never colourise. Also honoured: a non-empty `$NO_COLOR`, and a non-tty stdout
+
+  -h, --help
+          Print help (see a summary with '-h')
+```
+
+A one-shot command re-indexes before it reads; a server that lives for a day cannot, so it refreshes
+once at startup and then at most every `--refresh-secs` (300 by default, `0` to stop after startup).
+
+### The five tools
+
+Not one per subcommand — one per *shape of answer*, because a model picks a tool from a list of
+descriptions and then reports what comes back as the answer:
+
+| tool | the question it answers | what it returns |
+| --- | --- | --- |
+| `search_turns` | "why did the build fail" — a moment to read | ranked turns as skeletons: the prompt, the prose, one line per tool call and how it ended |
+| `get_turn` | "show me that whole turn" | every document of one turn, tool results truncated to a budget; `before`/`after` read the session around it |
+| `get_output` | "show me what that command printed" | one call's output, sliced by `head` / `tail` / regex `grep` and capped, with the totals it left out |
+| `search_sessions` | "what was I working on last week" | one row per session: title, opening prompt, project, branch, time span, message and tool counts |
+| `aggregate` | "what errors did we see" | a field's values and counts — any fast field, or a dynamic path like `tool_input.file_path` or `bash_cmd.program` |
+
+`search_turns` never returns tool output, and `get_turn`/`get_output` are the drill-down that
+follows it: a turn's context averages 5,651 bytes and its skeleton 555, so a page of twenty
+skeletons costs about eleven kilobytes where twenty full turns would cost a hundred and thirteen.
+Look at the shapes, then pay full price for the one turn that answers the question.
+
+The three searching tools take the same eighteen filters the CLI flags spell — `project`, `tool`,
+`program`, `branch`, `since`, `errors_only` and the rest — and all five responses carry an envelope
+naming the filters actually applied and the time window resolved to absolute instants, so a
+zero-hit answer arrives with the reason and a ready-to-send retry rather than as a bare empty list.
+
+The MCP server is a third front end over one struct rather than a third implementation of search:
+`Filters` derives `clap::Args` and `serde::Deserialize` side by side over plain
+`Option<String>`/`Vec<String>` fields, and `schemars::JsonSchema` on top of that is what the model
+reads. The `#[tool]` methods take `Parameters<T>` and return `Json<U>`, where `U` is the shape
+`--json` already emits.
+
+Design note, including why the tools are shaped by query class and the traps rmcp 3.2 sets:
+[`docs/MCP.md`](docs/MCP.md). The HTTP one is [`docs/WEB-UI.md`](docs/WEB-UI.md).
 
 ---
 

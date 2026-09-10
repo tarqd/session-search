@@ -1,9 +1,10 @@
 //! The stdio transport owns stdout, and this is the test that says so out loud.
 //!
-//! `docs/MCP.md` asks for it by name: *"a single stray `println!` in a library module turns into
-//! a protocol parse error on the client side with no useful diagnostic, so this is worth a test
-//! that runs the server and asserts stdout contains only well-formed JSON-RPC."* It earned its
-//! place before it was written — the first build of `session-search mcp` answered nothing at all,
+//! `docs/MCP.md` asks for it by name, under "Recorded traps": a single stray `println!` in a
+//! library module turns into a protocol parse error on the client side with no useful
+//! diagnostic, so the server is worth running for real and asserting that stdout carries only
+//! well-formed JSON-RPC. It earned its place before it was written — the first build of
+//! `session-search mcp` answered nothing at all,
 //! because `cli::run` held `stdout().lock()` across `dispatch` and the transport's first write,
 //! from another thread, parked on it forever. No panic, no log line, no output: exactly the
 //! failure this file exists to make loud.
