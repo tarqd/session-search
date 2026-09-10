@@ -24,239 +24,14 @@ use std::path::{Path, PathBuf};
 
 use serde_json::Value;
 
-use crate::model::{
+use super::model::{
     AssistantRecord, Attachment, AttachmentRecord, ContentBlock, MessageContent, ParsedLine,
     Record, SystemRecord, ToolUseBlock, UserRecord, clean_line, parse_line,
 };
-
-// ---------------------------------------------------------------------------
-// pinned public types
-// ---------------------------------------------------------------------------
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-pub enum DocKind {
-    Message,
-    ToolCall,
-}
-
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-pub struct Doc {
-    /// `"<session_id>:<agent_id|->:<file_tag>:<seq>"` — unique, and the delete key for a
-    /// single doc. `file_tag` is a short digest of `source_path`: `seq` restarts at 0 in every
-    /// file, and two transcripts can legitimately share a `session_id`
-    /// (`resetSessionFile()`, a `relocated` sidecar — TRANSCRIPT-FORMAT §9), so without it
-    /// the id is not unique.
-    pub doc_id: String,
-    pub kind: DocKind,
-    /// Absolute; the delete-by-term key when a whole file is re-indexed.
-    pub source_path: String,
-    /// Monotonic ordinal within the file, continuing from `seq_base`.
-    pub seq: u64,
-    pub session_id: String,
-    pub agent_id: Option<String>,
-    pub agent_type: Option<String>,
-    pub uuid: Option<String>,
-    pub parent_uuid: Option<String>,
-    pub timestamp_ms: Option<i64>,
-    /// From the record `cwd`, NEVER the lossy project directory name.
-    pub project: Option<String>,
-    pub git_branch: Option<String>,
-    /// `"user" | "assistant" | "system" | "attachment"`.
-    pub role: String,
-    pub model: Option<String>,
-    pub tool_name: Option<String>,
-    pub tool_use_id: Option<String>,
-    pub tool_input: Option<Value>,
-    /// Structured view of a Bash `tool_input.command` — `{"program": [...], "args": [...]}`
-    /// as produced by [`crate::bash::extract`]. `None` for every other tool, and for a
-    /// command the shell grammar rejects.
-    ///
-    /// `#[serde(default)]` because a `Doc` also travels inside [`ParseCarry`] in
-    /// `state.json`: state written before this field existed must still load.
-    #[serde(default)]
-    pub bash_cmd: Option<Value>,
-    pub is_error: bool,
-    pub is_sidechain: bool,
-    /// Compaction summaries, meta turns — excluded from "human prompt".
-    pub is_meta: bool,
-    pub entrypoint: Option<String>,
-    pub permission_mode: Option<String>,
-    pub version: Option<String>,
-    pub slug: Option<String>,
-    /// The indexed body. For a tool call this is the name and the input's own strings; the
-    /// result lives in [`Doc::tool_output`], so a match can be attributed to one or the other.
-    pub text: String,
-    /// The joined `tool_result` text, indexed and stored in its own right. `None` on a
-    /// message, and on a tool call whose result has not been read yet.
-    pub tool_output: Option<String>,
-    /// Stored; indexed only with `include_thinking`.
-    pub thinking: Option<String>,
-    /// `usage.output_tokens_details.thinking_tokens`, attached to exactly ONE document per API
-    /// message so sums and facets are not multiplied by the block count. Remote and web
-    /// sessions strip the thinking *text* but keep this, so it is the only surviving measure of
-    /// where a session stopped to reason.
-    pub thinking_tokens: Option<u64>,
-    /// The original JSONL line.
-    pub raw: String,
-}
-
-/// `#[serde(default)]` so a `sessions.json` written by an older build — one missing a field
-/// added since — still loads instead of failing the whole file.
-#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
-#[serde(default)]
-pub struct SessionInfo {
-    pub session_id: String,
-    pub agent_id: Option<String>,
-    pub agent_type: Option<String>,
-    /// Subagent `.meta.json` description; filled by the indexer, not by the parser.
-    pub description: Option<String>,
-    /// From a `summary` record, keyed by `leafUuid`.
-    pub title: Option<String>,
-    pub slug: Option<String>,
-    pub project: Option<String>,
-    pub git_branch: Option<String>,
-    pub source_path: String,
-    pub first_ts_ms: Option<i64>,
-    pub last_ts_ms: Option<i64>,
-    /// Conversational turns: human prompts, assistant API messages (counted once per
-    /// `message.id`, however many block records it was split across) and `system` records.
-    /// Compaction records and attachments are **excluded** (TRANSCRIPT-FORMAT §9).
-    pub messages: u64,
-    pub tool_calls: u64,
-    pub first_prompt: Option<String>,
-}
-
-/// A malformed line. Counted, never fatal.
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-pub struct ParseError {
-    pub path: String,
-    /// 1-based line number *within this parse run*.
-    pub line: u64,
-    /// Absolute byte offset of the start of the line.
-    pub byte_offset: u64,
-    pub message: String,
-}
-
-impl std::fmt::Display for ParseError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(
-            f,
-            "{}:{} (byte {}): {}",
-            self.path, self.line, self.byte_offset, self.message
-        )
-    }
-}
-
-#[derive(Debug)]
-pub struct ParseOutput {
-    pub docs: Vec<Doc>,
-    /// Documents that **replace** ones already in the index: same `doc_id`, same `seq`, now
-    /// carrying the tool result that arrived after they were written. The consumer must delete
-    /// each one's `doc_id` before adding it, and must **not** count them towards the file's
-    /// `docs` watermark — their `seq` numbers were handed out by an earlier run.
-    pub replacements: Vec<Doc>,
-    pub session: SessionInfo,
-    pub errors: Vec<ParseError>,
-    /// What the *next* incremental parse of this same file has to be told. See [`ParseCarry`].
-    pub carry: ParseCarry,
-}
-
-/// How many message ids one file's [`ParseCarry`] keeps. Cross-boundary memory only has to
-/// reach back far enough to cover one interleaving of records; the cap stops a pathological
-/// transcript from growing `state.json` without bound.
-const CARRY_CAP: usize = 512;
-
-/// How many unanswered tool calls one file carries. In practice this is 0, 1, or the width of
-/// one batch of parallel calls.
-const PENDING_CAP: usize = 32;
-
-/// A carried document larger than this is remembered by id only: `state.json` is rewritten on
-/// every run, so it must not grow to hold a copy of an enormous `Write` payload.
-const PENDING_DOC_CAP: usize = 128 * 1024;
-
-/// State that has to survive from one incremental parse of a file to the next.
-///
-/// A tail parse sees only the bytes appended since the last run, and two things in this format
-/// straddle that boundary:
-///
-/// * a `tool_use` block and the `tool_result` that answers it are usually written in
-///   consecutive records, so the boundary lands between them almost every time the indexer
-///   runs against a live transcript. Without [`ParseCarry::pending_tool_uses`] the tail sees an
-///   *orphan* result and emits a second, half-empty document for a tool call that is already
-///   indexed — doubling every tool call in a live session.
-/// * one API message is split across sibling block records sharing a `message.id` (§4), and
-///   those records are *not* contiguous (§7), so a boundary inside one message would count it
-///   twice without [`ParseCarry::counted_message_ids`].
-///
-/// [`ParseCarry::tail_line`] is unrelated to parsing: it fingerprints the last complete line
-/// consumed so the indexer can tell "the file grew" from "the file was rewritten in place".
-#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
-#[serde(default)]
-pub struct ParseCarry {
-    /// Tool calls this file has already emitted a document for that no `tool_result` has
-    /// answered yet.
-    pub pending_tool_uses: Vec<PendingToolCall>,
-    /// API `message.id`s already counted towards [`SessionInfo::messages`].
-    pub counted_message_ids: Vec<String>,
-    /// API `message.id`s whose thinking cost has already been charged to a document. Separate
-    /// from `counted_message_ids` because the record carrying `thinking_tokens` is usually the
-    /// `tool_use` one, not whichever block record emitted first.
-    pub charged_message_ids: Vec<String>,
-    /// `(start offset, hash)` of the last complete line consumed.
-    pub tail_line: Option<TailLine>,
-}
-
-/// One tool call whose document is in the index but whose result has not been read yet.
-///
-/// Carrying the document itself — not just the id — is what lets a later tail *complete* it:
-/// the replacement keeps the original `doc_id` and `seq`, so the result text lands on the same
-/// document a whole-file parse would have produced, rather than being lost or duplicated.
-#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
-#[serde(default)]
-pub struct PendingToolCall {
-    pub tool_use_id: String,
-    /// The document as it was indexed, minus the result. `None` when it was too large to carry
-    /// (see [`PENDING_DOC_CAP`]): the duplicate is still suppressed, but a late result for it
-    /// updates nothing until the next `index --full`.
-    pub doc: Option<Box<Doc>>,
-}
-
-/// A fingerprint of the last complete line a parse consumed, so a later run can check that the
-/// bytes before its watermark are still the bytes it read.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-#[serde(default)]
-pub struct TailLine {
-    pub start: u64,
-    pub hash: u64,
-}
-
-/// Per-file inputs that are not the bytes of the file itself.
-#[derive(Debug, Clone, Default)]
-pub struct FileContext {
-    /// `agent-<id>.meta.json`'s `agentType`. TRANSCRIPT-FORMAT §1 makes this the canonical
-    /// source for a subagent's type; `attributionAgent` on an assistant record is a bonus that
-    /// only some writers emit, so a parser that relies on it alone leaves `agent_type` empty
-    /// on exactly the transcripts the sidecar exists for.
-    pub agent_type: Option<String>,
-    /// What the previous incremental parse of this same file left behind.
-    pub carry: ParseCarry,
-}
-
-/// FNV-1a, 64-bit. Deterministic across builds (unlike `DefaultHasher`), which matters because
-/// these digests are persisted in `state.json` and baked into `doc_id`.
-pub(crate) fn fnv1a(bytes: &[u8]) -> u64 {
-    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
-    for b in bytes {
-        hash ^= u64::from(*b);
-        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
-    }
-    hash
-}
-
-/// The `file_tag` component of a [`Doc::doc_id`]: eight hex digits of the source path.
-pub fn file_tag(source_path: &str) -> String {
-    format!("{:08x}", fnv1a(source_path.as_bytes()) as u32)
-}
+use crate::doc::{
+    CARRY_CAP, Doc, DocKind, FileContext, PENDING_CAP, ParseCarry, ParseError, ParseOptions,
+    ParseOutput, PartialDoc, PendingToolCall, SessionInfo, TailLine, carryable, file_tag, fnv1a,
+};
 
 /// The `text` copy of a tool call's input never needs the full budget: every input is already
 /// indexed whole and uncapped in `tool_input`, which is one of the default query fields, so this
@@ -265,33 +40,6 @@ pub fn file_tag(source_path: &str) -> String {
 /// incremental boundary (see [`PENDING_DOC_CAP`]), which raising [`ParseOptions::max_text_bytes`]
 /// would otherwise quietly stop happening.
 const INPUT_LEAVES_CAP: usize = 64 * 1024;
-
-#[derive(Debug, Clone)]
-pub struct ParseOptions {
-    /// Cap on the indexed body of one doc. `tool_output` is capped separately, at the same
-    /// number: a tool call's input and its result are two fields now, not one shared budget.
-    ///
-    /// The default is deliberately far above what a transcript actually carries. Claude Code
-    /// bounds tool output before it reaches disk — anything oversized is spilled to
-    /// `tool-results/<id>.txt` and referenced by a stub — so on a real corpus the largest
-    /// inline result measured 18.7 KB and *nothing* reached the old 32 KiB cap. The one place
-    /// that cap did bite was the spill path, which exists to go and fetch precisely the outputs
-    /// too big to inline: a 54.5 KB spill lost 40% of itself on the way in. A cap this size
-    /// still bounds a `cat` of something enormous, without cutting any output a person would
-    /// call reasonable.
-    pub max_text_bytes: usize,
-    /// Follow `<persisted-output>` pointers into `tool-results/<id>.txt`.
-    pub load_spilled_results: bool,
-}
-
-impl Default for ParseOptions {
-    fn default() -> Self {
-        ParseOptions {
-            max_text_bytes: 1024 * 1024,
-            load_spilled_results: false,
-        }
-    }
-}
 
 /// Prefix of the first human prompt kept on [`SessionInfo`].
 const FIRST_PROMPT_CHARS: usize = 500;
@@ -436,6 +184,7 @@ impl<'a> Parser<'a> {
             file_tag: file_tag(&source_path),
             session: SessionInfo {
                 session_id: ids.session_id,
+                agent: super::ID.to_string(),
                 agent_id: ids.agent_id.clone(),
                 agent_type: ctx.agent_type.clone(),
                 source_path,
@@ -855,6 +604,7 @@ impl<'a> Parser<'a> {
             counted_message_ids: tail_of(self.counted_order.clone(), CARRY_CAP),
             charged_message_ids: tail_of(self.charged_order.clone(), CARRY_CAP),
             tail_line: self.tail_line,
+            agent_state: Value::Null,
         }
     }
 
@@ -1267,6 +1017,7 @@ impl<'a> Parser<'a> {
                 self.file_tag,
                 seq
             ),
+            agent: super::ID.to_string(),
             kind: p.kind,
             source_path: self.session.source_path.clone(),
             seq,
@@ -1308,101 +1059,6 @@ impl<'a> Parser<'a> {
     }
 }
 
-/// Everything about a doc that comes from the *content block*, before the record-level
-/// metadata is folded in.
-struct PartialDoc {
-    kind: DocKind,
-    role: String,
-    text: String,
-    tool_output: Option<String>,
-    thinking: Option<String>,
-    thinking_tokens: Option<u64>,
-    model: Option<String>,
-    tool_name: Option<String>,
-    tool_use_id: Option<String>,
-    tool_input: Option<Value>,
-    bash_cmd: Option<Value>,
-    is_error: bool,
-    is_meta: bool,
-}
-
-impl PartialDoc {
-    fn message(role: &str, text: String) -> PartialDoc {
-        PartialDoc {
-            kind: DocKind::Message,
-            role: role.to_string(),
-            text,
-            tool_output: None,
-            thinking: None,
-            thinking_tokens: None,
-            model: None,
-            tool_name: None,
-            tool_use_id: None,
-            tool_input: None,
-            bash_cmd: None,
-            is_error: false,
-            is_meta: false,
-        }
-    }
-
-    /// `text` is the call side — the tool name and the input's own strings. The result goes in
-    /// `tool_output` via [`PartialDoc::output`], never concatenated onto `text`.
-    fn tool_call(
-        tool_name: Option<String>,
-        tool_use_id: Option<String>,
-        tool_input: Option<Value>,
-        text: String,
-        is_error: bool,
-    ) -> PartialDoc {
-        PartialDoc {
-            kind: DocKind::ToolCall,
-            role: "assistant".to_string(),
-            text,
-            tool_output: None,
-            thinking: None,
-            thinking_tokens: None,
-            model: None,
-            tool_name,
-            tool_use_id,
-            tool_input,
-            bash_cmd: None,
-            is_error,
-            is_meta: false,
-        }
-    }
-
-    fn role(mut self, role: &str) -> Self {
-        self.role = role.to_string();
-        self
-    }
-    fn model(mut self, model: Option<String>) -> Self {
-        self.model = model;
-        self
-    }
-    fn thinking(mut self, thinking: Option<String>) -> Self {
-        self.thinking = thinking;
-        self
-    }
-    /// Empty output is `None`, not `Some("")`: "the tool returned nothing" and "the result has
-    /// not arrived yet" both render as absent, and neither should occupy a posting list.
-    fn output(mut self, output: String) -> Self {
-        self.tool_output = Some(output).filter(|s| !s.is_empty());
-        self
-    }
-    fn bash_cmd(mut self, bash_cmd: Option<Value>) -> Self {
-        self.bash_cmd = bash_cmd;
-        self
-    }
-    fn meta(mut self, is_meta: bool) -> Self {
-        self.is_meta = is_meta;
-        self
-    }
-    fn error(mut self, is_error: bool) -> Self {
-        self.is_error = is_error;
-        self
-    }
-}
-
 // ---------------------------------------------------------------------------
 // helpers
 // ---------------------------------------------------------------------------
@@ -1438,12 +1094,6 @@ fn ids_from_path(path: &Path) -> FileIds {
             agent_id: None,
         }
     }
-}
-
-/// A copy of a document small enough to sit in `state.json` until its result arrives.
-fn carryable(doc: &Doc) -> Option<Box<Doc>> {
-    let size = doc.text.len() + doc.raw.len() + doc.tool_output.as_deref().map_or(0, str::len);
-    (size <= PENDING_DOC_CAP).then(|| Box::new(doc.clone()))
 }
 
 /// The last `cap` elements, in order. Used to bound what one file's [`ParseCarry`] persists.
@@ -2720,8 +2370,9 @@ mod tests {
     #[test]
     #[ignore]
     fn real_transcripts_on_this_machine() {
-        let root = crate::discovery::default_root().expect("a transcript root");
-        let files = crate::discovery::discover(std::slice::from_ref(&root)).expect("discovery");
+        let root = crate::agents::claude::discovery::default_root().expect("a transcript root");
+        let files = crate::agents::claude::discovery::discover(std::slice::from_ref(&root))
+            .expect("discovery");
         println!("root: {}", root.display());
         println!("files: {}", files.len());
         let (mut docs, mut errors, mut tools, mut thinking) = (0usize, 0usize, 0usize, 0usize);

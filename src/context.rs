@@ -8,7 +8,7 @@
 use tantivy::query::{BooleanQuery, Occur, Query, RangeQuery};
 use tantivy::schema::Term;
 
-use crate::parse::Doc;
+use crate::doc::Doc;
 use crate::schema::Fields;
 use crate::search::{docs_by_seq, session_clauses};
 
@@ -69,7 +69,7 @@ pub fn session(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::parse::DocKind;
+    use crate::doc::DocKind;
     use crate::search::testkit::{blank_doc, index_docs};
 
     /// A main transcript of 10 docs, plus a 3-doc subagent file that numbers its own `seq`
@@ -229,8 +229,11 @@ mod tests {
     fn around_over_a_real_transcript_slice() {
         let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("tests/fixtures/real_main_slice.jsonl");
-        let out =
-            crate::parse::parse_whole(&fixture, &crate::parse::ParseOptions::default()).unwrap();
+        let out = crate::agents::claude::parse::parse_whole(
+            &fixture,
+            &crate::doc::ParseOptions::default(),
+        )
+        .unwrap();
         let (index, f) = index_docs(&out.docs);
         let session_id = out.docs[0].session_id.clone();
 

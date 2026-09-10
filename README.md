@@ -1,6 +1,9 @@
 # session-search
 
-**Full-text search and faceted analytics over your Claude Code session transcripts.**
+**Full-text search and faceted analytics over your coding-agent session transcripts.**
+
+Claude Code is the supported agent today. The on-disk format sits behind one trait so Codex, pi
+and others can follow; `docs/MULTI-AGENT.md` has the research and the plan.
 
 Every Claude Code session is written to disk as JSONL under `~/.claude/projects/` — every prompt
 you typed, every command the agent ran, every file it read, every tool argument, every error,
@@ -672,9 +675,9 @@ point: `tool_input` is for finding text, `bash_cmd` is for counting facts.
 
 ### One rebuild on upgrade
 
-`bash_cmd` changed the shape of a document, so `state.json`'s `version` went from 2 to 3. The
-first run of a build that has this field sees the mismatch, throws the watermarks away and
-reindexes every transcript from byte zero. Nothing is asked of you and `index --full` is not
+`bash_cmd` changed the shape of a document, so `state.json`'s `version` went from 2 to 3; the
+`agent` field and per-agent roots took it to 4. The first run of a build that has a new field
+sees the mismatch, throws the watermarks away and reindexes every transcript from byte zero. Nothing is asked of you and `index --full` is not
 needed; it costs one full pass, 76 ms for the 193 documents on this machine.
 
 ---
@@ -729,7 +732,9 @@ Accepted by `search`, `facets` and `sessions`:
       --role <ROLE>
       --kind <KIND>             `message` or `tool_call`
       --session <SESSION_ID>
-      --agent-type <TYPE>
+      --agent <AGENT>           Which agent wrote the transcript: `claude-code`, … (see
+                                `session-search index --help`)
+      --agent-type <TYPE>       Subagent type (`Explore`, `Plan`, …), for sidechain transcripts
       --since <WHEN>            RFC3339, `YYYY-MM-DD`, or a relative span such as `7d`
       --until <WHEN>
       --errors-only
@@ -764,7 +769,9 @@ Options:
       --full                Ignore the watermarks and rebuild every file from scratch
       --index <DIR>         Index directory. Defaults to `$XDG_DATA_HOME/session-search` [env:
                             SESSION_SEARCH_INDEX=]
-      --root <DIR>          Transcript root; repeatable. Defaults to `$CLAUDE_CONFIG_DIR/projects`
+      --root <[AGENT=]DIR>  Transcript root as `[AGENT=]DIR`; repeatable. A bare DIR is a
+                            `claude-code` root. Defaults to every registered agent's own
+                            location (`$CLAUDE_CONFIG_DIR/projects` for Claude Code)
   -v, --verbose...          Raise the log level on stderr; repeatable (`-v` info, `-vv` debug,
                             `-vvv` trace)
       --jobs <N>            Parser threads. Defaults to the rayon pool size
@@ -845,7 +852,7 @@ Arguments:
   <SESSION_ID>
 
 Options:
-      --agent <AGENT_ID>   Subagent id, for a sidechain transcript
+      --subagent <AGENT_ID>  Subagent id, for a sidechain transcript [alias: --agent]
       --index <DIR>        Index directory. Defaults to `$XDG_DATA_HOME/session-search` [env:
                            SESSION_SEARCH_INDEX=]
       --around <UUID|SEQ>  A doc uuid or a `seq` number; prints a window instead of the whole
@@ -1017,13 +1024,16 @@ role  4 values · 978 of 978 matching docs have a value
 
 ### Incremental
 
-`state.json` records `{size, mtime_ms, byte_offset, docs}` for every transcript file:
+`state.json` records `{agent, size, mtime_ms, byte_offset, docs}` for every transcript file,
+and the roots the index is bound to, each paired with the adapter that reads it:
 
 ```json
 {
-  "version": 3,
+  "version": 4,
+  "roots": [{ "agent": "claude-code", "path": "/root/.claude/projects" }],
   "files": {
     "/root/.claude/projects/-home-user-session-search/b20208d8-….jsonl": {
+      "agent": "claude-code",
       "size": 1029179,
       "mtime_ms": 1788982251799,
       "byte_offset": 1029179,
@@ -1104,7 +1114,7 @@ API message's block records. Both cases used to re-emit work the previous run ha
 indexed: replaying one real 147-line transcript one line at a time produced **88 documents where
 a single pass produced 49**, and reported 78 tool calls where there were 39.
 
-The fix is a small per-file *carry* in `state.json` (`parse::ParseCarry`): the ids — and the
+The fix is a small per-file *carry* in `state.json` (`doc::ParseCarry`): the ids — and the
 documents — a run left unfinished, plus a fingerprint of the last line it consumed. A later tail
 uses it to *complete* the waiting document (same `doc_id`, same `seq`, result text appended)
 instead of inventing a second half-empty one, and to recognise a `message.id` it has already

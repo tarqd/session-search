@@ -44,8 +44,8 @@ use serde::{Deserialize, Serialize};
 use tantivy::schema::Schema;
 use tantivy::{Index, IndexWriter, TantivyDocument, Term};
 
-use crate::discovery::{TranscriptFile, discover};
-use crate::parse::{FileContext, ParseCarry, ParseOptions, ParseOutput, SessionInfo, parse_file};
+use crate::agent::{self, Root, SessionFile};
+use crate::doc::{FileContext, ParseCarry, ParseOptions, ParseOutput, SessionInfo};
 use crate::schema::{Fields, build_schema, doc_to_json};
 
 const TANTIVY_SUBDIR: &str = "tantivy";
@@ -58,7 +58,8 @@ const SESSIONS_FILE: &str = "sessions.json";
 ///
 /// 1 -> 2: `roots` and `thinking_indexed` joined the state file.
 /// 2 -> 3: the `bash_cmd` field. Existing indexes are fully reindexed on the next run.
-const STATE_VERSION: u32 = 3;
+/// 3 -> 4: `agent` on every watermark, and `roots` became `{agent, path}` pairs.
+const STATE_VERSION: u32 = 4;
 
 /// Tantivy refuses a per-thread arena below this (`MEMORY_BUDGET_NUM_BYTES_MIN`).
 const MIN_HEAP_BYTES: usize = 15_000_000;
@@ -75,7 +76,7 @@ pub struct IndexOptions {
     /// Follow `Full output saved to: <path>` pointers into `tool-results/<id>.txt`, so an
     /// oversized tool result is searchable rather than just its "output too large" stub.
     pub load_spilled_results: bool,
-    /// Cap on each indexed body field of one document. See [`crate::parse::ParseOptions`] for
+    /// Cap on each indexed body field of one document. See [`crate::doc::ParseOptions`] for
     /// why the default is where it is.
     pub max_text_bytes: usize,
     pub heap_bytes: usize,
@@ -115,6 +116,9 @@ pub struct IndexStats {
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default)]
 struct FileState {
+    /// Which adapter parsed this file. A file that changes hands (a root re-registered under
+    /// another agent) is a reset, never a tail.
+    agent: String,
     size: u64,
     mtime_ms: i64,
     byte_offset: u64,
@@ -129,17 +133,53 @@ struct FileState {
 #[serde(default)]
 struct State {
     version: u32,
-    /// The transcript roots this index was built from, canonicalized.
+    /// The transcript roots this index was built from, canonicalized, each with the adapter
+    /// that reads it.
     ///
     /// An index is bound to its corpus. Without this, an auto-refresh resolves the *default*
     /// root and silently merges a second corpus into the index — which is exactly how an index
     /// built over a 12-file snapshot came to report 32 files and answer questions about
     /// sessions that were not in the snapshot at all.
-    roots: Vec<String>,
+    roots: Vec<StoredRoot>,
     /// Whether thinking text was indexed. A query-time `--include-thinking` against an index
     /// built without it silently matches nothing, so the query side warns instead.
     thinking_indexed: bool,
     files: BTreeMap<String, FileState>,
+}
+
+/// A [`Root`] as it sits in `state.json`. The agent is stored by id, so a state file written
+/// for an adapter this build no longer registers still loads; [`meta`] drops such roots with a
+/// warning rather than failing.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct StoredRoot {
+    agent: String,
+    path: String,
+}
+
+impl StoredRoot {
+    fn from_root(root: &Root) -> StoredRoot {
+        StoredRoot {
+            agent: root.agent.to_string(),
+            path: root.path.display().to_string(),
+        }
+    }
+
+    fn to_root(&self) -> Option<Root> {
+        let Some(adapter) = agent::by_id(&self.agent) else {
+            tracing::warn!(agent = %self.agent, path = %self.path, "no adapter registered for a bound root; ignoring it");
+            return None;
+        };
+        Some(Root {
+            agent: adapter.id(),
+            path: PathBuf::from(&self.path),
+        })
+    }
+}
+
+impl std::fmt::Display for StoredRoot {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}={}", self.agent, self.path)
+    }
 }
 
 impl Default for State {
@@ -168,7 +208,8 @@ struct Job {
     /// `source_path` as it is stored in Tantivy, and the key in both `state.json` and
     /// `sessions.json`.
     key: String,
-    file: TranscriptFile,
+    adapter: &'static dyn agent::Agent,
+    file: SessionFile,
     prev: Option<FileState>,
     plan: Plan,
 }
@@ -178,12 +219,7 @@ impl Job {
     /// from the `.meta.json` beside it, and — for a tail — what the last parse left behind.
     fn file_context(&self) -> FileContext {
         FileContext {
-            agent_type: self
-                .file
-                .meta
-                .as_ref()
-                .and_then(|m| m.agent_type.clone())
-                .filter(|t| !t.is_empty()),
+            agent_type: self.file.agent_type.clone(),
             carry: match (self.plan, &self.prev) {
                 (Plan::Tail { .. }, Some(prev)) => prev.carry.clone(),
                 // A reset re-reads the file from byte zero, so nothing carries over.
@@ -236,24 +272,22 @@ pub fn open_or_create(index_dir: &Path) -> Result<(Index, Fields)> {
     Ok((index, fields))
 }
 
-/// One incremental pass over every transcript under `roots`.
-pub fn run(index_dir: &Path, roots: &[PathBuf], opts: &IndexOptions) -> Result<IndexStats> {
+/// One incremental pass over every transcript under `roots`, each root read by the adapter
+/// it is paired with.
+pub fn run(index_dir: &Path, roots: &[Root], opts: &IndexOptions) -> Result<IndexStats> {
     let started = Instant::now();
     let (index, fields) = open_or_create(index_dir)?;
     let schema = index.schema();
 
     // Canonical roots keep `source_path` — the delete key — stable no matter how the caller
     // spelled the path.
-    let roots: Vec<PathBuf> = roots
-        .iter()
-        .map(|r| std::fs::canonicalize(r).unwrap_or_else(|_| r.clone()))
-        .collect();
+    let roots: Vec<Root> = roots.iter().map(canonical_root).collect();
     let mut state = load_state(index_dir);
 
     // An index belongs to one corpus. Pointing a second corpus at it would merge the two with
     // no way to tell them apart afterwards, and every count the tool reports would silently
     // describe a union nobody asked for.
-    let requested: Vec<String> = roots.iter().map(|r| r.display().to_string()).collect();
+    let requested: Vec<StoredRoot> = roots.iter().map(StoredRoot::from_root).collect();
     if !state.roots.is_empty() && state.roots != requested {
         if opts.full {
             // A full rebuild drops every document anyway, so re-pointing is well defined.
@@ -264,13 +298,13 @@ pub fn run(index_dir: &Path, roots: &[PathBuf], opts: &IndexOptions) -> Result<I
                  Merging two corpora into one index would make every count describe their union.\n\
                  Use a different --index for the new corpus, or `index --full` to rebuild this \
                  one against it.",
-                state.roots.join(", "),
-                requested.join(", "),
+                joined(&state.roots),
+                joined(&requested),
             );
         }
     }
 
-    let files = discover(&roots)?;
+    let files = discover_all(&roots)?;
     let mut sessions = match load_sessions(index_dir) {
         Ok(sessions) => sessions,
         Err(err) => {
@@ -293,6 +327,12 @@ pub fn run(index_dir: &Path, roots: &[PathBuf], opts: &IndexOptions) -> Result<I
             let key = file.path.display().to_string();
             let prev = state.files.get(&key).cloned();
             let mut plan = plan_for(&file, prev.as_ref(), opts.full);
+            // Only registered adapters reach discovery, so this cannot fail in practice; a
+            // file with no adapter to parse it is skipped rather than aborting the run.
+            let Some(adapter) = agent::by_id(file.agent) else {
+                tracing::warn!(path = %key, agent = file.agent, "no adapter registered; skipping");
+                return None;
+            };
             // A file can be rewritten in place and still be larger than it was — a rewind,
             // `resetSessionFile()`, a restored fork (§9). Size and mtime cannot tell that from
             // an append, so the last line we actually read is re-checked before trusting the
@@ -310,6 +350,7 @@ pub fn run(index_dir: &Path, roots: &[PathBuf], opts: &IndexOptions) -> Result<I
             }
             Some(Job {
                 key,
+                adapter,
                 file,
                 prev,
                 plan,
@@ -356,11 +397,10 @@ pub fn run(index_dir: &Path, roots: &[PathBuf], opts: &IndexOptions) -> Result<I
                                 _ => (0, 0),
                             };
                             let ctx = job.file_context();
-                            let parsed =
-                                parse_file(&job.file.path, from, seq_base, parse_opts_ref, &ctx)
-                                    .with_context(|| {
-                                        format!("parsing {}", job.file.path.display())
-                                    });
+                            let parsed = job
+                                .adapter
+                                .parse(&job.file.path, from, seq_base, parse_opts_ref, &ctx)
+                                .with_context(|| format!("parsing {}", job.file.path.display()));
                             // A closed receiver only happens if the consumer already died.
                             let _ = tx.send((i, parsed));
                         });
@@ -428,6 +468,45 @@ pub fn run(index_dir: &Path, roots: &[PathBuf], opts: &IndexOptions) -> Result<I
     stats.sessions = sessions.len();
     stats.elapsed_ms = started.elapsed().as_millis();
     Ok(stats)
+}
+
+fn canonical_root(root: &Root) -> Root {
+    Root {
+        agent: root.agent,
+        path: std::fs::canonicalize(&root.path).unwrap_or_else(|_| root.path.clone()),
+    }
+}
+
+fn joined(roots: &[StoredRoot]) -> String {
+    roots
+        .iter()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// Every transcript under every (already canonical) root, each root walked by its own
+/// adapter; overlapping roots for one agent are deduplicated by the adapter.
+fn discover_all(roots: &[Root]) -> Result<Vec<SessionFile>> {
+    let mut by_agent: BTreeMap<&'static str, Vec<PathBuf>> = BTreeMap::new();
+    for root in roots {
+        by_agent
+            .entry(root.agent)
+            .or_default()
+            .push(root.path.clone());
+    }
+    let mut files = Vec::new();
+    for (id, paths) in by_agent {
+        let Some(adapter) = agent::by_id(id) else {
+            anyhow::bail!("no adapter registered for agent {id:?}");
+        };
+        files.extend(
+            adapter
+                .discover(&paths)
+                .with_context(|| format!("discovering {id} transcripts"))?,
+        );
+    }
+    Ok(files)
 }
 
 /// Read `<index_dir>/sessions.json`, keyed by **absolute transcript path**.
@@ -520,6 +599,7 @@ fn consume(
     state.files.insert(
         job.key.clone(),
         FileState {
+            agent: job.file.agent.to_string(),
             // `size`/`mtime_ms` are the values observed *before* reading, so a file that grew
             // while we read it still looks changed next run and gets tailed rather than
             // skipped. `consumed` can exceed the stat when that happens.
@@ -594,7 +674,7 @@ fn tail_intact(path: &Path, prev: &FileState) -> bool {
     }
     let mut buf = vec![0u8; len];
     match file.read_exact(&mut buf) {
-        Ok(()) => crate::parse::fnv1a(&buf) == tail.hash,
+        Ok(()) => crate::doc::fnv1a(&buf) == tail.hash,
         Err(_) => false,
     }
 }
@@ -625,13 +705,13 @@ fn prune_vanished(
     }
 }
 
-fn plan_for(file: &TranscriptFile, prev: Option<&FileState>, full: bool) -> Plan {
+fn plan_for(file: &SessionFile, prev: Option<&FileState>, full: bool) -> Plan {
     let Some(prev) = prev else {
         // No watermark: reparse from zero, and delete first in case the index still holds
         // documents from a run whose state.json was lost.
         return Plan::Reset;
     };
-    if full {
+    if full || prev.agent != file.agent {
         return Plan::Reset;
     }
     if file.size == prev.size && file.mtime_ms == prev.mtime_ms {
@@ -653,21 +733,22 @@ fn plan_for(file: &TranscriptFile, prev: Option<&FileState>, full: bool) -> Plan
 // ---------------------------------------------------------------------------
 
 /// Fill in what only the indexer knows: the ids the filename carries, and the subagent
-/// `.meta.json` that lives beside the transcript rather than inside it.
+/// sidecar that lives beside the transcript rather than inside it.
 fn session_info(job: &Job, mut info: SessionInfo) -> SessionInfo {
+    if info.agent.is_empty() {
+        info.agent = job.file.agent.to_string();
+    }
     if info.session_id.is_empty() {
         info.session_id = job.file.session_id.clone();
     }
     if info.agent_id.is_none() {
         info.agent_id = job.file.agent_id.clone();
     }
-    if let Some(meta) = &job.file.meta {
-        if info.agent_type.is_none() {
-            info.agent_type = meta.agent_type.clone();
-        }
-        if info.description.is_none() {
-            info.description = meta.description.clone();
-        }
+    if info.agent_type.is_none() {
+        info.agent_type = job.file.agent_type.clone();
+    }
+    if info.description.is_none() {
+        info.description = job.file.description.clone();
     }
     if info.source_path.is_empty() {
         info.source_path = job.key.clone();
@@ -681,6 +762,9 @@ fn session_info(job: &Job, mut info: SessionInfo) -> SessionInfo {
 fn merge_session(dst: &mut SessionInfo, src: SessionInfo) {
     if dst.session_id.is_empty() {
         dst.session_id = src.session_id;
+    }
+    if !src.agent.is_empty() {
+        dst.agent = src.agent;
     }
     if src.agent_id.is_some() {
         dst.agent_id = src.agent_id;
@@ -729,7 +813,7 @@ fn merge_session(dst: &mut SessionInfo, src: SessionInfo) {
 /// when `--include-thinking` cannot possibly match, and report its own scope.
 #[derive(Debug, Clone, Default)]
 pub struct IndexMeta {
-    pub roots: Vec<PathBuf>,
+    pub roots: Vec<Root>,
     pub thinking_indexed: bool,
     pub files: usize,
 }
@@ -739,7 +823,7 @@ pub struct IndexMeta {
 pub fn meta(index_dir: &Path) -> IndexMeta {
     let state = load_state(index_dir);
     IndexMeta {
-        roots: state.roots.iter().map(PathBuf::from).collect(),
+        roots: state.roots.iter().filter_map(StoredRoot::to_root).collect(),
         thinking_indexed: state.thinking_indexed,
         files: state.files.len(),
     }
@@ -810,8 +894,16 @@ fn write_json_atomic<T: Serialize>(path: &Path, value: &T) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::agents::claude::{discovery as claude_discovery, parse as claude_parse};
     use tantivy::collector::Count;
     use tantivy::query::AllQuery;
+
+    fn claude_root(path: &Path) -> Root {
+        Root {
+            agent: "claude-code",
+            path: path.to_path_buf(),
+        }
+    }
 
     /// Documents currently visible in the committed index.
     fn live_docs(index_dir: &Path) -> u64 {
@@ -822,7 +914,7 @@ mod tests {
     /// Documents the parser would produce for the whole file — the ground truth every
     /// incremental assertion is measured against.
     fn docs_in(path: &Path) -> u64 {
-        let out = crate::parse::parse_whole(path, &ParseOptions::default()).unwrap();
+        let out = claude_parse::parse_whole(path, &ParseOptions::default()).unwrap();
         out.docs.len() as u64
     }
 
@@ -898,7 +990,7 @@ mod tests {
         }
 
         fn index_with(&self, opts: &IndexOptions) -> IndexStats {
-            run(&self.index_dir, std::slice::from_ref(&self.root), opts).unwrap()
+            run(&self.index_dir, &[claude_root(&self.root)], opts).unwrap()
         }
 
         fn append(&self, line: &str) {
@@ -943,7 +1035,7 @@ mod tests {
 
         let err = run(
             &a.index_dir,
-            std::slice::from_ref(&root_b),
+            &[claude_root(&root_b)],
             &IndexOptions::default(),
         )
         .expect_err("indexing a second corpus into one index must fail");
@@ -957,7 +1049,7 @@ mod tests {
         // --full re-points it, because a rebuild drops everything anyway.
         run(
             &a.index_dir,
-            std::slice::from_ref(&root_b),
+            &[claude_root(&root_b)],
             &IndexOptions {
                 full: true,
                 ..IndexOptions::default()
@@ -966,7 +1058,7 @@ mod tests {
         .expect("--full may re-point an index at a new corpus");
         assert_eq!(
             meta(&a.index_dir).roots,
-            [std::fs::canonicalize(&root_b).unwrap()]
+            [claude_root(&std::fs::canonicalize(&root_b).unwrap())]
         );
     }
 
@@ -980,7 +1072,7 @@ mod tests {
         let noisy = fx.root.join(".");
         run(
             &fx.index_dir,
-            std::slice::from_ref(&noisy),
+            &[claude_root(&noisy)],
             &IndexOptions::default(),
         )
         .expect("the same root spelled differently must not conflict");
@@ -1030,6 +1122,26 @@ mod tests {
         assert_eq!(fx.live(), fx.expected());
     }
 
+    /// The adapter's id reaches every document, the session row, and the watermark.
+    #[test]
+    fn every_document_and_session_carries_its_agent() {
+        let fx = Fixture::new();
+        fx.index();
+        let key = fx.transcript.display().to_string();
+        assert_eq!(fx.sessions()[&key].agent, "claude-code");
+        assert_eq!(fx.state().files[&key].agent, "claude-code");
+
+        let (index, fields) = open_or_create(&fx.index_dir).unwrap();
+        let mut request = crate::search::SearchRequest {
+            limit: 100,
+            ..crate::search::SearchRequest::default()
+        };
+        request.filters.agent = Some("claude-code".into());
+        let found = crate::search::search(&index, &fields, &request).unwrap();
+        assert_eq!(found.total as u64, fx.expected());
+        assert!(found.hits.iter().all(|h| h.doc.agent == "claude-code"));
+    }
+
     #[test]
     fn second_run_adds_nothing() {
         let fx = Fixture::new();
@@ -1074,7 +1186,7 @@ mod tests {
         assert_eq!(watermark.byte_offset, watermark.size);
 
         // Unique doc_ids are what make the delete key work; a restarted `seq` would collide.
-        let out = crate::parse::parse_whole(&fx.transcript, &ParseOptions::default()).unwrap();
+        let out = claude_parse::parse_whole(&fx.transcript, &ParseOptions::default()).unwrap();
         let ids: BTreeSet<&str> = out.docs.iter().map(|d| d.doc_id.as_str()).collect();
         assert_eq!(ids.len(), out.docs.len());
     }
@@ -1288,7 +1400,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let stats = run(
             &tmp.path().join("index"),
-            &[tmp.path().join("missing")],
+            &[claude_root(&tmp.path().join("missing"))],
             &IndexOptions::default(),
         )
         .unwrap();
@@ -1322,6 +1434,7 @@ mod tests {
         state.files.insert(
             "/a/b.jsonl".to_string(),
             FileState {
+                agent: "claude-code".into(),
                 size: 10,
                 mtime_ms: 20,
                 byte_offset: 8,
@@ -1414,7 +1527,7 @@ mod tests {
 
         let key = fx.transcript.display().to_string();
         let incremental = fx.sessions()[&key].messages;
-        let one_shot = crate::parse::parse_whole(&fx.transcript, &ParseOptions::default())
+        let one_shot = claude_parse::parse_whole(&fx.transcript, &ParseOptions::default())
             .unwrap()
             .session
             .messages;
@@ -1532,16 +1645,17 @@ mod tests {
         std::fs::write(&path, "one\ntwo\n").unwrap();
 
         let state = |offset: u64, start: u64, hash: u64| FileState {
+            agent: "claude-code".into(),
             size: 8,
             mtime_ms: 1,
             byte_offset: offset,
             docs: 2,
             carry: ParseCarry {
-                tail_line: Some(crate::parse::TailLine { start, hash }),
+                tail_line: Some(crate::doc::TailLine { start, hash }),
                 ..ParseCarry::default()
             },
         };
-        let two = crate::parse::fnv1a(b"two\n");
+        let two = crate::doc::fnv1a(b"two\n");
         assert!(tail_intact(&path, &state(8, 4, two)));
         assert!(!tail_intact(&path, &state(8, 4, two ^ 1)), "wrong hash");
         assert!(!tail_intact(&path, &state(4, 4, two)), "start past offset");
@@ -1553,6 +1667,7 @@ mod tests {
         assert!(tail_intact(
             &path,
             &FileState {
+                agent: "claude-code".into(),
                 size: 8,
                 mtime_ms: 1,
                 byte_offset: 8,
@@ -1586,15 +1701,18 @@ mod tests {
 
     #[test]
     fn plan_for_covers_every_watermark_transition() {
-        let file = |size: u64, mtime_ms: i64| TranscriptFile {
+        let file = |size: u64, mtime_ms: i64| SessionFile {
+            agent: "claude-code",
             path: PathBuf::from("/p/sess.jsonl"),
             session_id: "sess".into(),
             agent_id: None,
-            meta: None,
+            agent_type: None,
+            description: None,
             size,
             mtime_ms,
         };
         let prev = FileState {
+            agent: "claude-code".into(),
             size: 100,
             mtime_ms: 500,
             byte_offset: 90,
@@ -1603,6 +1721,12 @@ mod tests {
         };
 
         assert_eq!(plan_for(&file(100, 500), Some(&prev), false), Plan::Skip);
+        // The same bytes under a different adapter are a different document set.
+        let other = FileState {
+            agent: "codex".into(),
+            ..prev.clone()
+        };
+        assert_eq!(plan_for(&file(100, 500), Some(&other), false), Plan::Reset);
         assert_eq!(
             plan_for(&file(150, 600), Some(&prev), false),
             Plan::Tail {
@@ -1671,10 +1795,10 @@ mod tests {
     #[test]
     #[ignore = "requires real transcripts on this machine"]
     fn replaying_a_real_transcript_line_by_line_matches_a_single_pass() {
-        let Ok(root) = crate::discovery::default_root() else {
+        let Ok(root) = claude_discovery::default_root() else {
             return;
         };
-        let Some(source) = discover(std::slice::from_ref(&root))
+        let Some(source) = claude_discovery::discover(std::slice::from_ref(&root))
             .unwrap_or_default()
             .into_iter()
             .filter(|f| f.size > 0)
@@ -1701,7 +1825,7 @@ mod tests {
             std::thread::sleep(std::time::Duration::from_millis(2));
             run(
                 &live_dir,
-                std::slice::from_ref(&live_root),
+                &[claude_root(&live_root)],
                 &IndexOptions::default(),
             )
             .unwrap();
@@ -1710,7 +1834,7 @@ mod tests {
         let once_dir = tmp.path().join("once");
         let once = run(
             &once_dir,
-            std::slice::from_ref(&live_root),
+            &[claude_root(&live_root)],
             &IndexOptions::default(),
         )
         .unwrap();
@@ -1784,7 +1908,7 @@ mod tests {
     #[test]
     #[ignore = "requires real transcripts on this machine"]
     fn real_transcripts_index_incrementally() {
-        let Ok(root) = crate::discovery::default_root() else {
+        let Ok(root) = claude_discovery::default_root() else {
             return;
         };
         if !root.is_dir() {
@@ -1792,7 +1916,7 @@ mod tests {
         }
         let tmp = tempfile::tempdir().unwrap();
         let index_dir = tmp.path().join("index");
-        let roots = [root.clone()];
+        let roots = [claude_root(&root)];
 
         let first = run(&index_dir, &roots, &IndexOptions::default()).unwrap();
         println!(
