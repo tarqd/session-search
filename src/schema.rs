@@ -44,7 +44,9 @@ pub struct Fields {
     pub tool_input: tantivy::schema::Field,
     pub bash_cmd: tantivy::schema::Field,
     pub text: tantivy::schema::Field,
+    pub tool_output: tantivy::schema::Field,
     pub thinking: tantivy::schema::Field,
+    pub thinking_tokens: tantivy::schema::Field,
     pub timestamp: tantivy::schema::Field,
     pub seq: tantivy::schema::Field,
     pub is_error: tantivy::schema::Field,
@@ -120,7 +122,14 @@ pub fn build_schema() -> (Schema, Fields) {
     let bash_cmd = sb.add_json_field("bash_cmd", bash_cmd_options());
 
     let text = sb.add_text_field("text", TEXT | STORED);
+    // What a tool returned, indexed apart from what it was asked to do. Always indexed — a
+    // tool result is the record of what actually happened, and `--include-thinking` has no
+    // equivalent here.
+    let tool_output = sb.add_text_field("tool_output", TEXT | STORED);
     let thinking = sb.add_text_field("thinking", TEXT | STORED);
+    // Fast so it can be faceted and range-filtered; this is the only measure of reasoning that
+    // survives on machines where the thinking text is stripped.
+    let thinking_tokens = sb.add_u64_field("thinking_tokens", FAST | STORED | INDEXED);
 
     let timestamp = sb.add_date_field("timestamp", INDEXED | STORED | FAST);
     let seq = sb.add_u64_field("seq", INDEXED | STORED | FAST);
@@ -157,7 +166,9 @@ pub fn build_schema() -> (Schema, Fields) {
         tool_input,
         bash_cmd,
         text,
+        tool_output,
         thinking,
+        thinking_tokens,
         timestamp,
         seq,
         is_error,
@@ -226,6 +237,7 @@ pub fn doc_to_json(doc: &Doc, include_thinking: bool) -> Value {
     put_str(&mut o, "version", doc.version.as_deref());
     put_str(&mut o, "slug", doc.slug.as_deref());
     put_str(&mut o, "text", Some(&doc.text));
+    put_str(&mut o, "tool_output", doc.tool_output.as_deref());
     put_str(&mut o, "raw", Some(&doc.raw));
 
     if let Some(facet) = doc.project.as_deref().and_then(facet_path) {
@@ -239,6 +251,11 @@ pub fn doc_to_json(doc: &Doc, include_thinking: bool) -> Value {
             json!({ "value": input })
         };
         o.insert("tool_input".to_string(), value);
+    }
+    if let Some(n) = doc.thinking_tokens {
+        // Not gated on include_thinking: this is metadata about the turn, not thinking text,
+        // and it is the only thing left when the text was stripped before it reached disk.
+        o.insert("thinking_tokens".to_string(), json!(n));
     }
     // Only ever `Some` for a Bash call whose command parsed; an absent value must stay absent
     // rather than becoming an empty object, so `bash_cmd.program:*` means "a Bash script ran".
@@ -296,8 +313,10 @@ mod tests {
             permission_mode: Some("default".into()),
             version: Some("2.1.266".into()),
             slug: Some("wild-spinning-puppy".into()),
-            text: "cargo build".into(),
+            text: "Bash\ncargo build".into(),
+            tool_output: Some("Finished dev profile".into()),
             thinking: Some("hmm".into()),
+            thinking_tokens: None,
             raw: "{}".into(),
         }
     }
@@ -328,6 +347,7 @@ mod tests {
             "tool_input",
             "bash_cmd",
             "text",
+            "tool_output",
             "thinking",
             "timestamp",
             "seq",

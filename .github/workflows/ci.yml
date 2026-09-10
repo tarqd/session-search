@@ -1,0 +1,67 @@
+name: CI
+
+# The four checks the README's "Development" section asks a contributor to run by hand,
+# run for them on every push and pull request.
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+  # Mondays 07:00 UTC — the only thing that runs the macOS leg on its own.
+  schedule:
+    - cron: "0 7 * * 1"
+
+# A second push to the same branch makes the first one's answer irrelevant.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # One job, not four. Each job is a fresh runner that re-downloads the cache and rebuilds
+  # the dependency graph; on a private repo that is billed minutes for no extra signal.
+  # Ordered cheapest-first, and `fmt` needs no compilation at all.
+  check:
+    name: fmt + clippy + test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: cargo fmt --check
+        run: cargo fmt --check
+
+      # `-D warnings` after `--` reaches this crate's own units only, so a warning inside a
+      # dependency cannot fail the build. `--all-targets` covers tests and benches too.
+      - name: cargo clippy
+        run: cargo clippy --locked --all-targets --all-features -- -D warnings
+
+      - name: cargo build
+        run: cargo build --locked --all-targets
+
+      # The four `#[ignore]`d tests read this machine's own `~/.claude/projects`, which a
+      # runner does not have. They stay a by-hand check; see the README.
+      - name: cargo test
+        run: cargo test --locked
+
+  # macOS bills at 10x, so it does not run per-PR. This keeps the Apple leg from going stale
+  # between releases without paying for it on every push: once a week, and on demand.
+  macos:
+    name: test (macOS)
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test --locked

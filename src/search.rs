@@ -52,6 +52,15 @@ pub struct Filters {
     /// Tool parameter filter as `key=value`, e.g. `--tool-input command=cargo`; repeatable.
     #[arg(long = "tool-input", value_name = "KEY=VALUE")]
     pub tool_input: Vec<String>,
+    /// Phrase the tool's *output* must contain, e.g. `--tool-output "No such file"`;
+    /// repeatable, and ANDed.
+    #[arg(long = "tool-output", value_name = "TEXT")]
+    pub tool_output: Vec<String>,
+    /// Only turns where the model spent at least N thinking tokens. Works even where the
+    /// thinking text itself was stripped before it reached disk, which is the case for remote
+    /// and web sessions.
+    #[arg(long, value_name = "N")]
+    pub min_thinking: Option<u64>,
     /// Program run by a Bash command — any simple command in the script, e.g.
     /// `--program cargo`; repeatable, OR.
     #[arg(long, value_name = "NAME")]
@@ -244,6 +253,13 @@ pub fn search(
     if let Some(generator) = thinking_snippets.as_mut() {
         generator.set_max_num_chars(req.snippet_chars.max(32));
     }
+    // Likewise for a tool call matched through its result: the call side is a tool name and a
+    // command line, and highlighting that instead of the output the query actually hit shows
+    // the caller the one part of the document they did not ask about.
+    let mut output_snippets = SnippetGenerator::create(&searcher, &*query, f.tool_output).ok();
+    if let Some(generator) = output_snippets.as_mut() {
+        generator.set_max_num_chars(req.snippet_chars.max(32));
+    }
 
     // `TopDocs::with_limit(0)` panics, so the collector always asks for at least one doc;
     // an explicit `--limit 0` still means "no hits, just totals and facets".
@@ -253,21 +269,29 @@ pub fn search(
     for (score, address) in top_hits {
         let stored: TantivyDocument = searcher.doc(address)?;
         let doc = doc_from_stored(f, &stored);
-        let snippet = snippets
-            .as_ref()
-            .map(|g| render_snippet(&g.snippet_from_doc(&stored)))
-            .filter(|s| !s.trim().is_empty())
-            .or_else(|| {
-                thinking_snippets
-                    .as_ref()
-                    .map(|g| render_snippet(&g.snippet_from_doc(&stored)))
-                    .filter(|s| !s.trim().is_empty())
-            })
+        let highlighted = |g: &Option<SnippetGenerator>| {
+            g.as_ref()
+                .map(|g| render_snippet(&g.snippet_from_doc(&stored)))
+                .filter(|s| !s.trim().is_empty())
+        };
+        let snippet = highlighted(&snippets)
+            .or_else(|| highlighted(&output_snippets))
+            .or_else(|| highlighted(&thinking_snippets))
             .unwrap_or_else(|| {
-                let body = match (doc.text.trim().is_empty(), doc.thinking.as_deref()) {
-                    (true, Some(thinking)) => thinking,
-                    _ => &doc.text,
+                // Nothing highlighted: fall back to whichever body this document actually has.
+                // A failed call leads with its result — on `--errors-only`, which carries no
+                // free-text query and so lands here every time, the error is the answer and
+                // the command that failed is only context.
+                let (first, second) = if doc.is_error {
+                    (doc.tool_output.as_deref(), Some(doc.text.as_str()))
+                } else {
+                    (Some(doc.text.as_str()), doc.tool_output.as_deref())
                 };
+                let body = [first, second, doc.thinking.as_deref()]
+                    .into_iter()
+                    .flatten()
+                    .find(|b| !b.trim().is_empty())
+                    .unwrap_or("");
                 excerpt(body, req.snippet_chars)
             });
         hits.push(Hit {
@@ -275,6 +299,21 @@ pub fn search(
             score,
             snippet,
         });
+    }
+
+    // An unqualified `word:value` is a JSON-subpath lookup, so it cannot fail to parse — it
+    // just finds nothing when that subpath does not exist. Zero hits from a query shaped like
+    // that is far more often a misread colon than an empty corpus, so say so rather than
+    // letting it look like an authoritative "no".
+    if total == 0
+        && let Some(text) = non_empty(req.query.as_deref())
+        && has_unqualified_field_term(&schema, text)
+    {
+        tracing::warn!(
+            query = %text,
+            "no matches: a `word:value` term here was read as a tool_input JSON subpath. \
+             If you meant it as text, quote it."
+        );
     }
 
     Ok(SearchResponse {
@@ -325,7 +364,10 @@ fn build_query(
     let mut clauses: Vec<(Occur, Box<dyn Query>)> = Vec::new();
 
     if let Some(text) = non_empty(req.query.as_deref()) {
-        let mut default_fields = vec![f.text];
+        // `tool_output` is a default field, not an opt-in one: before it existed the result
+        // text lived in `text`, so leaving it out would make a bare query stop matching things
+        // it has always matched.
+        let mut default_fields = vec![f.text, f.tool_output];
         if req.include_thinking {
             default_fields.push(f.thinking);
         }
@@ -334,6 +376,7 @@ fn build_query(
         // Bare multi-word input reads as "all of these words", which is what people mean;
         // explicit `OR` / `AND` / `"phrases"` / `field:value` still work.
         qp.set_conjunction_by_default();
+        let text = &escape_stray_colons(text);
         let parsed = match qp.parse_query(text) {
             Ok(q) => q,
             Err(err) => {
@@ -365,6 +408,9 @@ fn build_query(
     for spec in &flt.tool_input {
         clauses.push((Occur::Must, tool_input_query(index, spec)?));
     }
+    for phrase in &flt.tool_output {
+        clauses.push((Occur::Must, tool_output_query(index, phrase)?));
+    }
     if let Some(q) = program_query(index, &flt.program)? {
         clauses.push((Occur::Must, q));
     }
@@ -387,6 +433,15 @@ fn build_query(
 
     if flt.errors_only {
         clauses.push((Occur::Must, flag_query(f.is_error, 1)));
+    }
+    if let Some(min) = flt.min_thinking {
+        clauses.push((
+            Occur::Must,
+            Box::new(RangeQuery::new(
+                std::ops::Bound::Included(Term::from_field_u64(f.thinking_tokens, min)),
+                std::ops::Bound::Unbounded,
+            )),
+        ));
     }
     if flt.sidechains_only {
         clauses.push((Occur::Must, flag_query(f.is_sidechain, 1)));
@@ -414,6 +469,71 @@ fn term_query(field: Field, value: &str) -> Box<dyn Query> {
         Term::from_field_text(field, value),
         IndexRecordOption::Basic,
     ))
+}
+
+/// Escape a `:` that punctuates prose rather than starting a field lookup.
+///
+/// `tool_input` is a JSON field sitting in the default search fields, so *any* `word:value`
+/// parses cleanly — it reads as a lookup on the JSON subpath `word`. That is a deliberate
+/// shorthand (`command:cargo` finds Bash commands without spelling out `tool_input.`), but it
+/// also means the parser can never report an unknown field, so a pasted URL or ordinary prose
+/// parses fine and then matches nothing, silently. The corpus this was found on holds
+/// `https://github.com` 86 times and the query returned zero.
+///
+/// The two cases are separable by what follows the colon. A field lookup always has a value
+/// immediately after it — `cargo`, `1`, `>=5000`, `[1 TO *]`, `"a phrase"`. Prose does not:
+/// `https://github.com` has a `/`, and `note: this` has a space. So a colon followed by
+/// whitespace, by `/`, or by nothing is punctuation, and is escaped to be searched literally.
+/// Quoted spans are left exactly as written.
+fn escape_stray_colons(query: &str) -> String {
+    let mut out = String::with_capacity(query.len() + 8);
+    let mut in_quotes = false;
+    let mut chars = query.char_indices().peekable();
+
+    while let Some((_, c)) = chars.next() {
+        if c == '"' {
+            in_quotes = !in_quotes;
+            out.push(c);
+            continue;
+        }
+        if c == ':' && !in_quotes {
+            let starts_a_value = chars
+                .peek()
+                .is_some_and(|(_, next)| !next.is_whitespace() && *next != '/');
+            if !starts_a_value {
+                out.push('\\');
+            }
+        }
+        out.push(c);
+    }
+    out
+}
+
+/// Does this query contain a `word:` whose root is not a field in the schema? Such a term is a
+/// JSON-subpath lookup, which is valid but matches nothing when the subpath does not exist —
+/// worth saying out loud when the search came back empty.
+fn has_unqualified_field_term(schema: &Schema, query: &str) -> bool {
+    let mut in_quotes = false;
+    let mut token = String::new();
+    for c in query.chars() {
+        match c {
+            '"' => {
+                in_quotes = !in_quotes;
+                token.clear();
+            }
+            _ if in_quotes => {}
+            ':' => {
+                let root = token.split('.').next().unwrap_or("");
+                if !root.is_empty() && schema.get_field(root).is_err() {
+                    return true;
+                }
+                token.clear();
+            }
+            c if c.is_whitespace() || matches!(c, '(' | ')' | '+' | '-') => token.clear(),
+            c => token.push(c),
+        }
+    }
+    false
 }
 
 fn flag_query(field: Field, value: u64) -> Box<dyn Query> {
@@ -497,6 +617,19 @@ fn expand_tilde(path: &str) -> String {
 /// Routed through `QueryParser` on purpose: it emits both the tokenized text terms *and* the
 /// typed fast-value term, so `path=/tmp/x.rs`, `command="cargo build"` and `timeout=600000`
 /// all match the way they were indexed.
+/// `--tool-output TEXT` as a phrase query over what the tool returned. Quoted, so an operator
+/// or a stray colon in the text is matched literally rather than reinterpreted as grammar.
+fn tool_output_query(index: &tantivy::Index, phrase: &str) -> anyhow::Result<Box<dyn Query>> {
+    let phrase = phrase.trim();
+    if phrase.is_empty() {
+        bail!("--tool-output expects a non-empty value");
+    }
+    let escaped = phrase.replace('\\', r"\\").replace('"', r#"\""#);
+    let qp = QueryParser::for_index(index, Vec::new());
+    qp.parse_query(&format!("tool_output:\"{escaped}\""))
+        .with_context(|| format!("building a tool-output filter from {phrase:?}"))
+}
+
 fn tool_input_query(index: &tantivy::Index, spec: &str) -> anyhow::Result<Box<dyn Query>> {
     let (key, value) = spec
         .split_once('=')
@@ -876,7 +1009,9 @@ pub fn doc_from_stored(f: &Fields, stored: &TantivyDocument) -> Doc {
         version: s(f.version),
         slug: s(f.slug),
         text: s(f.text).unwrap_or_default(),
+        tool_output: s(f.tool_output),
         thinking: s(f.thinking),
+        thinking_tokens: u(f.thinking_tokens),
         raw: s(f.raw).unwrap_or_default(),
     }
 }
@@ -980,7 +1115,9 @@ pub(crate) mod testkit {
             version: Some("2.1.266".into()),
             slug: None,
             text: String::new(),
+            tool_output: None,
             thinking: None,
+            thinking_tokens: None,
             raw: "{}".into(),
         }
     }
@@ -1015,8 +1152,9 @@ pub(crate) mod testkit {
         d.tool_name = Some("Bash".into());
         d.tool_use_id = Some("toolu_1".into());
         d.tool_input = Some(json!({"command": "cargo build --release", "timeout": 600000}));
+        d.text = "Bash\ncargo build --release".into();
+        d.tool_output = Some("Compiling tantivy\nFinished dev profile".into());
         d.bash_cmd = crate::bash::extract("cargo build --release").map(|c| c.to_json());
-        d.text = "cargo build --release\nCompiling tantivy".into();
         docs.push(d);
 
         let mut d = blank_doc(2);
@@ -1025,7 +1163,8 @@ pub(crate) mod testkit {
         d.model = Some("claude-opus-5".into());
         d.tool_name = Some("Read".into());
         d.tool_input = Some(json!({"file_path": "/home/user/session-search/src/index.rs"}));
-        d.text = "pub fn open_or_create(index_dir: &Path)".into();
+        d.text = "Read\n/home/user/session-search/src/index.rs".into();
+        d.tool_output = Some("pub fn open_or_create(index_dir: &Path)".into());
         docs.push(d);
 
         let mut d = blank_doc(3);
@@ -1092,6 +1231,63 @@ mod tests {
             query: (!query.is_empty()).then(|| query.to_string()),
             ..SearchRequest::default()
         }
+    }
+
+    /// `tool_input` is a JSON field in the default search fields, so any `word:value` parses
+    /// cleanly as a JSON-subpath lookup — which made a pasted URL match nothing and say nothing.
+    /// The corpus this was found on holds `https://github.com` 86 times; the query returned 0.
+    #[test]
+    fn a_colon_in_ordinary_text_is_not_a_field_lookup() {
+        let mut docs = corpus();
+        let mut d = blank_doc(90);
+        d.text = "see https://github.com/tarqd/session-search for the source".into();
+        docs.push(d);
+        let mut d = blank_doc(91);
+        d.text = "note: this one is prose, not a field".into();
+        docs.push(d);
+        let (index, fields) = index_docs(&docs);
+
+        let hits = |q: &str| search(&index, &fields, &req(q)).unwrap().total;
+
+        assert_eq!(hits("https://github.com"), 1, "a URL must search as text");
+        assert_eq!(
+            hits("https://github.com"),
+            hits("\"https://github.com\""),
+            "quoting it must not change the answer"
+        );
+        assert_eq!(
+            hits("note: this"),
+            1,
+            "prose with a colon must search as text"
+        );
+    }
+
+    /// The other half of the same rule: a prefix that *does* name a field is still a lookup,
+    /// including a JSON subpath, which is the feature the whole schema is built around.
+    #[test]
+    fn a_colon_after_a_real_field_name_is_still_a_field_lookup() {
+        let (index, fields) = index_docs(&corpus());
+        let hits = |q: &str| search(&index, &fields, &req(q)).unwrap().total;
+
+        assert!(hits("tool_input.command:cargo") > 0, "JSON subpath lookup");
+        assert!(hits("text:tantivy") > 0, "plain field lookup");
+        assert_eq!(
+            hits("is_error:1"),
+            search(
+                &index,
+                &fields,
+                &SearchRequest {
+                    filters: Filters {
+                        errors_only: true,
+                        ..Filters::default()
+                    },
+                    ..SearchRequest::default()
+                }
+            )
+            .unwrap()
+            .total,
+            "the flag and the field query are the same filter"
+        );
     }
 
     /// The bug this guards: the facet total used to be the sum of the returned buckets, so a
@@ -1198,12 +1394,88 @@ mod tests {
         assert_eq!(r.total, 3);
     }
 
+    /// The whole point of the field: ask about what a tool *returned*, and get only that.
+    #[test]
+    fn tool_output_is_searchable_apart_from_the_call() {
+        let (index, f) = index_docs(&corpus());
+
+        // `tool_output:` reaches the result and nothing else.
+        let r = search(&index, &f, &req("tool_output:Compiling")).unwrap();
+        assert_eq!(r.total, 1, "{:?}", texts(&r));
+        assert_eq!(r.hits[0].doc.tool_name.as_deref(), Some("Bash"));
+
+        // ...and it does NOT reach the command line, which lives in `text`.
+        let r = search(&index, &f, &req("tool_output:release")).unwrap();
+        assert_eq!(r.total, 0, "the input is not the output: {:?}", texts(&r));
+
+        // The mirror: `text:` sees the call and not the result.
+        let r = search(&index, &f, &req("text:Compiling")).unwrap();
+        assert_eq!(r.total, 0, "{:?}", texts(&r));
+
+        // A bare query still spans both, exactly as it did when the result lived in `text`.
+        for query in ["Compiling", "release"] {
+            let r = search(&index, &f, &req(query)).unwrap();
+            assert!(r.total > 0, "bare query {query:?} lost its hits");
+        }
+    }
+
+    /// `--tool-output` is a phrase filter, so an operator inside it is text, not grammar.
+    #[test]
+    fn the_tool_output_filter_is_a_phrase_and_ands_with_the_rest() {
+        let (index, f) = index_docs(&corpus());
+
+        let mut r0 = SearchRequest::default();
+        r0.filters.tool_output = vec!["Finished dev profile".into()];
+        let r = search(&index, &f, &r0).unwrap();
+        assert_eq!(r.total, 1);
+        assert_eq!(r.hits[0].doc.tool_use_id.as_deref(), Some("toolu_1"));
+
+        // Adjacent-in-that-order, like any phrase.
+        r0.filters.tool_output = vec!["profile dev Finished".into()];
+        assert_eq!(search(&index, &f, &r0).unwrap().total, 0);
+
+        // Repeated, the filters AND rather than replace one another.
+        r0.filters.tool_output = vec!["Compiling".into(), "Finished".into()];
+        assert_eq!(search(&index, &f, &r0).unwrap().total, 1);
+        r0.filters.tool_output = vec!["Compiling".into(), "nonesuch".into()];
+        assert_eq!(search(&index, &f, &r0).unwrap().total, 0);
+
+        // And it composes with the other filters instead of overriding them.
+        r0.filters.tool_output = vec!["Compiling".into()];
+        r0.filters.tool = vec!["Read".into()];
+        assert_eq!(search(&index, &f, &r0).unwrap().total, 0);
+
+        // An empty value is an error, not a silent match-nothing.
+        let mut bad = SearchRequest::default();
+        bad.filters.tool_output = vec!["   ".into()];
+        assert!(search(&index, &f, &bad).is_err());
+    }
+
+    /// A `tool_result` whose `tool_use` never appeared has an empty `text`; the response must
+    /// still show what came back rather than a blank line.
+    #[test]
+    fn an_output_only_document_still_gets_a_snippet() {
+        let mut d = blank_doc(0);
+        d.kind = DocKind::ToolCall;
+        d.text = String::new();
+        d.tool_use_id = Some("toolu_orphan".into());
+        d.tool_output = Some("error: linker `cc` not found".into());
+        let (index, f) = index_docs(&[d]);
+
+        let r = search(&index, &f, &SearchRequest::default()).unwrap();
+        assert_eq!(r.hits[0].snippet, "error: linker `cc` not found");
+
+        let r = search(&index, &f, &req("linker")).unwrap();
+        assert_eq!(r.total, 1);
+        assert!(r.hits[0].snippet.contains("**linker**"), "{:?}", r.hits[0]);
+    }
+
     #[test]
     fn phrase_query_is_exact() {
         let (index, f) = index_docs(&corpus());
         let r = search(&index, &f, &req(r#""cargo build""#)).unwrap();
         assert_eq!(r.total, 1, "{:?}", texts(&r));
-        assert!(r.hits[0].doc.text.starts_with("cargo build"));
+        assert!(r.hits[0].doc.text.contains("cargo build --release"));
         // The words exist in two docs, but not adjacent in that order in the second.
         let r = search(&index, &f, &req(r#""build cargo""#)).unwrap();
         assert_eq!(r.total, 0);
@@ -1531,6 +1803,8 @@ mod tests {
         let r = search(&index, &f, &req("parsnips")).unwrap();
         assert_eq!(r.total, 0, "thinking is not searched unless opted in");
 
+        // "Compiling" occurs only in a tool *result*, so this also proves the `tool_output`
+        // snippet generator: without it the hit would be highlighted on its command line.
         let r = search(&index, &f, &req("Compiling")).unwrap();
         assert_eq!(r.hits.len(), 1);
         assert!(
@@ -1544,12 +1818,15 @@ mod tests {
         r0.filters.tool = vec!["Read".into()];
         let r = search(&index, &f, &r0).unwrap();
         assert_eq!(r.hits.len(), 1);
-        assert_eq!(r.hits[0].snippet, "pub fn open_or_create(index_dir: &Path)");
+        assert_eq!(
+            r.hits[0].snippet,
+            "Read /home/user/session-search/src/index.rs"
+        );
 
         // ...capped at `snippet_chars`.
         r0.snippet_chars = 20;
         let r = search(&index, &f, &r0).unwrap();
-        assert_eq!(r.hits[0].snippet, "pub fn open_or_creat…");
+        assert_eq!(r.hits[0].snippet, "Read /home/user/sess…");
     }
 
     #[test]
