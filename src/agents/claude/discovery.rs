@@ -20,7 +20,8 @@ use serde::Deserialize;
 use serde_json::Value;
 use walkdir::WalkDir;
 
-use crate::model::{Extra, flex_string, flex_u64};
+use super::model::{Extra, flex_string, flex_u64};
+use crate::agent::SessionFile;
 
 /// `agent-<id>.meta.json`, alongside a sidechain transcript.
 #[derive(Debug, Clone, Default, Deserialize, serde::Serialize)]
@@ -50,28 +51,6 @@ impl AgentMeta {
     }
 }
 
-#[derive(Debug, Clone)]
-pub struct TranscriptFile {
-    pub path: PathBuf,
-    /// From the filename / parent dir. Records may disagree; records win downstream.
-    pub session_id: String,
-    /// `Some(..)` for `subagents/**/agent-<id>.jsonl`.
-    pub agent_id: Option<String>,
-    pub meta: Option<AgentMeta>,
-    pub size: u64,
-    pub mtime_ms: i64,
-}
-
-impl TranscriptFile {
-    /// The `sessions.json` key: `"<session_id>"` or `"<session_id>:<agent_id>"`.
-    pub fn key(&self) -> String {
-        match &self.agent_id {
-            Some(a) => format!("{}:{}", self.session_id, a),
-            None => self.session_id.clone(),
-        }
-    }
-}
-
 /// `$CLAUDE_CONFIG_DIR` else `~/.claude`, plus `/projects`.
 pub fn default_root() -> anyhow::Result<PathBuf> {
     let base = match std::env::var_os("CLAUDE_CONFIG_DIR") {
@@ -87,9 +66,9 @@ pub fn default_root() -> anyhow::Result<PathBuf> {
 
 /// Enumerate every transcript under `roots`. Missing roots are skipped, not an error —
 /// the CLI prunes old transcripts and roots come and go.
-pub fn discover(roots: &[PathBuf]) -> anyhow::Result<Vec<TranscriptFile>> {
+pub fn discover(roots: &[PathBuf]) -> anyhow::Result<Vec<SessionFile>> {
     // Keyed by path so overlapping roots do not yield duplicates.
-    let mut found: BTreeMap<PathBuf, TranscriptFile> = BTreeMap::new();
+    let mut found: BTreeMap<PathBuf, SessionFile> = BTreeMap::new();
 
     for root in roots {
         if !root.is_dir() {
@@ -122,13 +101,16 @@ pub fn discover(roots: &[PathBuf]) -> anyhow::Result<Vec<TranscriptFile>> {
                 .as_ref()
                 .and_then(|_| AgentMeta::read(&path.with_extension("meta.json")));
 
+            let non_empty = |s: Option<String>| s.filter(|s| !s.is_empty());
             found.insert(
                 path.to_path_buf(),
-                TranscriptFile {
+                SessionFile {
+                    agent: super::ID,
                     path: path.to_path_buf(),
                     session_id: ids.session_id,
                     agent_id: ids.agent_id,
-                    meta,
+                    agent_type: non_empty(meta.as_ref().and_then(|m| m.agent_type.clone())),
+                    description: non_empty(meta.as_ref().and_then(|m| m.description.clone())),
                     size,
                     mtime_ms,
                 },
@@ -138,7 +120,7 @@ pub fn discover(roots: &[PathBuf]) -> anyhow::Result<Vec<TranscriptFile>> {
 
     // Main transcript before its subagents, so a consumer walking the list sees the parent
     // session first.
-    let mut files: Vec<TranscriptFile> = found.into_values().collect();
+    let mut files: Vec<SessionFile> = found.into_values().collect();
     files.sort_by(|a, b| {
         (&a.session_id, &a.agent_id, &a.path).cmp(&(&b.session_id, &b.agent_id, &b.path))
     });
@@ -274,17 +256,12 @@ mod tests {
         assert_eq!(names, vec!["sess-1", "sess-1:a1", "sess-1:a2"]);
 
         let a1 = files.iter().find(|f| f.key() == "sess-1:a1").unwrap();
-        assert_eq!(
-            a1.meta.as_ref().unwrap().agent_type.as_deref(),
-            Some("Explore")
-        );
-        assert_eq!(
-            a1.meta.as_ref().unwrap().description.as_deref(),
-            Some("look around")
-        );
+        assert_eq!(a1.agent_type.as_deref(), Some("Explore"));
+        assert_eq!(a1.description.as_deref(), Some("look around"));
         let a2 = files.iter().find(|f| f.key() == "sess-1:a2").unwrap();
-        assert!(a2.meta.is_none());
+        assert!(a2.agent_type.is_none() && a2.description.is_none());
         assert!(files.iter().all(|f| f.size > 0));
+        assert!(files.iter().all(|f| f.agent == "claude-code"));
     }
 
     #[test]

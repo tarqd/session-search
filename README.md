@@ -1,6 +1,9 @@
 # session-search
 
-**Full-text search and faceted analytics over your Claude Code session transcripts.**
+**Full-text search and faceted analytics over your coding-agent session transcripts.**
+
+Claude Code is the supported agent today. The on-disk format sits behind one trait so Codex, pi
+and others can follow; `docs/MULTI-AGENT.md` has the research and the plan.
 
 Every Claude Code session is written to disk as JSONL under `~/.claude/projects/` — every prompt
 you typed, every command the agent ran, every file it read, every tool argument, every error,
@@ -478,7 +481,9 @@ Accepted by `search`, `facets` and `sessions`:
       --role <ROLE>
       --kind <KIND>             `message` or `tool_call`
       --session <SESSION_ID>
-      --agent-type <TYPE>
+      --agent <AGENT>           Which agent wrote the transcript: `claude-code`, … (see
+                                `session-search index --help`)
+      --agent-type <TYPE>       Subagent type (`Explore`, `Plan`, …), for sidechain transcripts
       --since <WHEN>            RFC3339, `YYYY-MM-DD`, or a relative span such as `7d`
       --until <WHEN>
       --errors-only
@@ -512,7 +517,9 @@ Options:
       --full                Ignore the watermarks and rebuild every file from scratch
       --index <DIR>         Index directory. Defaults to `$XDG_DATA_HOME/session-search` [env:
                             SESSION_SEARCH_INDEX=]
-      --root <DIR>          Transcript root; repeatable. Defaults to `$CLAUDE_CONFIG_DIR/projects`
+      --root <[AGENT=]DIR>  Transcript root as `[AGENT=]DIR`; repeatable. A bare DIR is a
+                            `claude-code` root. Defaults to every registered agent's own
+                            location (`$CLAUDE_CONFIG_DIR/projects` for Claude Code)
   -v, --verbose...          Raise the log level on stderr; repeatable (`-v` info, `-vv` debug,
                             `-vvv` trace)
       --jobs <N>            Parser threads. Defaults to the rayon pool size
@@ -593,7 +600,7 @@ Arguments:
   <SESSION_ID>
 
 Options:
-      --agent <AGENT_ID>   Subagent id, for a sidechain transcript
+      --subagent <AGENT_ID>  Subagent id, for a sidechain transcript [alias: --agent]
       --index <DIR>        Index directory. Defaults to `$XDG_DATA_HOME/session-search` [env:
                            SESSION_SEARCH_INDEX=]
       --around <UUID|SEQ>  A doc uuid or a `seq` number; prints a window instead of the whole

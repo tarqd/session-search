@@ -14,11 +14,12 @@ use anyhow::{Context as _, Result, anyhow, bail};
 use clap::{Parser, Subcommand};
 use serde_json::Value;
 
+use crate::agent::Root;
+use crate::doc::SessionInfo;
 use crate::format::{self, OutputOpts};
 use crate::index::{self, IndexOptions, IndexStats};
-use crate::parse::SessionInfo;
 use crate::search::{self, Filters, SearchRequest};
-use crate::{context, discovery};
+use crate::{agent, context};
 
 /// Facet buckets returned alongside `search --facets`. `facets` has `--top` for the same knob;
 /// on `search` the facets are a side dish, so the depth is fixed.
@@ -32,7 +33,7 @@ const UUID_SCAN_LIMIT: usize = 50_000;
 #[command(
     name = "session-search",
     version,
-    about = "Search Claude Code session transcripts",
+    about = "Search coding-agent session transcripts (Claude Code today; more via `agents/`)",
     max_term_width = 100
 )]
 pub struct Cli {
@@ -56,9 +57,11 @@ pub enum Command {
         /// Ignore the watermarks and rebuild every file from scratch.
         #[arg(long)]
         full: bool,
-        /// Transcript root; repeatable. Defaults to `$CLAUDE_CONFIG_DIR/projects`.
-        #[arg(long = "root", value_name = "DIR")]
-        roots: Vec<PathBuf>,
+        /// Transcript root as `[AGENT=]DIR`; repeatable. A bare DIR is a `claude-code` root.
+        /// Defaults to every registered agent's own location (`$CLAUDE_CONFIG_DIR/projects`
+        /// for Claude Code).
+        #[arg(long = "root", value_name = "[AGENT=]DIR", value_parser = Root::parse)]
+        roots: Vec<Root>,
         /// Parser threads. Defaults to the rayon pool size.
         #[arg(long, value_name = "N")]
         jobs: Option<usize>,
@@ -99,8 +102,8 @@ pub enum Command {
     },
     /// Count values of a fast field or any `tool_input.<path>`.
     Facets {
-        /// `tool_name`, `project`, `model`, `git_branch`, `role`, `kind`, `agent_type`,
-        /// `entrypoint`, or a JSON path such as `tool_input.file_path`.
+        /// `tool_name`, `project`, `model`, `git_branch`, `role`, `kind`, `agent`,
+        /// `agent_type`, `entrypoint`, or a JSON path such as `tool_input.file_path`.
         field: String,
         /// Restrict the counted set to documents matching this query.
         #[arg(long, value_name = "QUERY")]
@@ -118,7 +121,7 @@ pub enum Command {
     Show {
         session_id: String,
         /// Subagent id, for a sidechain transcript.
-        #[arg(long, value_name = "AGENT_ID")]
+        #[arg(long = "subagent", visible_alias = "agent", value_name = "AGENT_ID")]
         agent: Option<String>,
         /// A doc uuid or a `seq` number; prints a window instead of the whole session.
         #[arg(long, value_name = "UUID|SEQ")]
@@ -417,9 +420,9 @@ fn refresh(index_dir: &Path, no_refresh: bool, include_thinking: bool) {
     }
 }
 
-fn resolve_roots(explicit: Vec<PathBuf>) -> Result<Vec<PathBuf>> {
+fn resolve_roots(explicit: Vec<Root>) -> Result<Vec<Root>> {
     if explicit.is_empty() {
-        Ok(vec![discovery::default_root()?])
+        agent::default_roots()
     } else {
         Ok(explicit)
     }
@@ -432,7 +435,7 @@ fn context_windows(
     fields: &crate::schema::Fields,
     response: &search::SearchResponse,
     window: usize,
-) -> Vec<Vec<crate::parse::Doc>> {
+) -> Vec<Vec<crate::doc::Doc>> {
     response
         .hits
         .iter()
@@ -569,6 +572,7 @@ struct SessionMatcher {
     project: Option<String>,
     branch: Option<String>,
     session: Option<String>,
+    agent: Option<String>,
     agent_type: Option<String>,
     since_ms: Option<i64>,
     until_ms: Option<i64>,
@@ -583,6 +587,7 @@ impl SessionMatcher {
             project: f.project.as_deref().map(expand_tilde),
             branch: f.branch.clone(),
             session: f.session.clone(),
+            agent: f.agent.clone(),
             agent_type: f.agent_type.clone(),
             since_ms: f
                 .since
@@ -620,6 +625,11 @@ impl SessionMatcher {
         // A session id is long enough that a prefix is a convenience, not an ambiguity.
         if let Some(session) = &self.session
             && !info.session_id.starts_with(session.as_str())
+        {
+            return false;
+        }
+        if let Some(agent) = &self.agent
+            && info.agent != *agent
         {
             return false;
         }
@@ -928,7 +938,10 @@ mod tests {
         assert!(!no_spilled_results);
         assert_eq!(
             roots,
-            [PathBuf::from("/a/projects"), PathBuf::from("/b/projects")]
+            [
+                Root::parse("/a/projects").unwrap(),
+                Root::parse("/b/projects").unwrap()
+            ]
         );
         assert_eq!(jobs, Some(4));
 
@@ -1302,8 +1315,9 @@ mod tests {
 
     #[test]
     fn roots_fall_back_to_the_default_only_when_none_are_given() {
-        let explicit = resolve_roots(vec![PathBuf::from("/a")]).unwrap();
-        assert_eq!(explicit, [PathBuf::from("/a")]);
+        let explicit = resolve_roots(vec![Root::parse("/a").unwrap()]).unwrap();
+        assert_eq!(explicit, [Root::parse("/a").unwrap()]);
+        assert_eq!(explicit[0].agent, "claude-code");
     }
 
     #[test]

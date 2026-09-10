@@ -11,7 +11,7 @@ use tantivy::schema::{
     TEXT, TextFieldIndexing,
 };
 
-use crate::parse::{Doc, DocKind};
+use crate::doc::{Doc, DocKind};
 
 /// One handle per schema field. Cheap to clone.
 #[derive(Debug, Clone, Copy)]
@@ -22,6 +22,7 @@ pub struct Fields {
     pub parent_uuid: tantivy::schema::Field,
     pub tool_use_id: tantivy::schema::Field,
 
+    pub agent: tantivy::schema::Field,
     pub session_id: tantivy::schema::Field,
     pub agent_id: tantivy::schema::Field,
     pub agent_type: tantivy::schema::Field,
@@ -73,7 +74,9 @@ pub fn build_schema() -> (Schema, Fields) {
     let parent_uuid = sb.add_text_field("parent_uuid", STRING | STORED);
     let tool_use_id = sb.add_text_field("tool_use_id", STRING | STORED);
 
-    // Filterable + facetable dimensions.
+    // Filterable + facetable dimensions. `agent` is which program wrote the transcript
+    // (`claude-code`, …); `agent_id`/`agent_type` describe a *subagent* within a session.
+    let agent = sb.add_text_field("agent", STRING | STORED | FAST);
     let session_id = sb.add_text_field("session_id", STRING | STORED | FAST);
     let agent_id = sb.add_text_field("agent_id", STRING | STORED | FAST);
     let agent_type = sb.add_text_field("agent_type", STRING | STORED | FAST);
@@ -113,6 +116,7 @@ pub fn build_schema() -> (Schema, Fields) {
         uuid,
         parent_uuid,
         tool_use_id,
+        agent,
         session_id,
         agent_id,
         agent_type,
@@ -184,6 +188,7 @@ pub fn doc_to_json(doc: &Doc, include_thinking: bool) -> Value {
     put_str(&mut o, "uuid", doc.uuid.as_deref());
     put_str(&mut o, "parent_uuid", doc.parent_uuid.as_deref());
     put_str(&mut o, "tool_use_id", doc.tool_use_id.as_deref());
+    put_str(&mut o, "agent", Some(&doc.agent));
     put_str(&mut o, "session_id", Some(&doc.session_id));
     put_str(&mut o, "agent_id", doc.agent_id.as_deref());
     put_str(&mut o, "agent_type", doc.agent_type.as_deref());
@@ -238,6 +243,7 @@ mod tests {
     fn sample() -> Doc {
         Doc {
             doc_id: "sess:-:7".into(),
+            agent: "claude-code".into(),
             kind: DocKind::ToolCall,
             source_path: "/tmp/sess.jsonl".into(),
             seq: 7,
@@ -383,8 +389,11 @@ mod tests {
 
         let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("tests/fixtures/assistant_split_blocks.jsonl");
-        let out =
-            crate::parse::parse_whole(&fixture, &crate::parse::ParseOptions::default()).unwrap();
+        let out = crate::agents::claude::parse::parse_whole(
+            &fixture,
+            &crate::doc::ParseOptions::default(),
+        )
+        .unwrap();
 
         let (schema, f) = build_schema();
         let index = Index::create_in_ram(schema.clone());

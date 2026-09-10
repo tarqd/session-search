@@ -23,8 +23,8 @@ use chrono::{DateTime, Utc};
 use owo_colors::Style;
 use serde_json::{Value, json};
 
+use crate::doc::{Doc, SessionInfo};
 use crate::index::IndexStats;
-use crate::parse::{Doc, SessionInfo};
 use crate::search::{FacetResult, Hit, SearchResponse};
 
 /// The marker `search.rs` wraps matched spans in. Identical on both sides, so splitting on it
@@ -182,6 +182,7 @@ fn hit_json(hit: &Hit, context: &[Doc]) -> Value {
 pub fn doc_json(d: &Doc) -> Value {
     json!({
         "doc_id": d.doc_id,
+        "agent": d.agent,
         "kind": d.kind.as_str(),
         "seq": d.seq,
         "session_id": d.session_id,
@@ -581,10 +582,20 @@ pub fn session_list(w: &mut impl Write, s: &[SessionInfo], o: &OutputOpts) -> Re
         return Ok(());
     }
 
+    // One agent's sessions need no label; a mixed list does.
+    let mixed = s
+        .iter()
+        .map(|i| i.agent.as_str())
+        .collect::<std::collections::BTreeSet<_>>()
+        .len()
+        > 1;
     for info in s {
         let mut line = ink.paint(&info.session_id, head());
         if let Some(slug) = info.slug.as_deref().filter(|s| !s.is_empty()) {
             line.push_str(&format!("  {slug}"));
+        }
+        if mixed && !info.agent.is_empty() {
+            line.push_str(&ink.paint(&format!("  [{}]", info.agent), dim()));
         }
         if let Some(agent) = info.agent_id.as_deref() {
             let label = match info.agent_type.as_deref() {
@@ -641,6 +652,7 @@ fn session_json(info: &SessionInfo) -> Value {
             None => info.session_id.clone(),
         },
         "session_id": info.session_id,
+        "agent": info.agent,
         "agent_id": info.agent_id,
         "agent_type": info.agent_type,
         "description": info.description,
@@ -972,7 +984,7 @@ mod tests {
             values,
         }
     }
-    use crate::parse::DocKind;
+    use crate::doc::DocKind;
 
     /// 2026-09-09T19:07:19Z — fixed so every rendering assertion is reproducible.
     const T0: i64 = 1_788_980_839_000;
@@ -980,6 +992,7 @@ mod tests {
     fn doc(seq: u64, role: &str, text: &str) -> Doc {
         Doc {
             doc_id: format!("b20208d8:-:{seq}"),
+            agent: "claude-code".into(),
             kind: DocKind::Message,
             source_path: "/home/u/.claude/projects/p/b20208d8.jsonl".into(),
             seq,
@@ -1118,6 +1131,7 @@ mod tests {
         // Every key an agent may depend on, present even when the value is null.
         for key in [
             "doc_id",
+            "agent",
             "kind",
             "seq",
             "session_id",
@@ -1217,6 +1231,7 @@ mod tests {
     fn session_and_stats_json_shapes() {
         let info = SessionInfo {
             session_id: "b20208d8".into(),
+            agent: "claude-code".into(),
             agent_id: Some("a10845c5ff9c7d4ec".into()),
             agent_type: Some("Explore".into()),
             description: Some("Characterize transcript format".into()),
@@ -1239,6 +1254,7 @@ mod tests {
         assert_eq!(s["messages"], 49);
         assert_eq!(s["first_ts"], "2026-09-09T19:07:19+00:00");
         assert_eq!(s["agent_type"], "Explore");
+        assert_eq!(s["agent"], "claude-code");
 
         let stats_json = render(|w| {
             stats(

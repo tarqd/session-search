@@ -4,13 +4,18 @@
 files and must code against the signatures here rather than inventing their own. If a
 signature genuinely needs to change, change it here in the same commit and say so.
 
-Read `docs/TRANSCRIPT-FORMAT.md` first — it is the input format spec.
+Read `docs/TRANSCRIPT-FORMAT.md` first — it is the input format spec for Claude Code, the
+first supported agent. `docs/MULTI-AGENT.md` is the research and plan for the others.
 
 ## Goal
 
-Index Claude Code session transcripts into a local Tantivy index; search them with full-text
-ranking plus facets over project/directory, tool, **tool parameters**, model, branch, date and
-errors. A CLI now; an `mcp` subcommand serving the same operations over stdio next.
+Index coding-agent session transcripts into a local Tantivy index; search them with full-text
+ranking plus facets over agent, project/directory, tool, **tool parameters**, model, branch,
+date and errors. A CLI now; an `mcp` subcommand serving the same operations over stdio next.
+
+Every agent's on-disk format lives behind one trait, `agent::Agent`. Everything past that seam
+— schema, indexer, search, context, rendering — speaks only `doc::Doc` and `doc::SessionInfo`
+and does not know which program wrote a transcript.
 
 ## Confirmed product decisions
 
@@ -81,9 +86,13 @@ intended: facets show whole commands/paths, search matches words inside them.
 ```
 src/
   lib.rs         re-exports; `pub mod` declarations only
-  model.rs       raw serde types for transcript records          [Foundation]
-  discovery.rs   locate roots, enumerate transcripts + sidechains [Foundation]
-  parse.rs       records -> Vec<Doc>                              [Foundation]
+  doc.rs         the normalized model: Doc, SessionInfo, ParseOutput, ParseCarry, PartialDoc
+  agent.rs       the seam: `Agent` trait, `SessionFile`, `Root`, the adapter registry
+  agents/
+    claude/      Claude Code adapter (the only one so far)
+      model.rs     raw serde types for transcript records
+      discovery.rs locate roots, enumerate transcripts + sidechains
+      parse.rs     records -> Vec<Doc>
   schema.rs      Tantivy schema + Fields handle                   [Foundation]
   index.rs       incremental indexer, watermarks, sessions.json   [Build A]
   search.rs      SearchRequest -> SearchResponse, facets          [Build B]
@@ -94,7 +103,7 @@ src/
 tests/
   fixtures/*.jsonl
 docs/
-  TRANSCRIPT-FORMAT.md   DESIGN.md
+  TRANSCRIPT-FORMAT.md   DESIGN.md   MULTI-AGENT.md
 ```
 
 ## Index directory
@@ -104,7 +113,7 @@ overridable with `--index` / `$SESSION_SEARCH_INDEX`.
 
 ```
 <index>/tantivy/        the Tantivy index
-<index>/state.json      { "files": { "<abs path>": {size, mtime_ms, byte_offset, docs, carry} }, "version": 1 }
+<index>/state.json      { "files": { "<abs path>": {agent, size, mtime_ms, byte_offset, docs, carry} }, "version": 2 }
 <index>/sessions.json   { "<abs transcript path>": SessionInfo }
 ```
 
@@ -118,16 +127,56 @@ files may share a `sessionId` (TRANSCRIPT-FORMAT §9); they are two transcripts 
 counts, project and opening prompt, and merging them loses all three. The display key
 `"<session_id>[:<agent_id>]"` is derived at render time.
 
-`carry` is `parse::ParseCarry` — see `parse.rs` below.
+`carry` is `doc::ParseCarry` — see `doc.rs` below. `agent` is the adapter that parsed the
+file; a file that changes adapters is a reset, and a `state.json` of version 1 (no `agent`)
+is reindexed rather than trusted.
 
 ## Core types (pinned)
 
-`model.rs` — tolerant; see the parser rules in the format doc. Every struct gets
+`agent.rs` — the seam:
+
+```rust
+pub trait Agent: Send + Sync {
+    /// Stable registry id, stored in `Doc::agent` and matched by `--agent`: `claude-code`, …
+    fn id(&self) -> &'static str;
+    /// Where transcripts live absent `--root`. Missing dirs are fine; an unknowable one is not.
+    fn default_roots(&self) -> anyhow::Result<Vec<PathBuf>>;
+    fn discover(&self, roots: &[PathBuf]) -> anyhow::Result<Vec<SessionFile>>;
+    /// Same contract `parse_file` always had (below), now per adapter. Every doc must carry
+    /// `agent == self.id()` and a dense per-file `seq`.
+    fn parse(&self, path: &Path, from_offset: u64, seq_base: u64, opts: &ParseOptions,
+             ctx: &FileContext) -> anyhow::Result<(ParseOutput, u64)>;
+    fn parse_whole(&self, path: &Path, opts: &ParseOptions) -> anyhow::Result<ParseOutput>; // default
+}
+pub struct SessionFile {
+    pub agent: &'static str,        // Agent::id of the adapter that found it
+    pub path: PathBuf,
+    pub session_id: String,         // from the filename / parent dir; records win downstream
+    pub agent_id: Option<String>,   // Some(..) for a subagent transcript
+    pub agent_type: Option<String>, // subagent type from a sidecar, if any
+    pub description: Option<String>,
+    pub size: u64, pub mtime_ms: i64,
+}
+pub struct Root { pub agent: &'static str, pub path: PathBuf }
+impl Root { pub fn parse(spec: &str) -> anyhow::Result<Root>; }   // "[AGENT=]DIR"; bare = claude-code
+pub fn all() -> &'static [&'static dyn Agent];
+pub fn by_id(id: &str) -> Option<&'static dyn Agent>;
+pub fn default_roots() -> anyhow::Result<Vec<Root>>;
+```
+
+Vocabulary: `agent` is *which program wrote the transcript*. `agent_id` / `agent_type` are
+Claude Code's names for a **subagent** within a session and keep that meaning everywhere.
+
+Parsing is byte-offset based on purpose: every supported format is one append-only JSONL file
+per session, and the watermark model is built on that. A non-file source (Cursor's SQLite) needs
+the watermark generalised to an opaque cursor first — see `docs/MULTI-AGENT.md`.
+
+`agents/claude/model.rs` — tolerant; see the parser rules in the format doc. Every struct gets
 `#[serde(default)]` fields plus `#[serde(flatten)] extra: serde_json::Map<String, Value>`, and
 every enum a `#[serde(other)] Unknown` variant. Nothing here may fail to deserialize on
 unknown input.
 
-`parse.rs`:
+`doc.rs` (shared by every adapter):
 
 ```rust
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -140,6 +189,7 @@ pub struct Doc {
                                  // `source_path`: `seq` restarts at 0 in every file and two
                                  // transcripts can share a `session_id`, so without it the
                                  // id is not unique.
+    pub agent: String,           // Agent::id of the adapter that produced it
     pub kind: DocKind,
     pub source_path: String,     // absolute; delete-by-term key for re-index
     pub seq: u64,                // monotonic doc ordinal within the file, in record order.
@@ -175,6 +225,7 @@ pub struct Doc {
 #[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 pub struct SessionInfo {
     pub session_id: String,
+    pub agent: String,               // Agent::id
     pub agent_id: Option<String>,
     pub agent_type: Option<String>,
     pub description: Option<String>, // subagent .meta.json description
@@ -227,6 +278,8 @@ pub struct ParseCarry {
                                          // then a late result only suppresses the duplicate.
     pub counted_message_ids: Vec<String>,
     pub tail_line: Option<TailLine>,     // { start: u64, hash: u64 }
+    pub agent_state: serde_json::Value,  // opaque to the indexer: whatever else THIS adapter
+                                         // needs across a boundary (pi's latest model_change)
 }
 
 /// Per-file inputs that are not the bytes of the file itself.
@@ -237,36 +290,41 @@ pub struct FileContext {
     pub carry: ParseCarry,
 }
 
+/// 8 hex digits of a digest of an absolute `source_path`; the `file_tag` in every `doc_id`.
+pub fn file_tag(source_path: &str) -> String;
+
+pub struct ParseOptions { pub max_text_bytes: usize, pub load_spilled_results: bool }
+
+/// The builder an adapter emits docs through: everything that comes from one content block,
+/// before the record-level metadata (ids, timestamps, cwd, branch) is folded in.
+pub struct PartialDoc { pub kind, pub role, pub text, pub thinking, pub model, pub tool_name,
+                        pub tool_use_id, pub tool_input, pub is_error, pub is_meta }
+impl PartialDoc {
+    pub fn message(role: &str, text: String) -> PartialDoc;
+    pub fn tool_call(name: Option<String>, id: Option<String>, input: Option<Value>,
+                     text: String, is_error: bool) -> PartialDoc;
+    pub fn role(self, &str) -> Self; pub fn model(self, Option<String>) -> Self;
+    pub fn thinking(self, Option<String>) -> Self; pub fn meta(self, bool) -> Self;
+    pub fn error(self, bool) -> Self;
+}
+```
+
+`agents/claude/parse.rs` and `agents/claude/discovery.rs` implement the Claude Code adapter
+against the contract above:
+
+```rust
 /// Parse a transcript. `from_offset` supports incremental tailing; `seq_base` continues
 /// numbering; `ctx` carries the per-file facts a tail parse cannot see for itself. Returns the
 /// byte offset of the end of the last COMPLETE line — a partial trailing line must be left
 /// unconsumed so the next run re-reads it.
 pub fn parse_file(path: &Path, from_offset: u64, seq_base: u64, opts: &ParseOptions,
                   ctx: &FileContext) -> anyhow::Result<(ParseOutput, u64)>;
-
 /// One-shot parse of a whole file with no carried state — the ground truth an incremental run
-/// must converge on, and what every caller that is not the indexer wants.
+/// must converge on.
 pub fn parse_whole(path: &Path, opts: &ParseOptions) -> anyhow::Result<ParseOutput>;
 
-/// 8 hex digits of a digest of an absolute `source_path`; the `file_tag` in every `doc_id`.
-pub fn file_tag(source_path: &str) -> String;
-
-pub struct ParseOptions { pub max_text_bytes: usize, pub load_spilled_results: bool }
-```
-
-`discovery.rs`:
-
-```rust
-pub struct TranscriptFile {
-    pub path: PathBuf,
-    pub session_id: String,        // from the filename / parent dir
-    pub agent_id: Option<String>,  // Some(..) for subagents/agent-<id>.jsonl
-    pub meta: Option<AgentMeta>,   // agent-<id>.meta.json
-    pub size: u64,
-    pub mtime_ms: i64,
-}
-pub fn default_root() -> anyhow::Result<PathBuf>;              // $CLAUDE_CONFIG_DIR else ~/.claude, + /projects
-pub fn discover(roots: &[PathBuf]) -> anyhow::Result<Vec<TranscriptFile>>;
+pub fn default_root() -> anyhow::Result<PathBuf>;   // $CLAUDE_CONFIG_DIR else ~/.claude, + /projects
+pub fn discover(roots: &[PathBuf]) -> anyhow::Result<Vec<SessionFile>>;
 ```
 
 `schema.rs`:
@@ -282,7 +340,7 @@ Field names and options:
 | field | type / options |
 | --- | --- |
 | `doc_id`, `source_path`, `uuid`, `parent_uuid`, `tool_use_id` | `STRING \| STORED` |
-| `session_id`, `agent_id`, `agent_type`, `project`, `git_branch`, `role`, `kind`, `model`, `tool_name`, `entrypoint`, `permission_mode`, `version`, `slug` | `STRING \| STORED \| FAST` |
+| `agent`, `session_id`, `agent_id`, `agent_type`, `project`, `git_branch`, `role`, `kind`, `model`, `tool_name`, `entrypoint`, `permission_mode`, `version`, `slug` | `STRING \| STORED \| FAST` |
 | `project_facet` | `FacetOptions` — hierarchical, `/home/user/session-search` |
 | `tool_input` | JSON, indexed + `set_fast(Some("raw"))` + `set_expand_dots_enabled()` + stored |
 | `text` | `TEXT \| STORED` |
@@ -310,13 +368,14 @@ pub struct IndexStats {
     pub parse_errors: u64, pub elapsed_ms: u128,
 }
 pub fn open_or_create(index_dir: &Path) -> anyhow::Result<(tantivy::Index, Fields)>;
-pub fn run(index_dir: &Path, roots: &[PathBuf], opts: &IndexOptions) -> anyhow::Result<IndexStats>;
+/// Each root is walked and parsed by the adapter it is paired with.
+pub fn run(index_dir: &Path, roots: &[Root], opts: &IndexOptions) -> anyhow::Result<IndexStats>;
 pub fn load_sessions(index_dir: &Path) -> anyhow::Result<BTreeMap<String, SessionInfo>>;
 ```
 
 Incremental rules:
-- Watermark per file: `{size, mtime_ms, byte_offset, docs, carry}`.
-- Unchanged `size` **and** `mtime_ms` → skip entirely.
+- Watermark per file: `{agent, size, mtime_ms, byte_offset, docs, carry}`.
+- Unchanged `size` **and** `mtime_ms` → skip entirely. A different `agent` → reset.
 - Grew → seek to `byte_offset`, parse the tail only, `seq_base` = recorded `docs`, and hand the
   parser the recorded `carry` so the tail converges on what a whole-file parse would produce.
 - Shrank, or mtime went backwards, or `--full` → `delete_term(source_path)` and reparse whole.
@@ -341,7 +400,8 @@ Incremental rules:
 pub struct Filters {
     pub project: Option<String>, pub tool: Vec<String>, pub tool_input: Vec<String>, // "key=value"
     pub branch: Option<String>, pub model: Option<String>, pub role: Option<String>,
-    pub kind: Option<String>, pub session: Option<String>, pub agent_type: Option<String>,
+    pub kind: Option<String>, pub session: Option<String>,
+    pub agent: Option<String>, pub agent_type: Option<String>,
     pub since: Option<String>, pub until: Option<String>,   // RFC3339 or YYYY-MM-DD or "7d"
     pub errors_only: bool, pub no_sidechains: bool, pub sidechains_only: bool,
 }
@@ -427,25 +487,28 @@ pub fn stats(w: &mut impl Write, s: &IndexStats, o: &OutputOpts) -> anyhow::Resu
 ## CLI surface
 
 ```
-session-search index [--full] [--root DIR]... [--index DIR] [--jobs N] [--include-thinking]
-                     [--no-spilled-results]
+session-search index [--full] [--root [AGENT=]DIR]... [--index DIR] [--jobs N]
+                     [--include-thinking] [--no-spilled-results]
 session-search search <QUERY> [FILTERS] [--facets f1,f2] [--context N]
                               [--limit N] [--offset N] [--json] [--no-refresh]
                               [--include-thinking]
 session-search facets <FIELD> [--query Q] [FILTERS] [--top N] [--json] [--no-refresh]
-session-search show <SESSION_ID> [--agent AGENT_ID] [--around UUID|SEQ]
+session-search show <SESSION_ID> [--subagent AGENT_ID] [--around UUID|SEQ]
                                  [--before N] [--after N] [--limit N] [--json] [--no-refresh]
 session-search sessions [FILTERS] [--limit N] [--json] [--no-refresh]
 session-search stats [--json]
 
 FILTERS: -p/--project P  -t/--tool T  --tool-input k=v  --branch B  --model M
-         --role R  --kind message|tool_call  --session S  --agent-type A
+         --role R  --kind message|tool_call  --session S  --agent A  --agent-type T
          --since D  --until D  --errors-only  --no-sidechains  --sidechains-only
 ```
 
 Global: `--index DIR` (`$SESSION_SEARCH_INDEX`), `-v/--verbose`, `--no-color` (`$NO_COLOR`).
 
-**`FIELD` for `facets`** is any fast field name (`tool_name`, `project`, `model`,
+`--root` takes `[AGENT=]DIR`; a bare `DIR` is a `claude-code` root. `show --agent` remains an
+alias of `--subagent`.
+
+**`FIELD` for `facets`** is any fast field name (`agent`, `tool_name`, `project`, `model`,
 `git_branch`, `role`, `kind`, `agent_type`, `entrypoint`) **or any JSON path** such as
 `tool_input.file_path`, `tool_input.command`, `tool_input.pattern`.
 

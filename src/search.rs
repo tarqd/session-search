@@ -32,7 +32,7 @@ use tantivy::schema::{Field, IndexRecordOption, OwnedValue, Schema, Term, Value 
 use tantivy::snippet::{Snippet, SnippetGenerator, collapse_overlapped_ranges};
 use tantivy::{DateTime, Searcher, TantivyDocument};
 
-use crate::parse::{Doc, DocKind};
+use crate::doc::{Doc, DocKind};
 use crate::schema::Fields;
 
 /// Wraps the matched span inside a snippet. Plain text on purpose: the snippet travels through
@@ -63,6 +63,10 @@ pub struct Filters {
     pub kind: Option<String>,
     #[arg(long, value_name = "SESSION_ID")]
     pub session: Option<String>,
+    /// Which agent wrote the transcript: `claude-code`, … (see `session-search index --help`).
+    #[arg(long, value_name = "AGENT")]
+    pub agent: Option<String>,
+    /// Subagent type (`Explore`, `Plan`, …), for sidechain transcripts.
     #[arg(long = "agent-type", value_name = "TYPE")]
     pub agent_type: Option<String>,
     /// RFC3339, `YYYY-MM-DD`, or a relative span such as `7d`.
@@ -366,6 +370,7 @@ fn build_query(
         (f.role, flt.role.as_deref()),
         (f.kind, flt.kind.as_deref()),
         (f.agent_type, flt.agent_type.as_deref()),
+        (f.agent, flt.agent.as_deref()),
     ] {
         if let Some(value) = non_empty(value) {
             clauses.push((Occur::Must, term_query(field, value)));
@@ -786,6 +791,7 @@ pub fn doc_from_stored(f: &Fields, stored: &TantivyDocument) -> Doc {
 
     Doc {
         doc_id: s(f.doc_id).unwrap_or_default(),
+        agent: s(f.agent).unwrap_or_default(),
         kind,
         source_path: s(f.source_path).unwrap_or_default(),
         seq: u(f.seq).unwrap_or(0),
@@ -892,6 +898,7 @@ pub(crate) mod testkit {
     pub fn blank_doc(seq: u64) -> Doc {
         Doc {
             doc_id: format!("s1:-:{seq}"),
+            agent: "claude-code".into(),
             kind: DocKind::Message,
             source_path: "/tmp/s1.jsonl".into(),
             seq,
@@ -1294,6 +1301,30 @@ mod tests {
         let mut r2 = SearchRequest::default();
         r2.filters.agent_type = Some("Explore".into());
         assert_eq!(search(&index, &f, &r2).unwrap().total, 1);
+    }
+
+    /// `agent` is the vendor dimension: filterable as a term and countable as a facet with
+    /// no search-side code beyond the field itself.
+    #[test]
+    fn the_agent_field_filters_and_facets() {
+        let (index, f) = index_docs(&corpus());
+        let all = corpus().len() as u64;
+
+        let mut r = SearchRequest {
+            facets: vec!["agent".into()],
+            ..SearchRequest::default()
+        };
+        r.filters.agent = Some("claude-code".into());
+        let found = search(&index, &f, &r).unwrap();
+        assert_eq!(found.total as u64, all);
+        assert!(found.hits.iter().all(|h| h.doc.agent == "claude-code"));
+        let agents = &found.facets["agent"];
+        assert_eq!(agents.values.len(), 1);
+        assert_eq!(agents.values[0].value, "claude-code");
+        assert_eq!(agents.values[0].count, all);
+
+        r.filters.agent = Some("codex".into());
+        assert_eq!(search(&index, &f, &r).unwrap().total, 0);
     }
 
     #[test]
@@ -1737,8 +1768,11 @@ mod tests {
     fn end_to_end_over_a_real_transcript_slice() {
         let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("tests/fixtures/real_main_slice.jsonl");
-        let out =
-            crate::parse::parse_whole(&fixture, &crate::parse::ParseOptions::default()).unwrap();
+        let out = crate::agents::claude::parse::parse_whole(
+            &fixture,
+            &crate::doc::ParseOptions::default(),
+        )
+        .unwrap();
         assert!(out.docs.len() > 5, "fixture should yield real docs");
         let (index, f) = index_docs(&out.docs);
 
