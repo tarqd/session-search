@@ -13,6 +13,16 @@
 //!
 //! A `tool_use` block and the `tool_result` that answers it are joined by `tool_use_id` into a
 //! single [`DocKind::ToolCall`] document carrying name, input, result text and error flag.
+//!
+//! A document's body is **split by kind**, because prose and code want opposite analysis
+//! (`schema.rs`, `tokenizer.rs`):
+//!
+//! * a `user` or `assistant` message is markdown, so [`crate::markdown::split`] routes its
+//!   prose to `text`, its blocks and spans to `code` and its headings to `headings`;
+//! * a tool call is not markdown and is never parsed as such — a `Bash` script full of `#`
+//!   and `*` is not a heading and a bullet list. Its name and input strings are `text`; its
+//!   *output*, and the file content of an `Edit`/`Write`, are `code`;
+//! * attachments and `system` records stay whole in `text`.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs::File;
@@ -72,8 +82,20 @@ pub struct Doc {
     pub permission_mode: Option<String>,
     pub version: Option<String>,
     pub slug: Option<String>,
-    /// The indexed body.
+    /// The indexed body, prose only: for a message the markdown minus its code blocks, for a
+    /// tool call the tool name and its input strings. Analyzed as English.
     pub text: String,
+    /// The code half of the body, one entry per code block or inline span of a message, and the
+    /// tool *output* of a tool call. Analyzed as code. `#[serde(default)]` on this and the two
+    /// below so a `state.json` carried over from a build without them still loads.
+    #[serde(default)]
+    pub code: Vec<String>,
+    /// A message's markdown headings, one entry each. Also present in `text`.
+    #[serde(default)]
+    pub headings: Vec<String>,
+    /// The info-string language of each fenced block, deduped.
+    #[serde(default)]
+    pub code_langs: Vec<String>,
     /// Stored; indexed only with `include_thinking`.
     pub thinking: Option<String>,
     /// The original JSONL line.
@@ -748,8 +770,9 @@ impl<'a> Parser<'a> {
     }
 
     /// Complete the documents a previous run left waiting for a result. The replacement keeps
-    /// the original `doc_id` and `seq` and appends the result exactly as `tool_call_doc` would
-    /// have, so the outcome is byte-identical to what a whole-file parse produces.
+    /// the original `doc_id` and `seq` and adds the result exactly as `tool_call_doc` would
+    /// have — as the last `code` entry, against the same shared budget — so the outcome is
+    /// byte-identical to what a whole-file parse produces.
     fn build_replacements(&self) -> Vec<Doc> {
         let mut out = Vec::new();
         for pending in self.carried_pending.values() {
@@ -760,8 +783,9 @@ impl<'a> Parser<'a> {
                 continue;
             };
             let mut doc = doc.clone();
-            let remaining = self.opts.max_text_bytes.saturating_sub(doc.text.len());
-            doc.text.push_str(&truncate(&outcome.text, remaining));
+            let used = doc.text.len() + doc.code.iter().map(String::len).sum::<usize>();
+            let remaining = self.opts.max_text_bytes.saturating_sub(used);
+            doc.code.extend(entry(&outcome.text, remaining));
             doc.is_error = outcome.is_error;
             out.push(doc);
         }
@@ -901,10 +925,7 @@ impl<'a> Parser<'a> {
                 if !is_meta {
                     self.session.messages += 1;
                 }
-                out.push(
-                    PartialDoc::message("user", truncate(s, self.opts.max_text_bytes))
-                        .meta(is_meta),
-                );
+                out.push(PartialDoc::markdown("user", s, self.opts.max_text_bytes).meta(is_meta));
             }
             MessageContent::Blocks(blocks) => {
                 let mut texts: Vec<String> = Vec::new();
@@ -931,12 +952,17 @@ impl<'a> Parser<'a> {
                             }
                             let outcome = self.outcomes.get(&id).cloned().unwrap_or_default();
                             self.session.tool_calls += 1;
+                            // An orphan carries no name and no input, so it is all output —
+                            // and output is `code`, exactly as it is on a joined tool call.
                             out.push(
                                 PartialDoc::tool_call(
                                     None,
                                     Some(id),
                                     None,
-                                    truncate(&outcome.text, self.opts.max_text_bytes),
+                                    String::new(),
+                                    entry(&outcome.text, self.opts.max_text_bytes)
+                                        .into_iter()
+                                        .collect(),
                                     outcome.is_error,
                                 )
                                 .role("user")
@@ -953,7 +979,7 @@ impl<'a> Parser<'a> {
                         self.session.messages += 1;
                     }
                     out.push(
-                        PartialDoc::message("user", truncate(&joined, self.opts.max_text_bytes))
+                        PartialDoc::markdown("user", &joined, self.opts.max_text_bytes)
                             .meta(is_meta),
                     );
                 }
@@ -1010,7 +1036,7 @@ impl<'a> Parser<'a> {
                         counted = true;
                     }
                     out.push(
-                        PartialDoc::message("assistant", truncate(s, self.opts.max_text_bytes))
+                        PartialDoc::markdown("assistant", s, self.opts.max_text_bytes)
                             .model(model.clone())
                             .error(a.is_api_error_message),
                     );
@@ -1041,6 +1067,17 @@ impl<'a> Parser<'a> {
         }
     }
 
+    /// A tool call, with its two halves in the two fields that suit them.
+    ///
+    /// `text` keeps what it always kept minus the output: the tool name and the input's own
+    /// strings, so `Bash cargo build` matches on `text` as well as through
+    /// `tool_input.command`. The **output** moves to `code`, and so do the `Edit`/`Write`
+    /// payloads (`old_string`, `new_string`, `content`) — those are file contents, and the
+    /// prose analyzer would stem every identifier in them.
+    ///
+    /// The byte budget is unchanged and still shared: the input strings get a quarter of it as
+    /// before, and whatever is left is spent on the file contents and then the output, so one
+    /// document still indexes at most `max_text_bytes` of body however it is divided.
     fn tool_call_doc(&self, tu: &ToolUseBlock) -> PartialDoc {
         let outcome = tu
             .id
@@ -1049,26 +1086,29 @@ impl<'a> Parser<'a> {
             .cloned()
             .unwrap_or_default();
 
-        // Index the input's own strings alongside the result, so `Bash cargo build` matches
-        // on `text` as well as through `tool_input.command`.
-        let input_budget = self.opts.max_text_bytes / 4;
+        let cap = self.opts.max_text_bytes;
+        let input_budget = cap / 4;
         let mut body = String::new();
+        let mut code: Vec<String> = Vec::new();
         if let Some(name) = &tu.name {
             body.push_str(name);
             body.push('\n');
         }
         if let Some(input) = &tu.input {
-            body.push_str(&truncate(&string_leaves(input).join("\n"), input_budget));
+            let (words, contents) = input_leaves(input);
+            body.push_str(&truncate(&words.join("\n"), input_budget));
             body.push('\n');
+            code.extend(entry(&contents.join("\n"), cap.saturating_sub(body.len())));
         }
-        let remaining = self.opts.max_text_bytes.saturating_sub(body.len());
-        body.push_str(&truncate(&outcome.text, remaining));
+        let used = body.len() + code.iter().map(String::len).sum::<usize>();
+        code.extend(entry(&outcome.text, cap.saturating_sub(used)));
 
         PartialDoc::tool_call(
             tu.name.clone(),
             tu.id.clone(),
             tu.input.clone(),
             body,
+            code,
             outcome.is_error,
         )
     }
@@ -1188,6 +1228,9 @@ impl<'a> Parser<'a> {
                 .and_then(|c| c.slug.clone())
                 .or_else(|| self.session.slug.clone()),
             text: p.text,
+            code: p.code,
+            headings: p.headings,
+            code_langs: p.code_langs,
             thinking: p.thinking,
             raw: raw.to_string(),
         }
@@ -1200,6 +1243,9 @@ struct PartialDoc {
     kind: DocKind,
     role: String,
     text: String,
+    code: Vec<String>,
+    headings: Vec<String>,
+    code_langs: Vec<String>,
     thinking: Option<String>,
     model: Option<String>,
     tool_name: Option<String>,
@@ -1210,11 +1256,41 @@ struct PartialDoc {
 }
 
 impl PartialDoc {
+    /// A message body indexed verbatim: no markdown split. For the record types whose text is
+    /// not markdown — a JSON dump, an attachment, a `system` notice.
     fn message(role: &str, text: String) -> PartialDoc {
         PartialDoc {
             kind: DocKind::Message,
             role: role.to_string(),
             text,
+            code: Vec::new(),
+            headings: Vec::new(),
+            code_langs: Vec::new(),
+            thinking: None,
+            model: None,
+            tool_name: None,
+            tool_use_id: None,
+            tool_input: None,
+            is_error: false,
+            is_meta: false,
+        }
+    }
+
+    /// A markdown message: prose to `text`, blocks and spans to `code`, headings to both.
+    ///
+    /// The body is capped **before** the split rather than after, so the same 32KB of a giant
+    /// message is considered as was considered before the split existed — the pieces divide
+    /// that budget instead of each getting one. Truncating markdown can cut a fence in half;
+    /// `markdown::split` treats an unclosed fence as a closed one.
+    fn markdown(role: &str, body: &str, cap: usize) -> PartialDoc {
+        let parts = crate::markdown::split(&truncate(body, cap));
+        PartialDoc {
+            kind: DocKind::Message,
+            role: role.to_string(),
+            text: parts.text,
+            code: parts.code,
+            headings: parts.headings,
+            code_langs: parts.code_langs,
             thinking: None,
             model: None,
             tool_name: None,
@@ -1230,12 +1306,16 @@ impl PartialDoc {
         tool_use_id: Option<String>,
         tool_input: Option<Value>,
         text: String,
+        code: Vec<String>,
         is_error: bool,
     ) -> PartialDoc {
         PartialDoc {
             kind: DocKind::ToolCall,
             role: "assistant".to_string(),
             text,
+            code,
+            headings: Vec::new(),
+            code_langs: Vec::new(),
             thinking: None,
             model: None,
             tool_name,
@@ -1386,10 +1466,56 @@ fn collect_strings(v: &Value, depth: usize, out: &mut Vec<String>) {
     }
 }
 
-fn string_leaves(v: &Value) -> Vec<String> {
-    let mut out = Vec::new();
-    collect_strings(v, 0, &mut out);
-    out
+/// Tool-input keys whose value is a chunk of a file rather than a parameter someone typed.
+const FILE_CONTENT_KEYS: &[&str] = &["old_string", "new_string", "content"];
+
+/// String leaves of a tool input, split into the ones that name what the call *does* and the
+/// ones that are file content.
+///
+/// The check is by key at any depth, so a `MultiEdit` — whose `edits` is an array of objects
+/// each holding `old_string` and `new_string` — is split the same way a single `Edit` is, and
+/// once a key marks a subtree as content everything under it is content.
+fn input_leaves(v: &Value) -> (Vec<String>, Vec<String>) {
+    fn walk(
+        v: &Value,
+        depth: usize,
+        is_content: bool,
+        words: &mut Vec<String>,
+        code: &mut Vec<String>,
+    ) {
+        if depth > 4 || words.len() + code.len() > 256 {
+            return;
+        }
+        match v {
+            Value::String(s) if !s.is_empty() => {
+                if is_content {
+                    code.push(s.clone());
+                } else {
+                    words.push(s.clone());
+                }
+            }
+            Value::Array(items) => items
+                .iter()
+                .for_each(|i| walk(i, depth + 1, is_content, words, code)),
+            Value::Object(map) => map.iter().for_each(|(key, i)| {
+                let content = is_content || FILE_CONTENT_KEYS.contains(&key.as_str());
+                walk(i, depth + 1, content, words, code)
+            }),
+            _ => {}
+        }
+    }
+    let (mut words, mut code) = (Vec::new(), Vec::new());
+    walk(v, 0, false, &mut words, &mut code);
+    (words, code)
+}
+
+/// `text` truncated to `max` bytes as a one-element vector, or nothing when it is blank.
+///
+/// The multi-valued fields hold real content or no value at all: a blank entry would cost a
+/// stored string and a position gap for nothing.
+fn entry(text: &str, max: usize) -> Option<String> {
+    let kept = truncate(text, max);
+    (!kept.trim().is_empty()).then_some(kept)
 }
 
 /// `toolUseResult` is a bare string on every failure path.
@@ -1469,6 +1595,12 @@ mod tests {
 
     fn texts(out: &ParseOutput) -> Vec<&str> {
         out.docs.iter().map(|d| d.text.as_str()).collect()
+    }
+
+    /// The `code` half of a document as one string. Tool output and file contents live there
+    /// now, so most "is the result indexed?" assertions ask this rather than `text`.
+    fn code_of(d: &Doc) -> String {
+        d.code.join("\n")
     }
 
     // -- file-level hazards -------------------------------------------------
@@ -1633,10 +1765,18 @@ mod tests {
         assert_eq!(bash.kind, DocKind::ToolCall);
         assert_eq!(bash.tool_name.as_deref(), Some("Bash"));
         assert_eq!(bash.tool_input.as_ref().unwrap()["command"], "cargo build");
-        assert!(bash.text.contains("cargo build"), "input is indexed");
         assert!(
-            bash.text.contains("Compiling session-search"),
-            "result is indexed"
+            bash.text.contains("cargo build"),
+            "input is indexed as text"
+        );
+        assert!(
+            code_of(bash).contains("Compiling session-search"),
+            "the result is indexed as code, not as prose: {:?}",
+            bash.code
+        );
+        assert!(
+            !bash.text.contains("Compiling session-search"),
+            "...and only as code"
         );
         assert!(!bash.is_error);
 
@@ -1646,11 +1786,146 @@ mod tests {
             .find(|d| d.tool_use_id.as_deref() == Some("toolu_2"))
             .unwrap();
         assert!(read.is_error);
-        assert!(read.text.contains("Error: file not found"));
+        assert!(code_of(&read.clone()).contains("Error: file not found"));
         assert_eq!(
             read.tool_input.as_ref().unwrap()["file_path"],
             "/home/user/session-search/src/index.rs"
         );
+    }
+
+    // -- the markdown split -------------------------------------------------
+
+    /// A message is markdown, and its two halves go to the two fields that suit them.
+    #[test]
+    fn a_markdown_message_is_split_into_prose_code_and_headings() {
+        let dir = tempfile::tempdir().unwrap();
+        let body = "## The fix\n\nThe indexer had already compiled it, so `open_or_create`                     reused the schema:\n\n```rust\npub fn open_or_create(dir: &Path) {}\n```";
+        let line = serde_json::json!({
+            "type": "assistant", "uuid": "a1", "sessionId": "s", "cwd": "/p",
+            "message": {"role": "assistant", "id": "m1", "model": "mm",
+                        "content": [{"type": "text", "text": body}]},
+        });
+        let out = parse_body(dir.path(), "md.jsonl", &format!("{line}\n"));
+        let doc = &out.docs[0];
+
+        assert_eq!(doc.headings, ["The fix"]);
+        assert_eq!(doc.code_langs, ["rust"]);
+        // The fence is one entry, the inline span another; both stay out of the prose.
+        assert_eq!(doc.code.len(), 2, "{:?}", doc.code);
+        assert!(doc.code.iter().any(|c| c.contains("pub fn open_or_create")));
+        assert!(doc.code.contains(&"open_or_create".to_string()));
+        assert!(!doc.text.contains("pub fn"), "{:?}", doc.text);
+        // The prose keeps the sentence — including the heading, which `show` prints.
+        assert!(doc.text.starts_with("The fix"), "{:?}", doc.text);
+        assert!(
+            doc.text.contains("had already compiled it"),
+            "{:?}",
+            doc.text
+        );
+        assert!(doc.raw.contains("```rust"), "the raw line is untouched");
+    }
+
+    /// The same for a user turn, and a turn with no markdown in it at all is unchanged.
+    #[test]
+    fn a_user_turn_is_split_too_and_plain_prose_survives_intact() {
+        let dir = tempfile::tempdir().unwrap();
+        let line = |text: &str| {
+            serde_json::json!({
+                "type": "user", "uuid": "u1", "sessionId": "s", "cwd": "/p",
+                "message": {"role": "user", "content": text},
+            })
+            .to_string()
+        };
+        let out = parse_body(
+            dir.path(),
+            "u.jsonl",
+            &format!("{}\n", line("run this:\n\n```bash\ncargo test\n```")),
+        );
+        assert_eq!(out.docs[0].text, "run this:");
+        assert_eq!(out.docs[0].code, ["cargo test"]);
+        assert_eq!(out.docs[0].code_langs, ["bash"]);
+
+        let plain = "please make the tantivy schema faster";
+        let out = parse_body(dir.path(), "p.jsonl", &format!("{}\n", line(plain)));
+        assert_eq!(out.docs[0].text, plain);
+        assert!(out.docs[0].code.is_empty());
+    }
+
+    /// A tool call is not markdown and must never be parsed as one: a `Bash` script is full of
+    /// `#`, `*` and `>` that mean nothing of the sort.
+    #[test]
+    fn a_tool_call_is_not_parsed_as_markdown_and_its_output_is_code() {
+        let dir = tempfile::tempdir().unwrap();
+        let script = "# rebuild\n*.rs > /tmp/list";
+        let body = format!(
+            "{}\n{}\n",
+            serde_json::json!({
+                "type": "assistant", "uuid": "a1", "sessionId": "s", "cwd": "/p",
+                "message": {"role": "assistant", "id": "m1", "model": "mm", "content": [
+                    {"type": "tool_use", "id": "t1", "name": "Bash",
+                     "input": {"command": script, "description": "rebuild the list"}}]},
+            }),
+            serde_json::json!({
+                "type": "user", "uuid": "u1", "sessionId": "s", "cwd": "/p",
+                "message": {"role": "user", "content": [
+                    {"type": "tool_result", "tool_use_id": "t1", "content": "# 3 files"}]},
+            }),
+        );
+        let out = parse_body(dir.path(), "bash.jsonl", &body);
+        let call = out
+            .docs
+            .iter()
+            .find(|d| d.tool_use_id.as_deref() == Some("t1"))
+            .unwrap();
+
+        assert!(call.headings.is_empty(), "`# rebuild` is not a heading");
+        assert!(call.code_langs.is_empty());
+        // The name and the input strings are the text, verbatim, exactly as before.
+        assert!(call.text.starts_with("Bash\n"), "{:?}", call.text);
+        assert!(call.text.contains("# rebuild"), "{:?}", call.text);
+        assert!(call.text.contains("*.rs > /tmp/list"), "{:?}", call.text);
+        // The output is the code, and only the code.
+        assert_eq!(call.code, ["# 3 files"]);
+    }
+
+    /// An `Edit` payload is file content, not a parameter someone typed, so it is code.
+    #[test]
+    fn edit_and_write_payloads_are_code_and_the_rest_of_the_input_is_text() {
+        let dir = tempfile::tempdir().unwrap();
+        let body = format!(
+            "{}\n",
+            serde_json::json!({
+                "type": "assistant", "uuid": "a1", "sessionId": "s", "cwd": "/p",
+                "message": {"role": "assistant", "id": "m1", "model": "mm", "content": [
+                    {"type": "tool_use", "id": "t1", "name": "Edit", "input": {
+                        "file_path": "/home/user/session-search/src/index.rs",
+                        "old_string": "fn openOrCreate(dir: &Path)",
+                        "new_string": "fn open_or_create(dir: &Path)"}},
+                    {"type": "tool_use", "id": "t2", "name": "MultiEdit", "input": {
+                        "file_path": "/tmp/a.rs",
+                        "edits": [{"old_string": "let mut x", "new_string": "let x"}]}}]},
+            }),
+        );
+        let out = parse_body(dir.path(), "edit.jsonl", &body);
+        let call = |id: &str| {
+            out.docs
+                .iter()
+                .find(|d| d.tool_use_id.as_deref() == Some(id))
+                .unwrap()
+        };
+
+        let edit = call("t1");
+        assert!(edit.text.contains("/home/user/session-search/src/index.rs"));
+        assert!(!edit.text.contains("openOrCreate"), "{:?}", edit.text);
+        // Leaf order follows the JSON object's key order, which `serde_json` sorts.
+        assert_eq!(
+            edit.code,
+            ["fn open_or_create(dir: &Path)\nfn openOrCreate(dir: &Path)"]
+        );
+        // A `MultiEdit` nests its payloads one level deeper; the key still decides.
+        let multi = call("t2");
+        assert!(multi.text.contains("/tmp/a.rs"));
+        assert_eq!(multi.code, ["let x\nlet mut x"]);
     }
 
     #[test]
@@ -1678,7 +1953,7 @@ mod tests {
             ls.is_error,
             "a bare-string toolUseResult starting `Error:` is a failure"
         );
-        assert!(ls.text.contains("total 24"));
+        assert!(code_of(ls).contains("total 24"));
     }
 
     #[test]
@@ -1689,7 +1964,7 @@ mod tests {
             .iter()
             .find(|d| d.tool_use_id.as_deref() == Some("toolu_b"))
             .unwrap();
-        assert!(agent.text.contains("agent said hello"));
+        assert!(code_of(agent).contains("agent said hello"));
         assert!(!agent.is_error);
     }
 
@@ -1773,7 +2048,7 @@ mod tests {
         };
         let out = parse_whole(&transcript, &off).unwrap();
         assert!(
-            !out.docs.iter().any(|d| d.text.contains("quokkatron")),
+            !out.docs.iter().any(|d| code_of(d).contains("quokkatron")),
             "the spill must stay out unless asked for"
         );
 
@@ -1783,18 +2058,27 @@ mod tests {
         };
         let out = parse_whole(&transcript, &on).unwrap();
         assert!(
-            out.docs.iter().any(|d| d.text.contains("quokkatron")),
+            out.docs.iter().any(|d| code_of(d).contains("quokkatron")),
             "spill not folded in: {:?}",
-            out.docs.iter().map(|d| &d.text).collect::<Vec<_>>()
+            out.docs.iter().map(|d| &d.code).collect::<Vec<_>>()
         );
 
-        // And it obeys the same body cap as anything else.
+        // And it obeys the same body cap as anything else — a cap the two halves now share.
         let capped = ParseOptions {
             load_spilled_results: true,
             max_text_bytes: 24,
         };
         let out = parse_whole(&transcript, &capped).unwrap();
-        assert!(out.docs.iter().all(|d| d.text.len() <= 24));
+        assert!(
+            out.docs
+                .iter()
+                .all(|d| d.text.len() + code_of(d).len() <= 24),
+            "{:?}",
+            out.docs
+                .iter()
+                .map(|d| (&d.text, &d.code))
+                .collect::<Vec<_>>()
+        );
     }
 
     // -- session metadata ---------------------------------------------------
@@ -2042,7 +2326,7 @@ mod tests {
             "bare `Error:` string: {:?}",
             call("t1")
         );
-        assert!(call("t1").text.contains("No such tool available"));
+        assert!(code_of(call("t1")).contains("No such tool available"));
         assert!(call("t2").is_error, "toolDenialKind: {:?}", call("t2"));
         assert!(!call("t3").is_error, "a success must stay a success");
         // And nothing was invented: three tool calls in, three documents out.
@@ -2197,7 +2481,8 @@ mod tests {
         assert_eq!(second.replacements[0].doc_id, expected.doc_id);
         assert_eq!(second.replacements[0].seq, expected.seq);
         assert_eq!(second.replacements[0].text, expected.text);
-        assert!(second.replacements[0].text.contains("Finished"));
+        assert_eq!(second.replacements[0].code, expected.code);
+        assert!(code_of(&second.replacements[0]).contains("Finished"));
 
         // Without the carry the same tail invents a second half-document instead.
         let (naive, _) = parse_file(

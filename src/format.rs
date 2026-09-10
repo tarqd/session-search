@@ -206,6 +206,9 @@ pub fn doc_json(d: &Doc) -> Value {
         "version": d.version,
         "slug": d.slug,
         "text": d.text,
+        "code": d.code,
+        "headings": d.headings,
+        "code_lang": d.code_langs,
         "thinking": d.thinking,
         "source_path": d.source_path,
     })
@@ -246,7 +249,7 @@ fn human_search(
             writeln!(w)?;
             write_hit_line(w, hit, i + 1, ink, cols)?;
             let body = if hit.snippet.trim().is_empty() {
-                one_line(&hit.doc.text, cols * MAX_SNIPPET_LINES)
+                one_line(&body(&hit.doc), cols * MAX_SNIPPET_LINES)
             } else {
                 one_line(&hit.snippet, usize::MAX)
             };
@@ -388,8 +391,8 @@ fn write_context(
             _ => doc.role.clone(),
         };
         let prefix = format!("      #{:<5} {:<20} ", doc.seq, truncate(&label, 20));
-        let body = one_line(&doc.text, cols.saturating_sub(prefix.chars().count()));
-        writeln!(w, "{}", ink.paint(&format!("{prefix}{body}"), dim()))?;
+        let line = one_line(&body(doc), cols.saturating_sub(prefix.chars().count()));
+        writeln!(w, "{}", ink.paint(&format!("{prefix}{line}"), dim()))?;
     }
     Ok(())
 }
@@ -556,7 +559,7 @@ pub fn session_view(w: &mut impl Write, docs: &[Doc], o: &OutputOpts) -> Result<
         } else {
             MESSAGE_BUDGET
         };
-        for line in wrap(&clip(&doc.text, budget), cols.saturating_sub(6)) {
+        for line in wrap(&clip(&body(doc), budget), cols.saturating_sub(6)) {
             writeln!(w, "      {line}")?;
         }
         if let Some(thinking) = doc.thinking.as_deref().filter(|t| !t.trim().is_empty()) {
@@ -760,6 +763,28 @@ fn is_control_char(c: char) -> bool {
 
 /// Whitespace collapsed onto one line, control characters neutralised, then truncated to `max`
 /// visible characters.
+/// Everything of a document a reader would have seen before the body was split in two: the
+/// prose, then the code blocks under it.
+///
+/// `parse.rs` moves a message's fenced blocks and a tool call's output out of `text` and into
+/// `code`, so anything that prints `text` alone now prints a tool call with no output and an
+/// answer with no snippet in it. Order matches the source: prose first, code after.
+fn body(d: &Doc) -> String {
+    if d.code.is_empty() {
+        return d.text.clone();
+    }
+    let mut out =
+        String::with_capacity(d.text.len() + d.code.iter().map(String::len).sum::<usize>());
+    out.push_str(d.text.trim_end());
+    for block in &d.code {
+        if !out.is_empty() {
+            out.push('\n');
+        }
+        out.push_str(block);
+    }
+    out
+}
+
 fn one_line(s: &str, max: usize) -> String {
     let flat = s.split_whitespace().collect::<Vec<_>>().join(" ");
     truncate(&sanitize_controls(&flat), max)
@@ -1004,6 +1029,9 @@ mod tests {
             version: Some("2.1.266".into()),
             slug: Some("wild-spinning-puppy".into()),
             text: text.into(),
+            code: Vec::new(),
+            headings: Vec::new(),
+            code_langs: Vec::new(),
             thinking: None,
             raw: "{\"type\":\"user\"}".into(),
         }
@@ -1427,6 +1455,50 @@ mod tests {
             "long bodies are clipped: {out}"
         );
         assert!(out.len() < long.len() + 4_000);
+    }
+
+    /// The body of a document is spread over `text` and `code`, and `show` prints both — a
+    /// tool call with no output on screen, or an answer with the snippet cut out of it, would
+    /// be a regression in what the command displays.
+    #[test]
+    fn session_view_prints_the_code_after_the_prose() {
+        let mut answer = doc(1, "assistant", "Use the helper:");
+        answer.code = vec!["pub fn open_or_create(dir: &Path) {}".into()];
+        answer.headings = vec!["The fix".into()];
+        let mut call = tool_doc(
+            2,
+            "Bash",
+            json!({"command": "cargo test"}),
+            "Bash\ncargo test",
+        );
+        call.code = vec!["error: test failed".into()];
+
+        let out = render(|w| session_view(w, &[answer, call], &plain()));
+        assert!(out.contains("Use the helper:"), "{out}");
+        assert!(out.contains("pub fn open_or_create"), "{out}");
+        assert!(out.contains("error: test failed"), "{out}");
+        // Prose first, code after it.
+        assert!(
+            out.find("Use the helper:") < out.find("pub fn open_or_create"),
+            "{out}"
+        );
+        assert!(
+            out.find("cargo test") < out.find("error: test failed"),
+            "{out}"
+        );
+    }
+
+    /// The JSON shape carries the new fields, so a `--json` consumer sees the whole document.
+    #[test]
+    fn doc_json_carries_the_code_and_heading_fields() {
+        let mut d = doc(1, "assistant", "Use the helper:");
+        d.code = vec!["pub fn open_or_create(dir: &Path) {}".into()];
+        d.headings = vec!["The fix".into()];
+        d.code_langs = vec!["rust".into()];
+        let v = doc_json(&d);
+        assert_eq!(v["code"][0], "pub fn open_or_create(dir: &Path) {}");
+        assert_eq!(v["headings"][0], "The fix");
+        assert_eq!(v["code_lang"][0], "rust");
     }
 
     #[test]

@@ -75,7 +75,7 @@ pub enum Command {
     Search {
         /// Query string: words, "phrases", AND/OR/NOT, `field:value`.
         query: Option<String>,
-        /// Comma-separated facet fields, e.g. `tool_name,tool_input.file_path`.
+        /// Comma-separated facet fields, e.g. `tool_name,code_lang,tool_input.file_path`.
         #[arg(long, value_delimiter = ',', value_name = "FIELD")]
         facets: Vec<String>,
         /// Also show N turns either side of each hit.
@@ -99,8 +99,8 @@ pub enum Command {
     },
     /// Count values of a fast field or any `tool_input.<path>`.
     Facets {
-        /// `tool_name`, `project`, `model`, `git_branch`, `role`, `kind`, `agent_type`,
-        /// `entrypoint`, or a JSON path such as `tool_input.file_path`.
+        /// `tool_name`, `code_lang`, `project`, `model`, `git_branch`, `role`, `kind`,
+        /// `agent_type`, `entrypoint`, or a JSON path such as `tool_input.file_path`.
         field: String,
         /// Restrict the counted set to documents matching this query.
         #[arg(long, value_name = "QUERY")]
@@ -663,6 +663,9 @@ fn warn_unused_session_filters(f: &Filters) {
     if !f.tool_input.is_empty() {
         ignored.push("--tool-input");
     }
+    if !f.lang.is_empty() {
+        ignored.push("--lang");
+    }
     if f.model.is_some() {
         ignored.push("--model");
     }
@@ -793,6 +796,10 @@ mod tests {
             "command=cargo",
             "--tool-input",
             "file_path=src/index.rs",
+            "--lang",
+            "rust",
+            "--lang",
+            "bash",
             "--branch",
             "main",
             "--model",
@@ -812,7 +819,7 @@ mod tests {
             "--errors-only",
             "--no-sidechains",
             "--facets",
-            "tool_name,tool_input.file_path",
+            "tool_name,code_lang",
             "--context",
             "2",
             "--limit",
@@ -848,6 +855,7 @@ mod tests {
             filters.tool_input,
             ["command=cargo", "file_path=src/index.rs"]
         );
+        assert_eq!(filters.lang, ["rust", "bash"]);
         assert_eq!(filters.branch.as_deref(), Some("main"));
         assert_eq!(filters.model.as_deref(), Some("claude-opus-5"));
         assert_eq!(filters.role.as_deref(), Some("assistant"));
@@ -860,7 +868,7 @@ mod tests {
         assert!(filters.no_sidechains);
         assert!(!filters.sidechains_only);
         // `--facets a,b` is one flag, two fields.
-        assert_eq!(facets, ["tool_name", "tool_input.file_path"]);
+        assert_eq!(facets, ["tool_name", "code_lang"]);
         assert_eq!((context, limit, offset), (2, 5, 10));
         assert!(json && no_refresh && include_thinking);
     }

@@ -1153,16 +1153,17 @@ mod tests {
         assert_eq!(stats.sessions, 0);
     }
 
-    /// The exact schema the previous build pinned: identical to today's but for the tokenizer
-    /// name on the three full-text fields. Round-tripping through JSON keeps the two in step,
-    /// so this test proves the *tokenizer* is what makes the old index unreadable and not some
-    /// unrelated drift.
+    /// The exact schema a build before the custom analyzers pinned: identical to today's but
+    /// for the tokenizer name on every full-text field. Round-tripping through JSON keeps the
+    /// two in step, so this test proves the *tokenizer* is what makes the old index unreadable
+    /// and not some unrelated drift.
     fn schema_with_the_previous_tokenizer() -> tantivy::schema::Schema {
         let (schema, _) = build_schema();
         let mut json = serde_json::to_value(&schema).unwrap();
         for field in json.as_array_mut().unwrap() {
             if let Some(tokenizer) = field.pointer_mut("/options/indexing/tokenizer")
-                && *tokenizer == crate::tokenizer::CODE_ANALYZER
+                && (*tokenizer == crate::tokenizer::CODE_ANALYZER
+                    || *tokenizer == crate::tokenizer::PROSE_ANALYZER)
             {
                 *tokenizer = serde_json::json!("default");
             }
@@ -1170,8 +1171,8 @@ mod tests {
         serde_json::from_value(json).unwrap()
     }
 
-    /// A field's tokenizer name is part of the schema, so moving `text`, `thinking` and
-    /// `tool_input` onto the `code` analyzer makes every index an older build wrote
+    /// A field's tokenizer name is part of the schema, so naming an analyzer on `text`,
+    /// `code`, `headings`, `thinking` and `tool_input` makes every index an older build wrote
     /// unreadable. The recovery has to be automatic — nobody is going to be told to delete a
     /// directory — so `open_or_create` must notice, discard it, and hand back a clean index
     /// that the next `run` refills.
@@ -1314,7 +1315,11 @@ mod tests {
         let doc = &found.hits[0].doc;
         assert_eq!(doc.tool_name.as_deref(), Some("Bash"));
         assert_eq!(doc.tool_input.as_ref().unwrap()["command"], "cargo build");
-        assert!(doc.text.contains("Finished"), "{:?}", doc.text);
+        assert!(
+            doc.code.iter().any(|c| c.contains("Finished")),
+            "the result is carried as code: {:?}",
+            doc.code
+        );
 
         // A third run with nothing new must still add nothing.
         assert_eq!(fx.index().docs_added, 0);

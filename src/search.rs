@@ -5,8 +5,10 @@
 //!
 //! Query shape, in the order the pieces are assembled:
 //!
-//! * the free-text query goes through `QueryParser` over `text` (+ `thinking` when opted in,
-//!   + `tool_input`), so phrases, booleans and `field:value` all work;
+//! * the free-text query goes through `QueryParser` over `text`, `code` and `headings`
+//!   (+ `thinking` when opted in, + `tool_input`), so phrases, booleans and `field:value` all
+//!   work. `headings` is boosted 2.0: a section title is what the section is *about*, so a
+//!   term in one is a better answer than the same term in the middle of a paragraph;
 //! * every filter is ANDed on top as a term, prefix (regex) or range query;
 //! * facets are a terms aggregation collected in the *same* searcher pass as the hits.
 //!
@@ -41,6 +43,9 @@ use crate::schema::Fields;
 const HL_PREFIX: &str = "**";
 const HL_SUFFIX: &str = "**";
 
+/// How much more a term in a markdown heading is worth than the same term in a paragraph.
+const HEADING_BOOST: Score = 2.0;
+
 #[derive(Debug, Clone, Default, clap::Args, serde::Serialize, serde::Deserialize)]
 #[serde(default)]
 pub struct Filters {
@@ -53,6 +58,9 @@ pub struct Filters {
     /// Tool parameter filter as `key=value`, e.g. `--tool-input command=cargo`; repeatable.
     #[arg(long = "tool-input", value_name = "KEY=VALUE")]
     pub tool_input: Vec<String>,
+    /// Fenced-code language, as written in the info string (`rust`, `bash`); repeatable.
+    #[arg(long, value_name = "LANG")]
+    pub lang: Vec<String>,
     #[arg(long, value_name = "BRANCH")]
     pub branch: Option<String>,
     #[arg(long, value_name = "MODEL")]
@@ -223,12 +231,16 @@ pub fn search(
     }
 
     // One snippet generator per response, per field: each only keeps the query's terms for
-    // its own field.
+    // its own field, and each tokenizes with that field's own analyzer.
     let raw_query = non_empty(req.query.as_deref()).unwrap_or_default();
     let snippet_chars = req.snippet_chars.max(32);
     let snippets = snippet_generator(&searcher, &*query, f.text, raw_query, snippet_chars).ok();
+    // A tool call keeps its output in `code`, and a message its snippets, so a hit that landed
+    // there has nothing to highlight in `text` — which is most tool-call hits.
+    let code_snippets =
+        snippet_generator(&searcher, &*query, f.code, raw_query, snippet_chars).ok();
     // A doc matched *through* `thinking` stores its body in that field and leaves `text`
-    // empty, so without a second generator the one thing `--include-thinking` is paid for is
+    // empty, so without a third generator the one thing `--include-thinking` is paid for is
     // the one thing never shown.
     let thinking_snippets = req
         .include_thinking
@@ -243,23 +255,17 @@ pub fn search(
     for (score, address) in top_hits {
         let stored: TantivyDocument = searcher.doc(address)?;
         let doc = doc_from_stored(f, &stored);
-        let snippet = snippets
-            .as_ref()
-            .map(|g| render_snippet(&g.snippet_from_doc(&stored)))
-            .filter(|s| !s.trim().is_empty())
-            .or_else(|| {
-                thinking_snippets
-                    .as_ref()
-                    .map(|g| render_snippet(&g.snippet_from_doc(&stored)))
-                    .filter(|s| !s.trim().is_empty())
-            })
-            .unwrap_or_else(|| {
-                let body = match (doc.text.trim().is_empty(), doc.thinking.as_deref()) {
-                    (true, Some(thinking)) => thinking,
-                    _ => &doc.text,
-                };
-                excerpt(body, req.snippet_chars)
-            });
+        // Prose first, then code, then thinking: the prose is what a reader recognises, and a
+        // highlight anywhere beats a head-of-body excerpt with no highlight at all.
+        let highlight = |g: &Option<SnippetGenerator>| {
+            g.as_ref()
+                .map(|g| render_snippet(&g.snippet_from_doc(&stored)))
+                .filter(|s| !s.trim().is_empty())
+        };
+        let snippet = highlight(&snippets)
+            .or_else(|| highlight(&code_snippets))
+            .or_else(|| highlight(&thinking_snippets))
+            .unwrap_or_else(|| excerpt(&fallback_body(&doc), req.snippet_chars));
         hits.push(Hit {
             doc,
             score,
@@ -388,12 +394,16 @@ fn build_query(
     let mut clauses: Vec<(Occur, Box<dyn Query>)> = Vec::new();
 
     if let Some(text) = non_empty(req.query.as_deref()) {
-        let mut default_fields = vec![f.text];
+        let mut default_fields = vec![f.text, f.code, f.headings];
         if req.include_thinking {
             default_fields.push(f.thinking);
         }
         default_fields.push(f.tool_input);
         let mut qp = QueryParser::for_index(index, default_fields);
+        // A heading names the subject of everything under it, so a hit in one outranks the
+        // same word buried in a paragraph. 2.0 is enough to reorder two otherwise comparable
+        // documents without letting one heading beat a document that matches repeatedly.
+        qp.set_field_boost(f.headings, HEADING_BOOST);
         // Bare multi-word input reads as "all of these words", which is what people mean;
         // explicit `OR` / `AND` / `"phrases"` / `field:value` still work.
         qp.set_conjunction_by_default();
@@ -423,6 +433,11 @@ fn build_query(
         ));
     }
     if let Some(q) = any_of(f.tool_name, &flt.tool) {
+        clauses.push((Occur::Must, q));
+    }
+    // `code_lang` is a STRING field holding the info word verbatim, so this is an exact match
+    // on the same lowercased token `markdown::split` stored.
+    if let Some(q) = any_of(f.code_lang, &lowercased(&flt.lang)) {
         clauses.push((Occur::Must, q));
     }
     for spec in &flt.tool_input {
@@ -467,6 +482,11 @@ fn build_query(
 
 fn non_empty(s: Option<&str>) -> Option<&str> {
     s.map(str::trim).filter(|s| !s.is_empty())
+}
+
+/// `--lang Rust` and `--lang rust` mean the same fence: the stored term is lowercase.
+fn lowercased(values: &[String]) -> Vec<String> {
+    values.iter().map(|v| v.trim().to_lowercase()).collect()
 }
 
 fn term_query(field: Field, value: &str) -> Box<dyn Query> {
@@ -803,6 +823,21 @@ fn render_snippet(snippet: &Snippet) -> String {
     out
 }
 
+/// What to excerpt when nothing highlighted: the prose if there is any, else the code, else
+/// the thinking.
+///
+/// A tool call whose input was empty, and an orphaned tool result, both carry their whole body
+/// in `code`; showing a blank line for them would hide the document the search just returned.
+fn fallback_body(doc: &Doc) -> String {
+    if !doc.text.trim().is_empty() {
+        return doc.text.clone();
+    }
+    if !doc.code.is_empty() {
+        return doc.code.join("\n");
+    }
+    doc.thinking.clone().unwrap_or_default()
+}
+
 /// Head-of-text fallback for hits with nothing to highlight — a filter-only search, or a
 /// match that landed in `tool_input` rather than `text`.
 fn excerpt(text: &str, max_chars: usize) -> String {
@@ -846,6 +881,14 @@ pub fn doc_from_stored(f: &Fields, stored: &TantivyDocument) -> Doc {
     };
     let u = |field: Field| -> Option<u64> { stored.get_first(field).and_then(|v| v.as_u64()) };
     let flag = |field: Field| -> bool { u(field).unwrap_or(0) != 0 };
+    // The three multi-valued fields: `get_first` would silently keep one code block of five.
+    let list = |field: Field| -> Vec<String> {
+        stored
+            .get_all(field)
+            .filter_map(|v| v.as_str())
+            .map(str::to_string)
+            .collect()
+    };
 
     let kind = match s(f.kind).as_deref() {
         Some("tool_call") => DocKind::ToolCall,
@@ -886,6 +929,9 @@ pub fn doc_from_stored(f: &Fields, stored: &TantivyDocument) -> Doc {
         version: s(f.version),
         slug: s(f.slug),
         text: s(f.text).unwrap_or_default(),
+        code: list(f.code),
+        headings: list(f.headings),
+        code_langs: list(f.code_lang),
         thinking: s(f.thinking),
         raw: s(f.raw).unwrap_or_default(),
     }
@@ -989,6 +1035,9 @@ pub(crate) mod testkit {
             version: Some("2.1.266".into()),
             slug: None,
             text: String::new(),
+            code: Vec::new(),
+            headings: Vec::new(),
+            code_langs: Vec::new(),
             thinking: None,
             raw: "{}".into(),
         }
@@ -1017,6 +1066,8 @@ pub(crate) mod testkit {
         d.text = "please make the tantivy schema faster".into();
         docs.push(d);
 
+        // Tool calls are shaped the way `parse::tool_call_doc` shapes them: the name and the
+        // input strings in `text`, the output in `code`.
         let mut d = blank_doc(1);
         d.kind = DocKind::ToolCall;
         d.role = "assistant".into();
@@ -1024,7 +1075,8 @@ pub(crate) mod testkit {
         d.tool_name = Some("Bash".into());
         d.tool_use_id = Some("toolu_1".into());
         d.tool_input = Some(json!({"command": "cargo build --release", "timeout": 600000}));
-        d.text = "cargo build --release\nCompiling tantivy".into();
+        d.text = "Bash\ncargo build --release".into();
+        d.code = vec!["Compiling tantivy v0.26.2".into()];
         docs.push(d);
 
         let mut d = blank_doc(2);
@@ -1033,7 +1085,8 @@ pub(crate) mod testkit {
         d.model = Some("claude-opus-5".into());
         d.tool_name = Some("Read".into());
         d.tool_input = Some(json!({"file_path": "/home/user/session-search/src/index.rs"}));
-        d.text = "pub fn open_or_create(index_dir: &Path)".into();
+        d.text = "Read\n/home/user/session-search/src/index.rs".into();
+        d.code = vec!["pub fn open_or_create(index_dir: &Path)".into()];
         docs.push(d);
 
         let mut d = blank_doc(3);
@@ -1041,7 +1094,8 @@ pub(crate) mod testkit {
         d.role = "assistant".into();
         d.tool_name = Some("Bash".into());
         d.tool_input = Some(json!({"command": "cargo test"}));
-        d.text = "cargo test\nerror: test failed".into();
+        d.text = "Bash\ncargo test".into();
+        d.code = vec!["error: test failed".into()];
         d.is_error = true;
         docs.push(d);
 
@@ -1104,8 +1158,10 @@ mod tests {
     /// The `code` analyzer's whole point: a part of an identifier finds the identifier, and
     /// the snake/camel/pascal spellings of one name are interchangeable.
     ///
-    /// The corpus is deliberately minimal — each doc's text *is* the identifier — so a hit
-    /// can only come from the analyzer and not from some other word in the sentence.
+    /// The corpus is deliberately minimal — each doc's body *is* the identifier — so a hit
+    /// can only come from the analyzer and not from some other word in the sentence. The body
+    /// is in `code`, which is the field the `code` analyzer indexes; `text` keeps a copy so
+    /// the assertions can name the document they mean.
     fn identifier_docs() -> Vec<Doc> {
         let names = [
             "open_or_create",
@@ -1120,6 +1176,7 @@ mod tests {
             .map(|(i, name)| {
                 let mut d = blank_doc(i as u64);
                 d.text = (*name).to_string();
+                d.code = vec![(*name).to_string()];
                 d
             })
             .collect()
@@ -1313,7 +1370,7 @@ mod tests {
         let (index, f) = index_docs(&corpus());
         let r = search(&index, &f, &req(r#""cargo build""#)).unwrap();
         assert_eq!(r.total, 1, "{:?}", texts(&r));
-        assert!(r.hits[0].doc.text.starts_with("cargo build"));
+        assert!(r.hits[0].doc.text.starts_with("Bash\ncargo build"));
         // The words exist in two docs, but not adjacent in that order in the second.
         let r = search(&index, &f, &req(r#""build cargo""#)).unwrap();
         assert_eq!(r.total, 0);
@@ -1649,22 +1706,26 @@ mod tests {
             r.hits[0].snippet
         );
 
-        // No free-text query -> a head-of-text excerpt rather than an empty snippet.
+        // No free-text query -> a head-of-body excerpt rather than an empty snippet.
         let mut r0 = SearchRequest::default();
         r0.filters.tool = vec!["Read".into()];
         let r = search(&index, &f, &r0).unwrap();
         assert_eq!(r.hits.len(), 1);
-        assert_eq!(r.hits[0].snippet, "pub fn open_or_create(index_dir: &Path)");
+        assert_eq!(
+            r.hits[0].snippet,
+            "Read /home/user/session-search/src/index.rs"
+        );
 
         // ...capped at `snippet_chars`.
         r0.snippet_chars = 20;
         let r = search(&index, &f, &r0).unwrap();
-        assert_eq!(r.hits[0].snippet, "pub fn open_or_creat…");
+        assert_eq!(r.hits[0].snippet, "Read /home/user/sess…");
 
         // The `code` analyzer highlights through an identifier too: a query for one part
         // marks that part, and a query for the whole name marks the whole name, because the
-        // offsets the analyzer hands back point into the *stored* text. (A fragment ends at
-        // its last token, which is why the closing paren is not in either of these.)
+        // offsets the analyzer hands back point into the *stored* text. Both of these land in
+        // `code` — the tool call's output — which is why the code generator exists.
+        // (A fragment ends at its last token, which is why the closing paren is in neither.)
         let r = search(&index, &f, &req("create")).unwrap();
         assert_eq!(
             r.hits[0].snippet,
@@ -1679,15 +1740,20 @@ mod tests {
 
     /// The snippet must show the identifier that matched, not a paragraph that happens to
     /// repeat its parts. `userEmail` expands to `useremail` + `user` + `email`, and the
-    /// prose ahead of it says `user` and `email` five times each.
+    /// text ahead of it says `user` and `email` five times each.
+    ///
+    /// The body is in `code`, the field the `code` analyzer indexes — this is a property of
+    /// that analyzer's snippets, and `text` is now analyzed as prose.
     #[test]
     fn the_snippet_shows_the_identifier_and_not_a_crowd_of_its_parts() {
         let mut d = blank_doc(1);
-        d.text = "The user asked for an email. Later the same user sent another email about \
-                  the user and the email. The user then wrote a third email, and the email \
-                  that the user sent after that was also about the user and the email they \
-                  had discussed. Deep at the end of the record sits the field userEmail."
-            .into();
+        d.code = vec![
+            "The user asked for an email. Later the same user sent another email about \
+             the user and the email. The user then wrote a third email, and the email \
+             that the user sent after that was also about the user and the email they \
+             had discussed. Deep at the end of the record sits the field userEmail."
+                .into(),
+        ];
         let (index, f) = index_docs(&[d]);
 
         for query in ["userEmail", "user_email"] {
@@ -1719,6 +1785,7 @@ mod tests {
             .map(|(i, name)| {
                 let mut d = blank_doc(i as u64);
                 d.text = (*name).to_string();
+                d.code = vec![(*name).to_string()];
                 d
             })
             .collect();
@@ -1735,6 +1802,161 @@ mod tests {
         assert_eq!(
             texts(&search(&index, &f, &req("server")).unwrap()),
             vec!["HTTPServerError"]
+        );
+    }
+
+    // -- the prose / code split ---------------------------------------------
+
+    /// A document built the way `parse.rs` builds one: its markdown split across the fields.
+    fn markdown_doc(seq: u64, body: &str) -> Doc {
+        let parts = crate::markdown::split(body);
+        let mut d = blank_doc(seq);
+        d.role = "assistant".into();
+        d.text = parts.text;
+        d.code = parts.code;
+        d.headings = parts.headings;
+        d.code_langs = parts.code_langs;
+        d
+    }
+
+    /// The whole point of the split: `text` is stemmed English and `code` is not.
+    ///
+    /// One analyzer cannot do both. Stemming a snippet turns `compiled` into `compil` and
+    /// matches a search for `compiling`, which is wrong for code and right for prose; not
+    /// stemming leaves `compiling` unable to find `compiled`, which is the reverse.
+    #[test]
+    fn a_prose_word_is_stemmed_and_the_same_word_in_code_is_not() {
+        let prose = markdown_doc(0, "The crate compiled cleanly on the second attempt.");
+        let code = markdown_doc(
+            1,
+            "It came out of this line:\n\n```rust\nlet compiled = 1;\n```",
+        );
+        let (index, f) = index_docs(&[prose, code]);
+
+        // `compiling` reaches the prose `compiled` through the stemmer...
+        let hits = texts(&search(&index, &f, &req("compiling")).unwrap());
+        assert_eq!(
+            hits,
+            vec!["The crate compiled cleanly on the second attempt."]
+        );
+
+        // ...and does not reach the identical word inside the fence, which is indexed verbatim.
+        let r = search(&index, &f, &req("compiling")).unwrap();
+        assert_eq!(r.total, 1, "the fenced `compiled` must not stem");
+
+        // Spelled exactly, it finds both: the prose through the stem, the code through itself.
+        assert_eq!(search(&index, &f, &req("compiled")).unwrap().total, 2);
+    }
+
+    /// An identifier inside a fenced block is indexed by the `code` analyzer, so a part of it
+    /// finds it — which is exactly what the prose analyzer on `text` could not do.
+    #[test]
+    fn an_identifier_in_a_fenced_block_is_found_by_one_of_its_parts() {
+        let d = markdown_doc(
+            0,
+            "Here is the function that opens it.\n\n```rust\npub fn open_or_create(dir: &Path) {}\n```",
+        );
+        assert_eq!(d.code_langs, ["rust"]);
+        assert!(!d.text.contains("open_or_create"), "{:?}", d.text);
+        let (index, f) = index_docs(&[d]);
+
+        for query in ["create", "OpenOrCreate", "open_or_create", "openorcreate"] {
+            assert_eq!(
+                search(&index, &f, &req(query)).unwrap().total,
+                1,
+                "{query:?} did not reach the fenced block"
+            );
+        }
+        // The prose around it is still prose: it is the one being stemmed, not the snippet.
+        assert_eq!(search(&index, &f, &req("opening")).unwrap().total, 1);
+    }
+
+    /// `code_lang` is a fast field, so it counts as a facet exactly like `tool_name`.
+    #[test]
+    fn code_langs_are_counted_as_a_facet() {
+        let docs = vec![
+            markdown_doc(0, "one\n\n```rust\nlet a = 1;\n```"),
+            markdown_doc(1, "two\n\n```rust\nlet b = 2;\n```"),
+            markdown_doc(2, "three\n\n```python\nb = 2\n```"),
+            // Two fences, two languages, one document — a multi-valued field.
+            markdown_doc(3, "four\n\n```bash\nls\n```\n\n```rust\nlet c = 3;\n```"),
+            // No fence at all: this one carries no value and must not be counted.
+            markdown_doc(4, "five, in prose, with an `inline span`"),
+        ];
+        let (index, f) = index_docs(&docs);
+
+        let r = facets(&index, &f, "code_lang", &SearchRequest::default()).unwrap();
+        let counts: BTreeMap<&str, u64> = r
+            .values
+            .iter()
+            .map(|c| (c.value.as_str(), c.count))
+            .collect();
+        assert_eq!(counts.get("rust"), Some(&3));
+        assert_eq!(counts.get("python"), Some(&1));
+        assert_eq!(counts.get("bash"), Some(&1));
+        assert_eq!(r.matching_docs, 5, "all five documents matched");
+        assert_eq!(r.docs_with_value, 5, "four documents, five values");
+
+        // And the same field filters, case-insensitively, the way `--tool` does.
+        let mut only_rust = SearchRequest::default();
+        only_rust.filters.lang = vec!["RUST".into()];
+        assert_eq!(search(&index, &f, &only_rust).unwrap().total, 3);
+        let mut two = SearchRequest::default();
+        two.filters.lang = vec!["python".into(), "bash".into()];
+        assert_eq!(search(&index, &f, &two).unwrap().total, 2);
+    }
+
+    /// A heading names what the section under it is about, so a term in one is a better answer
+    /// than the same term in the middle of a paragraph.
+    ///
+    /// The two documents differ in exactly one character — the `#` that makes the first line a
+    /// heading — so their `text` is identical and the boost is the only thing separating them.
+    #[test]
+    fn a_term_in_a_heading_outranks_the_same_term_in_a_paragraph() {
+        let tail = "\n\nthe surrounding paragraph is word for word the same in both.";
+        let with_heading = markdown_doc(0, &format!("# Retry policy{tail}"));
+        let without = markdown_doc(1, &format!("Retry policy{tail}"));
+        assert_eq!(with_heading.text, without.text, "only the heading differs");
+        assert_eq!(with_heading.headings, ["Retry policy"]);
+        assert!(without.headings.is_empty());
+
+        let (index, f) = index_docs(&[with_heading, without]);
+        let r = search(&index, &f, &req("retry")).unwrap();
+        assert_eq!(r.total, 2);
+        assert_eq!(r.hits[0].doc.seq, 0, "the heading hit ranks first");
+        assert!(
+            r.hits[0].score > r.hits[1].score,
+            "{} vs {}",
+            r.hits[0].score,
+            r.hits[1].score
+        );
+    }
+
+    /// A tool call keeps its output in `code`, so both the search and the snippet have to
+    /// reach a field that `text` no longer holds.
+    #[test]
+    fn a_tool_calls_output_is_searchable_and_snippets_from_code() {
+        let (index, f) = index_docs(&corpus());
+        let r = search(&index, &f, &req("Compiling")).unwrap();
+
+        assert_eq!(r.total, 1);
+        let hit = &r.hits[0];
+        assert_eq!(hit.doc.kind, DocKind::ToolCall);
+        assert_eq!(hit.doc.tool_name.as_deref(), Some("Bash"));
+        assert!(
+            hit.doc.text.contains("cargo build"),
+            "the input is still text: {:?}",
+            hit.doc.text
+        );
+        assert!(
+            !hit.doc.text.contains("Compiling"),
+            "the output is not: {:?}",
+            hit.doc.text
+        );
+        assert!(
+            hit.snippet.contains("**Compiling**"),
+            "the snippet comes from `code`: {:?}",
+            hit.snippet
         );
     }
 

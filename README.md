@@ -154,10 +154,13 @@ minutes earlier, indexed out of the session that is writing this README. The cor
 session you are sitting in.
 
 The query is a real query language, not a substring match: `"quoted phrases"`, `AND`/`OR`/`NOT`
-and `field:value` all work. Text is indexed by a code-aware analyzer, so an identifier is
-findable by any of its parts and by any of its spellings: `create`, `openOrCreate` and
-`OpenOrCreate` all find `open_or_create`, and `"open_or_create"` in quotes is still an exact
-phrase. There is no fuzzy operator — Tantivy 0.26 reads `~` as phrase slop,
+and `field:value` all work. A message is split before it is indexed: its prose is analyzed as
+English, so `compiling` finds `compiled`, while its code blocks, its inline spans and every tool
+result go through a code-aware analyzer, so an identifier is findable by any of its parts and by
+any of its spellings — `create`, `openOrCreate` and `OpenOrCreate` all find `open_or_create`, and
+`"open_or_create"` in quotes is still an exact phrase. Markdown headings are indexed once more on
+their own and count double, so a hit in a section title outranks the same word in a paragraph.
+There is no fuzzy operator — Tantivy 0.26 reads `~` as phrase slop,
 not edit distance, so `widget~1` is not a near-miss search. A query that fails to parse is
 retried leniently and the discarded parts are reported on stderr, so a typo'd field name does
 not look like an empty corpus.
@@ -476,6 +479,8 @@ Accepted by `search`, `facets` and `sessions`:
   -t, --tool <NAME>             Tool name; repeatable
       --tool-input <KEY=VALUE>  Tool parameter filter as `key=value`, e.g. `--tool-input
                                 command=cargo`; repeatable
+      --lang <LANG>             Fenced-code language, as written in the info string (`rust`,
+                                `bash`); repeatable
       --branch <BRANCH>
       --model <MODEL>
       --role <ROLE>
@@ -502,7 +507,8 @@ b20208d8-fbdb-5918-ba69-d203de6ed6dc  wild-spinning-puppy  agent a02e0e345842f6e
   harden:docs
 ```
 
-The ignored set is `--tool`, `--tool-input`, `--model`, `--role`, `--kind`, `--errors-only`.
+The ignored set is `--tool`, `--tool-input`, `--lang`, `--model`, `--role`, `--kind`,
+`--errors-only`.
 
 ### `index`
 
@@ -541,7 +547,8 @@ Arguments:
   [QUERY]  Query string: words, "phrases", AND/OR/NOT, `field:value`
 
 Options:
-      --facets <FIELD>    Comma-separated facet fields, e.g. `tool_name,tool_input.file_path`
+      --facets <FIELD>    Comma-separated facet fields, e.g.
+                          `tool_name,code_lang,tool_input.file_path`
       --index <DIR>       Index directory. Defaults to `$XDG_DATA_HOME/session-search` [env:
                           SESSION_SEARCH_INDEX=]
       --context <N>       Also show N turns either side of each hit [default: 0]
@@ -567,8 +574,8 @@ Count values of a fast field or any `tool_input.<path>`
 Usage: session-search facets [OPTIONS] <FIELD>
 
 Arguments:
-  <FIELD>  `tool_name`, `project`, `model`, `git_branch`, `role`, `kind`, `agent_type`,
-           `entrypoint`, or a JSON path such as `tool_input.file_path`
+  <FIELD>  `tool_name`, `code_lang`, `project`, `model`, `git_branch`, `role`, `kind`,
+           `agent_type`, `entrypoint`, or a JSON path such as `tool_input.file_path`
 
 Options:
       --index <DIR>    Index directory. Defaults to `$XDG_DATA_HOME/session-search` [env:
@@ -722,7 +729,11 @@ session-search search "aggregation" -t Bash --limit 1 --json --facets tool_name
 ```
 
 (Pretty-printed here; the real output is a single line. `snippet`, `source_path`, `text` and
-`tool_input.command` are truncated with `…` for width — they are complete in the actual output.)
+`tool_input.command` are truncated with `…` for width — they are complete in the actual output.
+This capture, and the search results above it, predate the prose/code split described under
+[Documents](#documents): a hit object now also carries `code`, `headings` and `code_lang`, a tool
+call's output is in `code` rather than at the end of `text`, and a snippet is highlighted out of
+one of those fields rather than out of their concatenation.)
 
 ---
 
@@ -744,8 +755,17 @@ merge and old ones are reclaimed.
 ### Documents
 
 One document per message, one per tool call. That granularity is what makes hits precise and
-facets meaningful — a hit points at the exact turn, not at a 400-line session. The index for this
-project's own development history:
+facets meaningful — a hit points at the exact turn, not at a 400-line session.
+
+A document's body is not one field. A message is markdown, so it is split before indexing: its
+prose goes to `text` (analyzed as English, stemmed), its fenced blocks and inline spans to `code`
+(analyzed as code, never stemmed), its headings to `headings` (prose, and worth double), and each
+fence's language to `code_lang`, which is a facet like `tool_name`. A tool call is not markdown
+and is never parsed as one: its name and input strings are `text`, while its **output** — and the
+file content of an `Edit` or `Write` — is `code`. Everything printed by `show`, and every
+`--json` document, carries both halves.
+
+The index for this project's own development history:
 
 ```bash
 session-search facets role
@@ -850,7 +870,8 @@ a single pass produced 49**, and reported 78 tool calls where there were 39.
 
 The fix is a small per-file *carry* in `state.json` (`parse::ParseCarry`): the ids — and the
 documents — a run left unfinished, plus a fingerprint of the last line it consumed. A later tail
-uses it to *complete* the waiting document (same `doc_id`, same `seq`, result text appended)
+uses it to *complete* the waiting document (same `doc_id`, same `seq`, the result added to its
+`code`)
 instead of inventing a second half-empty one, and to recognise a `message.id` it has already
 counted. `src/index.rs` carries the test:
 
@@ -901,9 +922,10 @@ content-directed file I/O — fine for your own `~/.claude` tree, worth remember
 index transcripts from elsewhere.
 
 **Everything is local and single-user.** No daemon, no watch mode, no incremental commit while a
-session is in flight; the index is refreshed at query time. There is no ranking tuning, no
-stemming, and no cross-machine sync. The one piece of language handling is the `code` analyzer
-described above, which splits identifiers; it does not know English.
+session is in flight; the index is refreshed at query time. There is no cross-machine sync, and
+the ranking tuning amounts to one field boost on markdown headings. Language handling is English
+only: prose is stemmed by an English stemmer, and the `code` analyzer described above splits
+identifiers and stems nothing.
 
 ---
 
@@ -917,8 +939,8 @@ cargo test
 ```
 
 ```
-running 177 tests
-test result: ok. 173 passed; 0 failed; 4 ignored; 0 measured; 0 filtered out; finished in 1.9s
+running 228 tests
+test result: ok. 224 passed; 0 failed; 4 ignored; 0 measured; 0 filtered out; finished in 2.4s
 ```
 
 The four ignored tests all need this machine's own `~/.claude/projects` and are the ones worth

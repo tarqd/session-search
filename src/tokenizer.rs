@@ -1,4 +1,10 @@
-//! The `code` analyzer: one tokenizer that indexes identifiers the way people search for them.
+//! The two analyzers: `code`, which indexes identifiers the way people search for them, and
+//! `prose`, which indexes English the way people search for that.
+//!
+//! `parse.rs` splits a markdown message into its prose and its code (see `markdown.rs`) so each
+//! half can have the analyzer it wants: `text` and `headings` are `prose`, while `code`,
+//! `thinking` and `tool_input` are `code`. The rest of this module is the `code` analyzer;
+//! [`prose_analyzer`] is four stock filters and is documented at its definition.
 //!
 //! Transcripts are mostly code, paths and shell, and the stock `default` analyzer answers badly
 //! for them: it indexes `SnippetGenerator` as one opaque blob, so `snippet` never finds it; it
@@ -54,11 +60,15 @@ use std::str::CharIndices;
 
 use tantivy::Index;
 use tantivy::tokenizer::{
-    LowerCaser, RemoveLongFilter, TextAnalyzer, Token, TokenFilter, TokenStream, Tokenizer,
+    Language, LowerCaser, RemoveLongFilter, SimpleTokenizer, Stemmer, TextAnalyzer, Token,
+    TokenFilter, TokenStream, Tokenizer,
 };
 
 /// The name the analyzer is registered under, and the name the schema refers to.
 pub const CODE_ANALYZER: &str = "code";
+
+/// The prose analyzer's name, for the fields that hold English rather than identifiers.
+pub const PROSE_ANALYZER: &str = "prose";
 
 /// Tokens longer than this are dropped. The stock limit is 40, which loses every sha256.
 const MAX_TOKEN_BYTES: usize = 255;
@@ -80,17 +90,37 @@ pub fn code_analyzer() -> TextAnalyzer {
         .build()
 }
 
-/// Register the `code` analyzer on `index`.
+/// Build the `prose` analyzer: the one the *other* half of a message wants.
+///
+/// `text` and `headings` hold English, so they get English treatment — `SimpleTokenizer`, a
+/// 255-byte length limit for symmetry with `code`, lowercasing, and an English stemmer, so
+/// `compiling` finds `compiled`. Stemming is exactly what must never touch a snippet: it turns
+/// `Serializes` into `serial` and `parses` into `pars`, terms no reader would type. Splitting
+/// prose and code into separate fields is what lets each have the analyzer it wants.
+///
+/// The `LowerCaser` runs before the stemmer because `Stemmer` matches on lowercase input.
+pub fn prose_analyzer() -> TextAnalyzer {
+    TextAnalyzer::builder(SimpleTokenizer::default())
+        .filter(RemoveLongFilter::limit(MAX_TOKEN_BYTES))
+        .filter(LowerCaser)
+        .filter(Stemmer::new(Language::English))
+        .build()
+}
+
+/// Register the `code` and `prose` analyzers on `index`.
 ///
 /// Must be called on **every** path that opens or creates an [`Index`], before any document is
 /// added and before any query is parsed: both the writer and `QueryParser` look the analyzer up
 /// by name, and a missing registration is an error at that point, not at open time.
 pub fn register(index: &Index) {
     index.tokenizers().register(CODE_ANALYZER, code_analyzer());
+    index
+        .tokenizers()
+        .register(PROSE_ANALYZER, prose_analyzer());
 }
 
-/// A RAM index carrying the pinned schema **and** the `code` analyzer — the in-memory
-/// counterpart of `index::open_or_create`, so no test can forget to register it and then fail
+/// A RAM index carrying the pinned schema **and** both analyzers — the in-memory
+/// counterpart of `index::open_or_create`, so no test can forget to register them and then fail
 /// with `UnknownTokenizer` a dozen frames deep.
 #[cfg(test)]
 pub(crate) fn create_in_ram(schema: tantivy::schema::Schema) -> Index {
@@ -601,10 +631,50 @@ mod tests {
     }
 
     #[test]
-    fn registering_makes_the_analyzer_reachable_by_name() {
+    fn registering_makes_both_analyzers_reachable_by_name() {
         let index = Index::create_in_ram(crate::schema::build_schema().0);
         assert!(index.tokenizers().get(CODE_ANALYZER).is_none());
+        assert!(index.tokenizers().get(PROSE_ANALYZER).is_none());
         register(&index);
         assert!(index.tokenizers().get(CODE_ANALYZER).is_some());
+        assert!(index.tokenizers().get(PROSE_ANALYZER).is_some());
+    }
+
+    /// `(text, position)` for every token the `prose` analyzer emits.
+    fn prose(text: &str) -> Vec<String> {
+        let mut analyzer = prose_analyzer();
+        let mut stream = analyzer.token_stream(text);
+        let mut out = Vec::new();
+        stream.process(&mut |t: &Token| out.push(t.text.clone()));
+        out
+    }
+
+    #[test]
+    fn the_prose_analyzer_stems_and_the_code_analyzer_does_not() {
+        assert_eq!(prose("compiling"), prose("compiled"));
+        assert_eq!(
+            prose("Indexes the sessions"),
+            vec!["index", "the", "session"]
+        );
+        // The same words through `code` keep their endings, which is the point: a snippet
+        // holding `parses` must not be indexed as `pars`.
+        assert_eq!(texts("parses"), vec!["parses"]);
+        assert_ne!(texts("compiling"), texts("compiled"));
+    }
+
+    #[test]
+    fn the_prose_analyzer_leaves_identifiers_whole() {
+        // `SimpleTokenizer` splits on `_`, and nothing puts the parts back together: prose is
+        // not where an identifier search is served, `code` is.
+        assert_eq!(prose("open_or_create"), vec!["open", "or", "creat"]);
+        assert_eq!(prose("SnippetGenerator"), vec!["snippetgener"]);
+    }
+
+    #[test]
+    fn the_prose_analyzer_keeps_a_long_token_whole() {
+        let hash = "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08";
+        assert_eq!(prose(hash), vec![hash.to_string()]);
+        // ...but the stock 40-byte limit would not, which is why the limit is set here too.
+        assert!(prose(&"a".repeat(300)).is_empty());
     }
 }

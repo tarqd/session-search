@@ -18,6 +18,9 @@ errors. A CLI now; an `mcp` subcommand serving the same operations over stdio ne
   expands a hit to surrounding turns on demand.
 - **Indexed text:** user prompts, assistant text, tool inputs, tool results (size-capped).
   Assistant **thinking is stored but not indexed** — `--include-thinking` opts in, default off.
+- **A message body is split by kind before it is indexed.** Its prose goes to `text`, its
+  fenced blocks and inline spans to `code`, its headings to `headings` — because prose and code
+  want opposite analysis. See "The markdown split" below.
 - **Incremental one-shot indexing** keyed on (size, mtime, byte offset) per file.
   The read commands (`search`, `facets`, `show`, `sessions`) auto-refresh unless `--no-refresh`;
   `stats` never opens the index at all. `--include-thinking` is an *index-time* choice — turning
@@ -76,9 +79,25 @@ intended: facets show whole commands/paths, search matches words inside them.
   ```
 - `tantivy` needs no extra cargo features for aggregations — they are built in.
 
-## The `code` analyzer (`tokenizer.rs`)
+## The two analyzers (`tokenizer.rs`)
 
-`text`, `thinking` and `tool_input` are all indexed with one registered analyzer named `code`.
+Two registered analyzers, one per kind of text:
+
+| analyzer | fields | pipeline |
+| --- | --- | --- |
+| `code` | `code`, `thinking`, `tool_input` | `WordTokenizer -> SplitIdentifiers -> LowerCaser -> RemoveLongFilter(255)` |
+| `prose` | `text`, `headings` | `SimpleTokenizer -> RemoveLongFilter(255) -> LowerCaser -> Stemmer(English)` |
+
+`prose` is four stock filters and needs no defending: it stems, so `compiling` finds `compiled`.
+Stemming is exactly what must never touch a snippet — it turns `Serializes` into `serial` and
+`parses` into `pars`, terms nobody types — which is why the two halves of a message are indexed
+in separate fields rather than under one compromise analyzer. `thinking` keeps `code`: it is
+prose and snippets interleaved with no marker between them, so there is no split to make, and
+the analyzer that keeps identifiers intact loses least. `tool_input` keeps `code` for the same
+reason it always had it — its values are commands and paths.
+
+The rest of this section is the `code` analyzer.
+
 Transcripts are mostly identifiers, paths and shell, and the stock `default` analyzer answers
 badly for them: `snippet` misses `SnippetGenerator`, which it indexes as one opaque word;
 `OpenOrCreate` and `open_or_create` share no term, so neither spelling finds the other; and every
@@ -131,16 +150,63 @@ reindex**: `index::open_or_create` sees `SchemaError`, discards the index togeth
 without changing its name does **not** trip that check — bump the registered name too, or the
 old terms stay on disk.
 
-Snippets are generated from the **whole** terms of the query only (`search::snippet_generator`).
+Snippets: one `SnippetGenerator` per response for `text`, one for `code` and, under
+`--include-thinking`, one for `thinking`. The first of those with something to highlight wins —
+prose, then code, then thinking — and a hit with nothing highlighted anywhere falls back to the
+head of its body (prose if it has any, else code, else thinking). The code generator is not
+optional: a tool call keeps its output in `code`, so most tool-call hits have nothing in `text`
+to mark.
+
+Each generator is built from the **whole** terms of the query only (`search::snippet_generator`).
 `SnippetGenerator::create` weighs every term of the parsed query alike and scores a fragment by
 summing its hits, so for a query word that expands into an identifier plus its parts, a paragraph
 repeating the parts (`user` here, `email` there) outscores the one line holding `userEmail` and
 the snippet shows everything except the reason the document matched. Dropping the parts is safe:
 they share the whole's position, so every matching document contains the whole form too.
 
-`tokenizer::register(&index)` must run on every path that opens or creates an `Index`, before any
-document is added and before any query is parsed: the writer and `QueryParser` both look the
-analyzer up by name, and a missing registration fails there rather than at open time.
+`tokenizer::register(&index)` registers **both** analyzers and must run on every path that opens
+or creates an `Index`, before any document is added and before any query is parsed: the writer
+and `QueryParser` both look an analyzer up by name, and a missing registration fails there rather
+than at open time.
+
+## The markdown split (`markdown.rs`)
+
+`markdown::split(&str) -> MarkdownParts { text, code, headings, code_langs }` walks
+pulldown-cmark's event stream once (tables + strikethrough on, everything else off, no regex)
+and routes each event:
+
+| markdown | lands in |
+| --- | --- |
+| paragraph, list item, table cell, blockquote, link text, image alt, raw HTML | `text` |
+| fenced or indented code block | one `code` entry, its info word in `code_langs` |
+| inline `` `span` `` | one `code` entry **and** stays in `text` |
+| heading | one `headings` entry **and** a line of `text` |
+
+Prose blocks are joined with newlines. Three routings are deliberate:
+
+- **A heading is also prose.** `show` prints `text`, so routing headings only to their own field
+  would delete every section title from the rendered transcript. Headings are short, and the
+  boost on `headings` is what makes the ranking difference, not exclusivity.
+- **Raw HTML is text, not dropped.** A turn that opens with `<system-reminder>` is one HTML block
+  to a markdown parser; dropping HTML would silently unindex the whole of it.
+- **Link destinations are dropped.** A URL is not prose, and `tool_input` already carries the
+  paths anyone searches for.
+
+Malformed input needs no special case: pulldown-cmark is total over `&str`, closes every tag it
+opened at EOF, and never fails. An unclosed fence is a closed one — which also makes it safe to
+cap a body *before* splitting it.
+
+`parse.rs` applies it to `user` and `assistant` **message** docs only:
+
+- a **tool call is never parsed as markdown** — a `Bash` script is full of `#`, `*` and `>` that
+  mean nothing of the sort. Its name and input strings stay in `text` as they always were; its
+  **output** moves to `code`, and so do the `old_string` / `new_string` / `content` leaves of an
+  `Edit`/`Write`/`MultiEdit`, which are file contents (the key decides, at any depth);
+- attachments and `system` records stay whole in `text`;
+- `max_text_bytes` still bounds one document's body: a message is truncated *before* the split,
+  and a tool call spends the same budget across `text` then `code`. `ParseOutput::replacements`
+  appends a late result as the last `code` entry against that same budget, so a completed tail
+  parse stays byte-identical to a whole-file one.
 
 ## Layout
 
@@ -150,7 +216,8 @@ src/
   model.rs       raw serde types for transcript records          [Foundation]
   discovery.rs   locate roots, enumerate transcripts + sidechains [Foundation]
   parse.rs       records -> Vec<Doc>                              [Foundation]
-  tokenizer.rs   the `code` analyzer + its registration           [Foundation]
+  markdown.rs    markdown body -> prose / code / headings          [Foundation]
+  tokenizer.rs   the `code` + `prose` analyzers, and registration  [Foundation]
   schema.rs      Tantivy schema + Fields handle                   [Foundation]
   index.rs       incremental indexer, watermarks, sessions.json   [Build A]
   search.rs      SearchRequest -> SearchResponse, facets          [Build B]
@@ -234,7 +301,12 @@ pub struct Doc {
     pub permission_mode: Option<String>,
     pub version: Option<String>,
     pub slug: Option<String>,
-    pub text: String,            // the indexed body
+    pub text: String,            // the prose half of the body: a message's markdown minus its
+                                 // code blocks, or a tool call's name + input strings
+    pub code: Vec<String>,       // the code half: one entry per code block or inline span of a
+                                 // message, or a tool call's OUTPUT and file-content inputs
+    pub headings: Vec<String>,   // a message's markdown headings (also present in `text`)
+    pub code_langs: Vec<String>, // fence info words, deduped
     pub thinking: Option<String>,// stored, indexed only with include_thinking
     pub raw: String,             // original JSONL line
 }
@@ -352,8 +424,11 @@ Field names and options:
 | `session_id`, `agent_id`, `agent_type`, `project`, `git_branch`, `role`, `kind`, `model`, `tool_name`, `entrypoint`, `permission_mode`, `version`, `slug` | `STRING \| STORED \| FAST` |
 | `project_facet` | `FacetOptions` — hierarchical, `/home/user/session-search` |
 | `tool_input` | JSON, indexed with the `code` tokenizer + `set_fast(Some("raw"))` + `set_expand_dots_enabled()` + stored |
-| `text` | stored, indexed with the `code` tokenizer, `WithFreqsAndPositions` (`TEXT \| STORED` but for the tokenizer) |
-| `thinking` | same as `text` (only populated when `include_thinking`) |
+| `text` | stored, indexed with the `prose` tokenizer, `WithFreqsAndPositions` (`TEXT \| STORED` but for the tokenizer) |
+| `headings` | same as `text`; **multi-valued** — one value per markdown heading |
+| `code` | same options, but the `code` tokenizer; **multi-valued** — one value per code block or inline span |
+| `code_lang` | `STRING \| STORED \| FAST`; **multi-valued** — the info word of each fence, lowercased |
+| `thinking` | stored, indexed with the `code` tokenizer (only populated when `include_thinking`) |
 | `timestamp` | date field, `INDEXED \| STORED \| FAST` (tantivy 0.26 has no `DATE` flag const; `add_date_field` takes the numeric flags) |
 | `seq` | `U64 \| STORED \| FAST \| INDEXED` |
 | `is_error`, `is_sidechain`, `is_meta` | `U64 \| FAST \| INDEXED \| STORED` (0/1) — STORED because `search::doc_from_stored` reads them back out of the stored payload |
@@ -407,6 +482,7 @@ Incremental rules:
 #[derive(Debug, Clone, Default)]
 pub struct Filters {
     pub project: Option<String>, pub tool: Vec<String>, pub tool_input: Vec<String>, // "key=value"
+    pub lang: Vec<String>,       // fence languages, matched against `code_lang` (--lang)
     pub branch: Option<String>, pub model: Option<String>, pub role: Option<String>,
     pub kind: Option<String>, pub session: Option<String>, pub agent_type: Option<String>,
     pub since: Option<String>, pub until: Option<String>,   // RFC3339 or YYYY-MM-DD or "7d"
@@ -415,7 +491,7 @@ pub struct Filters {
 pub struct SearchRequest {
     pub query: Option<String>, pub filters: Filters,
     pub limit: usize, pub offset: usize,
-    pub facets: Vec<String>,     // "tool_name", "project", or any JSON path e.g. "tool_input.file_path"
+    pub facets: Vec<String>,     // "tool_name", "code_lang", "project", or any JSON path e.g. "tool_input.file_path"
     pub facet_top: usize, pub snippet_chars: usize, pub include_thinking: bool,
 }
 pub struct FacetCount { pub value: String, pub count: u64 }
@@ -447,11 +523,14 @@ pub fn facets(index: &tantivy::Index, f: &Fields, field: &str, req: &SearchReque
     -> anyhow::Result<FacetResult>;
 ```
 
-Query semantics: the free-text query goes through `QueryParser` over `text` (+ `thinking` when
-opted in, + `tool_input`), so phrases, booleans and `field:value` all work. All three fields use
-the `code` analyzer, so a query word is matched against identifier parts as well as whole words,
-and a word that expands into several terms becomes a positional query — which is why those fields
-are indexed `WithFreqsAndPositions`. **There is no fuzzy operator**: `~` is phrase slop in Tantivy 0.26 and `set_field_fuzzy` is deliberately not wired
+Query semantics: the free-text query goes through `QueryParser` over `text`, `code` and
+`headings` (+ `thinking` when opted in, + `tool_input`), so phrases, booleans and `field:value`
+all work. `QueryParser` applies each field's own analyzer to the query, so one word is stemmed
+against the prose fields and split into identifier parts against the code ones — and a word that
+expands into several terms becomes a positional query, which is why every full-text field is
+indexed `WithFreqsAndPositions`. `headings` carries `set_field_boost(2.0)`: a section title says
+what the section is about, so a term in one is a better answer than the same term in the middle
+of a paragraph. **There is no fuzzy operator**: `~` is phrase slop in Tantivy 0.26 and `set_field_fuzzy` is deliberately not wired
 up, so do not advertise `term~1`. A query that fails to parse falls back to
 `parse_query_lenient`, and the discarded errors are logged at WARN — a typo'd field name must
 not look like an empty corpus. Filters are ANDed on top as term/range queries. `--tool-input
@@ -492,6 +571,10 @@ pub fn session_view(w: &mut impl Write, docs: &[Doc], o: &OutputOpts) -> anyhow:
 pub fn session_list(w: &mut impl Write, s: &[SessionInfo], o: &OutputOpts) -> anyhow::Result<()>;
 pub fn stats(w: &mut impl Write, s: &IndexStats, o: &OutputOpts) -> anyhow::Result<()>;
 ```
+
+Anything that prints a document's body prints `text` **then** its `code` entries, in that
+order — the two halves are one body, and printing `text` alone would show a tool call with no
+output. `doc_json` carries `code`, `headings` and `code_lang` alongside `text`.
 
 ## CLI surface
 
