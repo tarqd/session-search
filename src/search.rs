@@ -52,6 +52,10 @@ pub struct Filters {
     /// Tool parameter filter as `key=value`, e.g. `--tool-input command=cargo`; repeatable.
     #[arg(long = "tool-input", value_name = "KEY=VALUE")]
     pub tool_input: Vec<String>,
+    /// Program run by a Bash command — any simple command in the script, e.g.
+    /// `--program cargo`; repeatable, OR.
+    #[arg(long, value_name = "NAME")]
+    pub program: Vec<String>,
     #[arg(long, value_name = "BRANCH")]
     pub branch: Option<String>,
     #[arg(long, value_name = "MODEL")]
@@ -125,7 +129,10 @@ pub struct FacetResult {
     pub values: Vec<FacetCount>,
     /// Documents matching the query and filters. **Not** the sum of `values`.
     pub matching_docs: u64,
-    /// Of those, the ones that actually carry a value for this field.
+    /// Of those, the ones that actually carry a value for this field. Counted with an
+    /// `ExistsQuery`, not summed from the buckets: a multi-valued field like
+    /// `bash_cmd.program` buckets a document once per value, so the sum counts values and
+    /// can exceed `matching_docs`.
     pub docs_with_value: u64,
     /// Documents whose value fell outside the returned buckets (`sum_other_doc_count`).
     pub other_docs: u64,
@@ -214,9 +221,10 @@ pub fn search(
     if let Some(agg) = agg {
         let as_json = serde_json::to_value(agg).context("serializing aggregation result")?;
         for (i, name) in facet_fields.iter().enumerate() {
+            let with_value = docs_with_value(&searcher, &*query, name)?;
             facets.insert(
                 (*name).to_string(),
-                facet_result_from(&as_json, i, name, req.facet_top, total as u64),
+                facet_result_from(&as_json, i, name, req.facet_top, total as u64, with_value),
             );
         }
     }
@@ -292,6 +300,7 @@ pub fn facets(
     // `Count` rides along so the reported total is documents matched, not the sum of the rows
     // that happened to fit under `--top`.
     let (matching, agg) = searcher.search(&query, &(Count, collector))?;
+    let with_value = docs_with_value(&searcher, &*query, field)?;
     let as_json = serde_json::to_value(agg).context("serializing aggregation result")?;
     Ok(facet_result_from(
         &as_json,
@@ -299,6 +308,7 @@ pub fn facets(
         field,
         req.facet_top,
         matching as u64,
+        with_value,
     ))
 }
 
@@ -354,6 +364,9 @@ fn build_query(
     }
     for spec in &flt.tool_input {
         clauses.push((Occur::Must, tool_input_query(index, spec)?));
+    }
+    if let Some(q) = program_query(index, &flt.program)? {
+        clauses.push((Occur::Must, q));
     }
     // Session ids are 36-char UUIDs, so `--session` matches by prefix — the same affordance
     // `sessions --session` already had, and what anyone pasting the first block expects.
@@ -507,6 +520,34 @@ fn tool_input_query(index: &tantivy::Index, spec: &str) -> anyhow::Result<Box<dy
         .with_context(|| format!("building a tool-input filter from {spec:?}"))
 }
 
+/// `--program cargo --program git` -> one ANDed clause, OR over the values, each a query on
+/// the JSON subpath `bash_cmd.program`.
+///
+/// Built through `QueryParser` exactly like [`tool_input_query`], for the same reason: the
+/// parser emits the terms the JSON field actually indexed. `bash_cmd` is tokenized `raw`, so
+/// the value is matched whole and case-sensitively — `cargo` finds `cargo`, never `Cargo` and
+/// never `cargo-nextest`. Empty values are skipped, as in [`any_of`].
+fn program_query(
+    index: &tantivy::Index,
+    values: &[String],
+) -> anyhow::Result<Option<Box<dyn Query>>> {
+    let mut shoulds: Vec<(Occur, Box<dyn Query>)> = Vec::new();
+    let qp = QueryParser::for_index(index, Vec::new());
+    for value in values.iter().map(|v| v.trim()).filter(|v| !v.is_empty()) {
+        let escaped = value.replace('\\', r"\\").replace('"', r#"\""#);
+        let expr = format!("bash_cmd.program:\"{escaped}\"");
+        let query = qp
+            .parse_query(&expr)
+            .with_context(|| format!("building a --program filter from {value:?}"))?;
+        shoulds.push((Occur::Should, query));
+    }
+    Ok(match shoulds.len() {
+        0 => None,
+        1 => Some(shoulds.pop().expect("checked len").1),
+        _ => Some(Box::new(BooleanQuery::new(shoulds))),
+    })
+}
+
 // ---------------------------------------------------------------------------
 // dates
 // ---------------------------------------------------------------------------
@@ -628,6 +669,22 @@ fn agg_collector(fields: &[&str], top: usize) -> AggregationCollector {
     AggregationCollector::from_aggs(aggs, Default::default())
 }
 
+/// Documents in `query`'s match set that carry any value for `field`.
+///
+/// This cannot be read off the buckets: a terms aggregation counts a document once per
+/// *value*, so on a multi-valued field like `bash_cmd.program` (one entry per simple command
+/// in the script) summing the buckets counts values, and can sail past `matching_docs`.
+fn docs_with_value(searcher: &Searcher, query: &dyn Query, field: &str) -> tantivy::Result<u64> {
+    let exists = BooleanQuery::new(vec![
+        (Occur::Must, query.box_clone()),
+        (
+            Occur::Must,
+            Box::new(ExistsQuery::new(field.to_string(), false)) as Box<dyn Query>,
+        ),
+    ]);
+    searcher.search(&exists, &Count).map(|n| n as u64)
+}
+
 /// Assemble the buckets and the counts needed to read them, for facet `i` of a request.
 fn facet_result_from(
     result: &Value,
@@ -635,6 +692,7 @@ fn facet_result_from(
     field: &str,
     top: usize,
     matching_docs: u64,
+    docs_with_value: u64,
 ) -> FacetResult {
     let values = buckets_from(result, &agg_key(i), top);
     let other_docs = result
@@ -651,7 +709,7 @@ fn facet_result_from(
         .map(|v| v.round() as u64);
     FacetResult {
         field: field.to_string(),
-        docs_with_value: values.iter().map(|f| f.count).sum::<u64>() + other_docs,
+        docs_with_value,
         matching_docs,
         other_docs,
         distinct,
@@ -778,11 +836,15 @@ pub fn doc_from_stored(f: &Fields, stored: &TantivyDocument) -> Doc {
         Some("tool_call") => DocKind::ToolCall,
         _ => DocKind::Message,
     };
-    let tool_input = stored.get_first(f.tool_input).and_then(|v| {
-        serde_json::to_value(OwnedValue::from(v.as_value()))
-            .ok()
-            .filter(|v| !v.is_null())
-    });
+    let json = |field: Field| -> Option<Value> {
+        stored.get_first(field).and_then(|v| {
+            serde_json::to_value(OwnedValue::from(v.as_value()))
+                .ok()
+                .filter(|v| !v.is_null())
+        })
+    };
+    let tool_input = json(f.tool_input);
+    let bash_cmd = json(f.bash_cmd);
 
     Doc {
         doc_id: s(f.doc_id).unwrap_or_default(),
@@ -805,6 +867,7 @@ pub fn doc_from_stored(f: &Fields, stored: &TantivyDocument) -> Doc {
         tool_name: s(f.tool_name),
         tool_use_id: s(f.tool_use_id),
         tool_input,
+        bash_cmd,
         is_error: flag(f.is_error),
         is_sidechain: flag(f.is_sidechain),
         is_meta: flag(f.is_meta),
@@ -908,6 +971,7 @@ pub(crate) mod testkit {
             tool_name: None,
             tool_use_id: None,
             tool_input: None,
+            bash_cmd: None,
             is_error: false,
             is_sidechain: false,
             is_meta: false,
@@ -951,6 +1015,7 @@ pub(crate) mod testkit {
         d.tool_name = Some("Bash".into());
         d.tool_use_id = Some("toolu_1".into());
         d.tool_input = Some(json!({"command": "cargo build --release", "timeout": 600000}));
+        d.bash_cmd = crate::bash::extract("cargo build --release").map(|c| c.to_json());
         d.text = "cargo build --release\nCompiling tantivy".into();
         docs.push(d);
 
@@ -968,6 +1033,7 @@ pub(crate) mod testkit {
         d.role = "assistant".into();
         d.tool_name = Some("Bash".into());
         d.tool_input = Some(json!({"command": "cargo test"}));
+        d.bash_cmd = crate::bash::extract("cargo test").map(|c| c.to_json());
         d.text = "cargo test\nerror: test failed".into();
         d.is_error = true;
         docs.push(d);
@@ -1713,6 +1779,225 @@ mod tests {
         let r = search(&index, &f, &r1).unwrap();
         let hit = r.hits.iter().find(|h| h.doc.thinking.is_some()).unwrap();
         assert!(hit.snippet.contains("parsnips"), "{:?}", hit.snippet);
+    }
+
+    // -- --program / bash_cmd -----------------------------------------------
+
+    /// Docs parsed out of a fixture and indexed, so the whole chain is under test:
+    /// `parse::tool_call_doc` -> `bash::extract` -> `schema::doc_to_json` -> the index.
+    fn bash_fixture() -> (tantivy::Index, Fields, Vec<Doc>) {
+        let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/bash_commands.jsonl");
+        let out =
+            crate::parse::parse_whole(&fixture, &crate::parse::ParseOptions::default()).unwrap();
+        let (index, f) = index_docs(&out.docs);
+        (index, f, out.docs)
+    }
+
+    /// `--program cargo` finds the Bash documents that ran cargo — and nothing else, including
+    /// the `Read` call whose `file_path` merely mentions the crate.
+    #[test]
+    fn program_filter_finds_bash_docs_and_nothing_else() {
+        let (index, f, docs) = bash_fixture();
+
+        // Only Bash calls carry `bash_cmd`, and only when the command parsed.
+        let with_bash_cmd: Vec<&Doc> = docs.iter().filter(|d| d.bash_cmd.is_some()).collect();
+        assert_eq!(with_bash_cmd.len(), 2, "{docs:#?}");
+        assert!(
+            with_bash_cmd
+                .iter()
+                .all(|d| d.tool_name.as_deref() == Some("Bash"))
+        );
+        assert!(
+            docs.iter()
+                .any(|d| d.tool_name.as_deref() == Some("Read") && d.bash_cmd.is_none()),
+            "a non-Bash tool must not get a bash_cmd"
+        );
+        // `echo 'unterminated` does not parse: no bash_cmd, and no guess either.
+        assert!(
+            docs.iter()
+                .any(|d| d.text.contains("unterminated") && d.bash_cmd.is_none())
+        );
+
+        let total = |programs: &[&str]| {
+            let mut r0 = SearchRequest::default();
+            r0.filters.program = programs.iter().map(|p| (*p).to_string()).collect();
+            search(&index, &f, &r0).unwrap()
+        };
+
+        let r = total(&["cargo"]);
+        assert_eq!(r.total, 1, "{:?}", texts(&r));
+        assert_eq!(r.hits[0].doc.tool_name.as_deref(), Some("Bash"));
+        assert_eq!(
+            r.hits[0].doc.bash_cmd.as_ref().unwrap()["program"],
+            json!(["cargo", "tail"])
+        );
+
+        // `git` runs in the second command; `cd` and `tail` are found the same way, because
+        // every simple command in the script contributes its program.
+        assert_eq!(total(&["git"]).total, 1);
+        assert_eq!(total(&["cd"]).total, 1);
+        assert_eq!(total(&["tail"]).total, 1);
+        // The `Read` call is not a Bash script; `echo` never parsed.
+        assert_eq!(total(&["Read"]).total, 0);
+        assert_eq!(total(&["echo"]).total, 0);
+        assert_eq!(total(&["nosuchprogram"]).total, 0);
+    }
+
+    #[test]
+    fn repeated_program_flags_are_ored() {
+        let (index, f, _) = bash_fixture();
+        let total = |programs: &[&str]| {
+            let mut r0 = SearchRequest::default();
+            r0.filters.program = programs.iter().map(|p| (*p).to_string()).collect();
+            search(&index, &f, &r0).unwrap().total
+        };
+        assert_eq!(total(&["cargo"]), 1);
+        assert_eq!(total(&["git"]), 1);
+        assert_eq!(total(&["cargo", "git"]), 2, "OR, not AND");
+        assert_eq!(total(&["cargo", "nosuchprogram"]), 1);
+        // Both programs live in the *same* script, so an OR still yields one document.
+        assert_eq!(total(&["git", "cd"]), 1);
+        // Empty values are skipped, exactly as `--tool` does.
+        assert_eq!(
+            total(&["", "   "]),
+            5,
+            "no clause at all: every doc matches"
+        );
+        assert_eq!(total(&["", "cargo"]), 1);
+    }
+
+    /// `--program` ANDs with everything else, and combines with the corpus' hand-made docs.
+    #[test]
+    fn program_filter_ands_with_the_other_filters() {
+        let (index, f) = index_docs(&corpus());
+        let mut r0 = SearchRequest::default();
+        r0.filters.program = vec!["cargo".into()];
+        let r = search(&index, &f, &r0).unwrap();
+        assert_eq!(r.total, 2, "{:?}", texts(&r));
+
+        r0.filters.errors_only = true;
+        let r = search(&index, &f, &r0).unwrap();
+        assert_eq!(r.total, 1, "{:?}", texts(&r));
+        assert!(r.hits[0].doc.text.starts_with("cargo test"));
+
+        // A program that ran, ANDed with a query that does not match it, is still empty.
+        let mut r1 = req("parsnips");
+        r1.filters.program = vec!["cargo".into()];
+        assert_eq!(search(&index, &f, &r1).unwrap().total, 0);
+    }
+
+    #[test]
+    fn facets_over_bash_cmd_program_bucket_every_command_in_the_script() {
+        let (index, f, _) = bash_fixture();
+        let counts = facets(&index, &f, "bash_cmd.program", &SearchRequest::default()).unwrap();
+        let map: BTreeMap<_, _> = counts
+            .values
+            .iter()
+            .map(|c| (c.value.as_str(), c.count))
+            .collect();
+        assert_eq!(map.get("cargo"), Some(&1));
+        assert_eq!(map.get("tail"), Some(&1));
+        assert_eq!(map.get("cd"), Some(&1));
+        assert_eq!(map.get("git"), Some(&1));
+        assert_eq!(map.len(), 4, "{map:?}");
+        // Five documents in the fixture (one prompt, four tool calls); two carry a bash_cmd.
+        assert_eq!(counts.matching_docs, 5);
+        // `bash_cmd.program` is *multi-valued*: one document lands in one bucket per program
+        // it ran, so the bucket counts sum to 4 — more than the two documents that carry the
+        // field. `docs_with_value` counts documents, not values, so it stays at 2 and can
+        // never exceed `matching_docs`.
+        assert_eq!(counts.values.iter().map(|c| c.count).sum::<u64>(), 4);
+        assert_eq!(counts.docs_with_value, 2);
+        assert!(counts.docs_with_value <= counts.matching_docs);
+
+        // Arguments bucket the same way, whole and unmangled.
+        let args = facets(&index, &f, "bash_cmd.args", &SearchRequest::default()).unwrap();
+        let args: BTreeMap<_, _> = args
+            .values
+            .iter()
+            .map(|c| (c.value.as_str(), c.count))
+            .collect();
+        assert_eq!(args.get("--release"), Some(&1), "{args:?}");
+        assert_eq!(args.get("--short"), Some(&1));
+        assert_eq!(args.get("/tmp/x"), Some(&1));
+
+        // And the other direction: a match set of documents that cannot carry `bash_cmd`
+        // reports zero, well *below* `matching_docs` rather than above it.
+        let mut messages = SearchRequest::default();
+        messages.filters.kind = Some("message".into());
+        let counts = facets(&index, &f, "bash_cmd.program", &messages).unwrap();
+        assert!(counts.matching_docs > 0);
+        assert_eq!(counts.docs_with_value, 0);
+    }
+
+    /// The free-text side of the same field: `bash_cmd` is not in the default fields, but a
+    /// qualified `field:value` reaches it — and the `raw` tokenizer keeps the value exact.
+    #[test]
+    fn a_free_text_query_on_bash_cmd_is_exact_not_tokenized() {
+        let (index, f, _) = bash_fixture();
+        let total = |query: &str| search(&index, &f, &req(query)).unwrap().total;
+
+        // Quoted, because a bare leading `-` is negation in the query grammar.
+        assert_eq!(total(r#"bash_cmd.args:"--release""#), 1);
+        assert_eq!(total(r#"bash_cmd.args:"--short""#), 1);
+        assert_eq!(total("bash_cmd.program:cargo"), 1);
+        assert_eq!(total("bash_cmd.program:git"), 1);
+
+        // The raw tokenizer, proven at the query parser: no case folding, no splitting on
+        // punctuation, no stripping of leading dashes. If any of these starts hitting, the
+        // exactness `--program` promises is gone.
+        assert_eq!(total("bash_cmd.program:Cargo"), 0, "case-sensitive");
+        assert_eq!(total("bash_cmd.program:CARGO"), 0);
+        assert_eq!(
+            total("bash_cmd.args:release"),
+            0,
+            "dashes are part of the term"
+        );
+        assert_eq!(total("bash_cmd.args:short"), 0);
+        assert_eq!(total(r#"bash_cmd.args:"/tmp/x""#), 1);
+        assert_eq!(
+            total("bash_cmd.args:tmp"),
+            0,
+            "a path is one term, not three"
+        );
+        // ...and the filter agrees with the query on case.
+        let mut r0 = SearchRequest::default();
+        r0.filters.program = vec!["Cargo".into()];
+        assert_eq!(search(&index, &f, &r0).unwrap().total, 0);
+    }
+
+    /// A `--program` value is quoted and escaped before it reaches the query parser, so a
+    /// character the grammar reserves is an empty result rather than a failed search.
+    #[test]
+    fn an_odd_program_value_is_matched_literally_not_parsed() {
+        let (index, f, _) = bash_fixture();
+        for value in ["(", "a\"b", "a\\b", "AND", "*", "cargo build"] {
+            let mut r0 = SearchRequest::default();
+            r0.filters.program = vec![value.to_string()];
+            let r = search(&index, &f, &r0);
+            assert_eq!(r.unwrap().total, 0, "{value:?} should just not match");
+        }
+    }
+
+    /// `bash_cmd` has to survive the round trip into the index like `tool_input` does, or
+    /// `--json` output and `show` would drop the one field `--program` filtered on.
+    #[test]
+    fn bash_cmd_round_trips_out_of_the_stored_document() {
+        let (index, f, _) = bash_fixture();
+        let mut r0 = SearchRequest::default();
+        r0.filters.program = vec!["git".into()];
+        let r = search(&index, &f, &r0).unwrap();
+        let got = r.hits[0].doc.bash_cmd.clone().expect("stored bash_cmd");
+        assert_eq!(
+            got,
+            json!({"program": ["cd", "git"], "args": ["/tmp/x", "status", "--short"]})
+        );
+        // A document with no bash_cmd reads back as None, not as an empty object.
+        let mut r1 = SearchRequest::default();
+        r1.filters.tool = vec!["Read".into()];
+        let r = search(&index, &f, &r1).unwrap();
+        assert!(r.hits[0].doc.bash_cmd.is_none());
     }
 
     #[test]

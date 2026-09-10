@@ -64,6 +64,14 @@ pub struct Doc {
     pub tool_name: Option<String>,
     pub tool_use_id: Option<String>,
     pub tool_input: Option<Value>,
+    /// Structured view of a Bash `tool_input.command` — `{"program": [...], "args": [...]}`
+    /// as produced by [`crate::bash::extract`]. `None` for every other tool, and for a
+    /// command the shell grammar rejects.
+    ///
+    /// `#[serde(default)]` because a `Doc` also travels inside [`ParseCarry`] in
+    /// `state.json`: state written before this field existed must still load.
+    #[serde(default)]
+    pub bash_cmd: Option<Value>,
     pub is_error: bool,
     pub is_sidechain: bool,
     /// Compaction summaries, meta turns — excluded from "human prompt".
@@ -1064,6 +1072,21 @@ impl<'a> Parser<'a> {
         let remaining = self.opts.max_text_bytes.saturating_sub(body.len());
         body.push_str(&truncate(&outcome.text, remaining));
 
+        // `bash_cmd` is a Bash-only structured view of the command line, so `--program cargo`
+        // finds every script that ran `cargo` anywhere — inside a pipeline, an `&&` chain or a
+        // loop body — which searching the raw command text cannot do without also matching
+        // `--cargo-flag` or a path segment.
+        let bash_cmd = (tu.name.as_deref() == Some("Bash"))
+            .then(|| {
+                tu.input
+                    .as_ref()
+                    .and_then(|input| input.get("command"))
+                    .and_then(Value::as_str)
+                    .and_then(crate::bash::extract)
+                    .map(|cmd| cmd.to_json())
+            })
+            .flatten();
+
         PartialDoc::tool_call(
             tu.name.clone(),
             tu.id.clone(),
@@ -1071,6 +1094,7 @@ impl<'a> Parser<'a> {
             body,
             outcome.is_error,
         )
+        .bash_cmd(bash_cmd)
     }
 
     fn attachment_docs(&mut self, a: &AttachmentRecord, out: &mut Vec<PartialDoc>) {
@@ -1178,6 +1202,7 @@ impl<'a> Parser<'a> {
             tool_name: p.tool_name,
             tool_use_id: p.tool_use_id,
             tool_input: p.tool_input,
+            bash_cmd: p.bash_cmd,
             is_error: p.is_error,
             is_sidechain,
             is_meta: p.is_meta || common.is_some_and(|c| c.is_meta),
@@ -1205,6 +1230,7 @@ struct PartialDoc {
     tool_name: Option<String>,
     tool_use_id: Option<String>,
     tool_input: Option<Value>,
+    bash_cmd: Option<Value>,
     is_error: bool,
     is_meta: bool,
 }
@@ -1220,6 +1246,7 @@ impl PartialDoc {
             tool_name: None,
             tool_use_id: None,
             tool_input: None,
+            bash_cmd: None,
             is_error: false,
             is_meta: false,
         }
@@ -1241,6 +1268,7 @@ impl PartialDoc {
             tool_name,
             tool_use_id,
             tool_input,
+            bash_cmd: None,
             is_error,
             is_meta: false,
         }
@@ -1256,6 +1284,10 @@ impl PartialDoc {
     }
     fn thinking(mut self, thinking: Option<String>) -> Self {
         self.thinking = thinking;
+        self
+    }
+    fn bash_cmd(mut self, bash_cmd: Option<Value>) -> Self {
+        self.bash_cmd = bash_cmd;
         self
     }
     fn meta(mut self, is_meta: bool) -> Self {
@@ -1650,6 +1682,47 @@ mod tests {
         assert_eq!(
             read.tool_input.as_ref().unwrap()["file_path"],
             "/home/user/session-search/src/index.rs"
+        );
+    }
+
+    /// `bash_cmd` is filled for `Bash` and only for `Bash`, from `tool_input.command`.
+    #[test]
+    fn bash_tool_calls_carry_a_parsed_command() {
+        let (out, _) = parse("bash_commands.jsonl");
+        let by_id = |id: &str| {
+            out.docs
+                .iter()
+                .find(|d| d.tool_use_id.as_deref() == Some(id))
+                .unwrap()
+        };
+
+        // Every simple command in the script contributes its program, pipeline included.
+        assert_eq!(
+            by_id("toolu_1").bash_cmd,
+            Some(serde_json::json!({
+                "program": ["cargo", "tail"],
+                "args": ["build", "--release", "-20"],
+            })),
+        );
+        // `&&` chain; the redirect target `2>&1` above and here contribute no args.
+        assert_eq!(
+            by_id("toolu_2").bash_cmd,
+            Some(serde_json::json!({
+                "program": ["cd", "git"],
+                "args": ["/tmp/x", "status", "--short"],
+            })),
+        );
+        // Another tool's input is never parsed as a shell command...
+        assert_eq!(by_id("toolu_3").tool_name.as_deref(), Some("Read"));
+        assert_eq!(by_id("toolu_3").bash_cmd, None);
+        // ...and a command the grammar rejects gets nothing rather than a guess.
+        assert_eq!(by_id("toolu_4").tool_name.as_deref(), Some("Bash"));
+        assert_eq!(by_id("toolu_4").bash_cmd, None);
+        // Messages are not tool calls.
+        assert!(
+            out.docs
+                .iter()
+                .all(|d| d.kind == DocKind::ToolCall || d.bash_cmd.is_none())
         );
     }
 
@@ -2163,8 +2236,13 @@ mod tests {
         );
 
         std::fs::write(&path, format!("{head}{tail}")).unwrap();
+        // Through serde, because that is how `index.rs` hands a carry to the next run: it
+        // lives in `state.json` between processes, so a `Doc` field that does not survive the
+        // round trip is silently dropped from the completed document.
+        let carried: ParseCarry =
+            serde_json::from_str(&serde_json::to_string(&first.carry).unwrap()).unwrap();
         let ctx = FileContext {
-            carry: first.carry.clone(),
+            carry: carried,
             ..FileContext::default()
         };
         let (second, _) = parse_file(
@@ -2198,6 +2276,13 @@ mod tests {
         assert_eq!(second.replacements[0].seq, expected.seq);
         assert_eq!(second.replacements[0].text, expected.text);
         assert!(second.replacements[0].text.contains("Finished"));
+        // Including `bash_cmd`: it is computed when the `tool_use` is read, so a completion
+        // that rebuilt the document instead of carrying it would lose the field entirely.
+        assert_eq!(
+            second.replacements[0].bash_cmd,
+            Some(serde_json::json!({ "program": ["cargo"], "args": ["build"] })),
+        );
+        assert_eq!(second.replacements[0].bash_cmd, expected.bash_cmd);
 
         // Without the carry the same tail invents a second half-document instead.
         let (naive, _) = parse_file(

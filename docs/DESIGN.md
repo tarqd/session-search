@@ -18,6 +18,15 @@ errors. A CLI now; an `mcp` subcommand serving the same operations over stdio ne
   expands a hit to surrounding turns on demand.
 - **Indexed text:** user prompts, assistant text, tool inputs, tool results (size-capped).
   Assistant **thinking is stored but not indexed** — `--include-thinking` opts in, default off.
+- **Bash commands are indexed structurally as well as textually.** Every `Bash` tool-call
+  document carries `bash_cmd` — `{"program": [...], "args": [...]}`, the `argv[0]` of *every*
+  simple command in the script (pipelines, `&&` chains, subshells, loop and function bodies)
+  plus every suffix word — parsed with `brush-parser` (`src/bash.rs`). It is tokenized **raw**,
+  unlike `tool_input`: these are exact-match facts, so `--release` stays `--release` rather
+  than being split into `release`, and matching is case-sensitive (`Cargo` is not `cargo`).
+  That is what lets `--program cargo` mean "ran cargo" instead of "the command text mentions
+  cargo somewhere", which also matches `--cargo-flag` or a path segment. A command the shell
+  grammar rejects gets no `bash_cmd` at all; there is no heuristic fallback.
 - **Incremental one-shot indexing** keyed on (size, mtime, byte offset) per file.
   The read commands (`search`, `facets`, `show`, `sessions`) auto-refresh unless `--no-refresh`;
   `stats` never opens the index at all. `--include-thinking` is an *index-time* choice — turning
@@ -104,7 +113,7 @@ overridable with `--index` / `$SESSION_SEARCH_INDEX`.
 
 ```
 <index>/tantivy/        the Tantivy index
-<index>/state.json      { "files": { "<abs path>": {size, mtime_ms, byte_offset, docs, carry} }, "version": 1 }
+<index>/state.json      { "files": { "<abs path>": {size, mtime_ms, byte_offset, docs, carry} }, "version": 2 }
 <index>/sessions.json   { "<abs transcript path>": SessionInfo }
 ```
 
@@ -160,6 +169,11 @@ pub struct Doc {
     pub tool_name: Option<String>,
     pub tool_use_id: Option<String>,
     pub tool_input: Option<serde_json::Value>,
+    /// `bash::extract(tool_input.command).to_json()` for a `Bash` call whose command parses;
+    /// `None` for every other tool and for a command the shell grammar rejects.
+    /// `#[serde(default)]`: a `Doc` also travels inside `ParseCarry` in `state.json`.
+    #[serde(default)]
+    pub bash_cmd: Option<serde_json::Value>,
     pub is_error: bool,
     pub is_sidechain: bool,
     pub is_meta: bool,           // compaction summaries, meta turns — excluded from "human prompt"
@@ -285,6 +299,7 @@ Field names and options:
 | `session_id`, `agent_id`, `agent_type`, `project`, `git_branch`, `role`, `kind`, `model`, `tool_name`, `entrypoint`, `permission_mode`, `version`, `slug` | `STRING \| STORED \| FAST` |
 | `project_facet` | `FacetOptions` — hierarchical, `/home/user/session-search` |
 | `tool_input` | JSON, indexed + `set_fast(Some("raw"))` + `set_expand_dots_enabled()` + stored |
+| `bash_cmd` | JSON, stored + indexed with tokenizer `"raw"` / `IndexRecordOption::Basic` + `set_fast(Some("raw"))` + `set_expand_dots_enabled()`. `{"program": [..], "args": [..]}` from `bash::extract`; emitted only when `Some`. The `raw` tokenizer is the point: exact-match facts, so `--release` stays `--release` and matching is case-sensitive |
 | `text` | `TEXT \| STORED` |
 | `thinking` | `TEXT \| STORED` (only populated when `include_thinking`) |
 | `timestamp` | date field, `INDEXED \| STORED \| FAST` (tantivy 0.26 has no `DATE` flag const; `add_date_field` takes the numeric flags) |
@@ -340,6 +355,7 @@ Incremental rules:
 #[derive(Debug, Clone, Default)]
 pub struct Filters {
     pub project: Option<String>, pub tool: Vec<String>, pub tool_input: Vec<String>, // "key=value"
+    pub program: Vec<String>,    // any simple command's argv[0] in a Bash script; repeatable, OR
     pub branch: Option<String>, pub model: Option<String>, pub role: Option<String>,
     pub kind: Option<String>, pub session: Option<String>, pub agent_type: Option<String>,
     pub since: Option<String>, pub until: Option<String>,   // RFC3339 or YYYY-MM-DD or "7d"
@@ -387,7 +403,10 @@ up, so do not advertise `term~1`. A query that fails to parse falls back to
 `parse_query_lenient`, and the discarded errors are logged at WARN — a typo'd field name must
 not look like an empty corpus. Filters are ANDed on top as term/range queries. `--tool-input
 k=v` becomes a term query on `tool_input.k` for `v`; an empty key *or value* is an error, not a
-silent zero. `project` matches by prefix **on a path boundary**, so `-p ~/code` catches
+silent zero. `--program` is the same construction over `bash_cmd.program`, ORed across
+repeats and ANDed with everything else; because `bash_cmd` is tokenized `raw` the value matches
+whole and case-sensitively, and empty values are skipped rather than rejected.
+`project` matches by prefix **on a path boundary**, so `-p ~/code` catches
 subdirectories but `-p ~/code` does not catch `~/code-scratch`; `--session` is a bare character
 prefix, so the leading block of a uuid is enough (`show` resolves an unambiguous id prefix the
 same way, and errors when it is ambiguous). `--limit 0` returns totals and facets with no hits,
@@ -438,7 +457,7 @@ session-search show <SESSION_ID> [--agent AGENT_ID] [--around UUID|SEQ]
 session-search sessions [FILTERS] [--limit N] [--json] [--no-refresh]
 session-search stats [--json]
 
-FILTERS: -p/--project P  -t/--tool T  --tool-input k=v  --branch B  --model M
+FILTERS: -p/--project P  -t/--tool T  --tool-input k=v  --program NAME  --branch B  --model M
          --role R  --kind message|tool_call  --session S  --agent-type A
          --since D  --until D  --errors-only  --no-sidechains  --sidechains-only
 ```
@@ -447,7 +466,11 @@ Global: `--index DIR` (`$SESSION_SEARCH_INDEX`), `-v/--verbose`, `--no-color` (`
 
 **`FIELD` for `facets`** is any fast field name (`tool_name`, `project`, `model`,
 `git_branch`, `role`, `kind`, `agent_type`, `entrypoint`) **or any JSON path** such as
-`tool_input.file_path`, `tool_input.command`, `tool_input.pattern`.
+`tool_input.file_path`, `tool_input.command`, `tool_input.pattern`, `bash_cmd.program`,
+`bash_cmd.args`. The `bash_cmd` paths are multi-valued: a script that runs four programs lands
+in four buckets, so the bucket counts total *values*, not documents — they can run above the
+match set (many programs per Bash call) or far below it (most matched documents are not Bash
+calls at all). `docs_with_value` is a document count either way, so it never exceeds the match.
 
 ## MCP readiness (next step — do not build now)
 
