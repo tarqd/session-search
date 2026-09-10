@@ -782,7 +782,7 @@ async fn sessions_list(
     // The same list `session-search sessions` warns about, rendered as sentences instead: this
     // surface has no stderr a caller can read, so a filter it could not apply has to travel in
     // the response body or it does not travel at all.
-    let warnings = sessions::unanswerable_filter_notes(&filters);
+    let warnings = sessions::unanswerable_filter_notes(&filters, sessions::SearchSurface::HttpApi);
     for warning in &warnings {
         tracing::warn!(warning, "session filter ignored");
     }

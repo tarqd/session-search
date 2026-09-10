@@ -180,6 +180,17 @@ pub struct TurnSkeleton {
     pub dropped: usize,
     /// Rendered size of `lines`, newlines included.
     pub bytes: usize,
+    /// Documents of the turn this skeleton was rendered from.
+    ///
+    /// Fewer than `docs_in_turn` means the *document* cap bit before the byte budget was ever
+    /// reached, so `dropped` describes only the part that was fetched. The two caps are
+    /// independent and a skeleton that reported one of them would read as complete.
+    pub shown: usize,
+    /// Documents the turn holds in full. A sidechain is a single turn covering an entire
+    /// subagent transcript, so this is routinely far larger than `shown`.
+    pub docs_in_turn: usize,
+    /// `docs_in_turn > shown`, said out loud so nobody has to compare two numbers to notice.
+    pub truncated: bool,
 }
 
 /// The pair that addresses one turn. Pass it back exactly as it was returned.
@@ -394,19 +405,17 @@ count of failures and the exit status are at the bottom, under thousands of line
 Combines with `head`.")]
     pub tail: Option<usize>,
     /// Return only lines matching this regex, with `context` lines either side.
-    //
-    // `slice::Pattern` owns the grammar this actually implements and is still settling — it began
-    // as literal-substring matching and Cargo.toml now carries `regex` for it. The description
-    // below is the prose written for this field; `pattern_warning` on the response is the runtime
-    // channel for whatever the grammar cannot do, because the failure here is silent and severe:
-    // a caller that sends `.*error.*`, gets zero matches and is told only "0 matched" will report
-    // that the build had no errors. Re-read `slice.rs` before shipping and make the two agree.
     #[schemars(description = "\
-A regular expression; only matching lines are returned, each with `context` lines either side. \
-Use it when you know what you are looking for in a large output and neither end will have it — \
-a specific test name, a file path, a status code. Applied before `max_bytes`, so a grep that \
-matches thousands of lines can still be truncated; the response says how many lines matched and \
-how many were returned, so a capped grep never reads as a complete one.")]
+A regular expression, in the `regex` crate's syntax; only matching lines are returned, each with \
+`context` lines either side. Use it when you know what you are looking for in a large output and \
+neither end will have it — a specific test name, a file path, a status code. Matching is applied \
+one line at a time, so `^` and `$` anchor to a line without the multiline flag and no pattern can \
+match across a line break. Case-sensitive like grep(1); write `(?i)` for otherwise. A pattern \
+that does not compile is rejected with the syntax error, before any output is read — it never \
+degrades to zero matches, because a caller told only \"0 matched\" would report a log full of \
+errors as clean. Applied before `max_bytes`, so a grep that matches thousands of lines can still \
+be truncated; the response says how many lines matched and how many were returned, so a capped \
+grep never reads as a complete one.")]
     pub grep: Option<String>,
     /// Lines of context either side of each `grep` match. Ignored without `grep`.
     pub context: usize,
@@ -474,10 +483,6 @@ pub struct GetOutputResponse {
     /// True only when `output` is the entire original. The one question to ask before
     /// summarising a slice as if it were the whole log.
     pub complete: bool,
-    /// Set when the `grep` pattern could not be honoured as written — an operator this engine
-    /// treats literally, a pattern that failed to compile. Read it before concluding that zero
-    /// matches means the output is clean.
-    pub pattern_warning: Option<String>,
     pub envelope: Envelope,
 }
 

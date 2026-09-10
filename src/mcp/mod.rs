@@ -428,11 +428,34 @@ pub fn from_filter_error(err: &FilterError) -> ErrorData {
     invalid_params(format!("{err:#}"))
 }
 
+/// A request a tool could not start on: an address that names nothing, two addresses at once, a
+/// field this index cannot count, a `grep` that is not a regex.
+///
+/// One type for all four tools rather than one per tool, because the classification is the same
+/// everywhere and [`from_anyhow`] has to recognise it: a second type is a second arm somebody
+/// forgets to add, and the symptom is silent — the message still arrives, labelled as the
+/// server's fault. An `internal_error` tells the caller to stop; an `invalid_params` tells it to
+/// send something different. Only that second reading is true here.
+///
+/// Carried as `anyhow` inside the tool bodies so they read like the rest of the crate, and
+/// classified once, at the boundary, exactly as [`FilterError`] is.
+#[derive(Debug, thiserror::Error)]
+#[error("{0}")]
+pub struct CallerError(pub String);
+
+/// Build a [`CallerError`] as an `anyhow::Error`, ready to `return Err(...)` from a tool body.
+pub fn caller_error(message: impl Into<String>) -> anyhow::Error {
+    anyhow::Error::new(CallerError(message.into()))
+}
+
 /// Anything a tool body failed with. Kept as `anyhow` down there so tool code reads like the
 /// rest of the crate; the classification happens once, here.
 fn from_anyhow(err: &anyhow::Error) -> ErrorData {
     if let Some(filter) = err.downcast_ref::<FilterError>() {
         return from_filter_error(filter);
+    }
+    if err.downcast_ref::<CallerError>().is_some() {
+        return invalid_params(format!("{err:#}"));
     }
     ErrorData::internal_error(format!("{err:#}"), None)
 }

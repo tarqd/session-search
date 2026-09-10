@@ -14,8 +14,9 @@
 //! to a reader of either one, and a third front end would have made it a three-way disagreement.
 //!
 //! What stays with each front end is only how it *reports*: the CLI logs a `tracing::warn!`, the
-//! HTTP API returns the sentences in the response body. The list itself is
-//! [`unanswerable_filters`], here, once.
+//! HTTP API returns the sentences in the response body, the MCP tool carries them in its
+//! envelope's `warnings`, and each names the search surface its own caller can reach (see
+//! [`SearchSurface`]). The list itself is [`unanswerable_filters`], here, once.
 
 use crate::parse::SessionInfo;
 use crate::search::{self, Edge, Filters, when_ms};
@@ -166,23 +167,59 @@ pub fn unanswerable_filters(f: &Filters) -> Vec<&'static str> {
     .collect()
 }
 
+/// The front end asking, and with it the only word of [`unanswerable_filter_notes`] that is not
+/// shared: what its own caller can call the search operation.
+///
+/// The note has to end somewhere a reader can go, and every front end reaches search by a
+/// different name. `/api/search` is a URL an MCP client cannot request and a shell cannot run;
+/// `search_turns` is a tool name nothing outside an MCP session can invoke. A note that names
+/// the wrong one is worse than a note with no pointer at all: it reads as an answer, so the
+/// caller stops looking, and what they were told to do next does not exist for them.
+///
+/// The pointer is a parameter rather than the list being forked, and that is the point of this
+/// module. A second sentence for MCP would have arrived with a second copy of the ten filters
+/// beside it, and the two would have drifted exactly as `cli.rs` and `api/mod.rs` did before the
+/// list was extracted — one surface warning about `--program`, the other about `--min-thinking`,
+/// neither reader able to see the disagreement. One list, one reasoning, three names for the
+/// door out.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SearchSurface {
+    /// `GET /api/sessions`, whose caller can request `GET /api/search`. The original spelling,
+    /// and part of that endpoint's response text since it first returned warnings.
+    HttpApi,
+    /// The `search_sessions` MCP tool, whose caller can call the `search_turns` tool. It has no
+    /// stderr and no way to make an HTTP request; the tool name is the only address it has.
+    McpTool,
+    /// `session-search sessions`, whose reader can run `session-search search` in the same
+    /// shell.
+    Cli,
+}
+
+impl SearchSurface {
+    /// The search operation, spelled the way *this* front end's caller invokes it.
+    pub fn search_pointer(self) -> &'static str {
+        match self {
+            SearchSurface::HttpApi => "/api/search",
+            SearchSurface::McpTool => "the `search_turns` tool",
+            SearchSurface::Cli => "`session-search search`",
+        }
+    }
+}
+
 /// [`unanswerable_filters`] as sentences a caller can be handed verbatim.
 ///
 /// For any front end that answers in data rather than on stderr — the HTTP API's
 /// `warnings` array, and an agent reading a tool result, which has no stderr at all. Each names
-/// the filter, says why the listing could not apply it, and points at the surface that can.
-///
-/// That pointer is spelled `/api/search` because the sentence is the one `GET /api/sessions`
-/// has always returned and its text is part of that response. A front end whose search
-/// operation is not an HTTP route wants the same sentence with its own name for it; parameterise
-/// the pointer then, rather than writing a second list of filters to go with a second sentence.
-pub fn unanswerable_filter_notes(f: &Filters) -> Vec<String> {
+/// the filter, says why the listing could not apply it, and points at the surface that can, in
+/// the dialect [`SearchSurface`] picks.
+pub fn unanswerable_filter_notes(f: &Filters, surface: SearchSurface) -> Vec<String> {
+    let pointer = surface.search_pointer();
     unanswerable_filters(f)
         .into_iter()
         .map(|name| {
             format!(
                 "`{name}` was ignored: a session listing reads sessions.json, which records one \
-                 row per transcript and carries no per-message fields. Use /api/search for it."
+                 row per transcript and carries no per-message fields. Use {pointer} for it."
             )
         })
         .collect()
@@ -239,10 +276,54 @@ mod tests {
         // that answers in data and the surface that answers on stderr cannot report different
         // sets. `cli::tests::the_sessions_command_names_every_filter_it_cannot_apply_as_a_flag`
         // pins the other rendering.
-        let notes = unanswerable_filter_notes(&f);
+        let notes = unanswerable_filter_notes(&f, SearchSurface::HttpApi);
         assert_eq!(notes.len(), expected.len());
         for (note, name) in notes.iter().zip(expected) {
             assert!(note.starts_with(&format!("`{name}` was ignored")), "{note}");
+        }
+    }
+
+    #[test]
+    fn every_front_end_points_the_reader_at_a_surface_it_can_actually_reach() {
+        // One note, three front ends. Everything up to the pointer must be byte-identical —
+        // that is the shared list and the shared reason — and the pointer itself must be
+        // something this particular caller can invoke. An MCP client cannot issue
+        // `GET /api/search`, and a shell cannot either; a note that names it there sends the
+        // reader somewhere that does not exist for them, which reads as an answer and stops
+        // them looking.
+        let f = filters_with(|f| f.model = Some("claude-opus-5".into()));
+        let ending = |surface| {
+            let notes = unanswerable_filter_notes(&f, surface);
+            assert_eq!(notes.len(), 1, "one unanswerable filter, one note");
+            let note = notes[0].clone();
+            let (shared, pointer) = note
+                .split_once("Use ")
+                .map(|(a, b)| (a.to_string(), b.to_string()))
+                .expect("every note ends by naming a surface that can answer it");
+            (shared, pointer)
+        };
+        let (http_shared, http) = ending(SearchSurface::HttpApi);
+        let (mcp_shared, mcp) = ending(SearchSurface::McpTool);
+        let (cli_shared, cli) = ending(SearchSurface::Cli);
+        assert_eq!(http_shared, mcp_shared);
+        assert_eq!(http_shared, cli_shared);
+
+        assert_eq!(http, "/api/search for it.");
+        assert_eq!(mcp, "the `search_turns` tool for it.");
+        assert_eq!(cli, "`session-search search` for it.");
+
+        // The two ways to get this wrong, stated as the reader would hit them: an HTTP route
+        // handed to a caller with no HTTP, and a tool name handed to a caller with no tools.
+        for (surface, unreachable) in [
+            (SearchSurface::McpTool, "/api/"),
+            (SearchSurface::Cli, "/api/"),
+            (SearchSurface::HttpApi, "search_turns"),
+        ] {
+            let note = &unanswerable_filter_notes(&f, surface)[0];
+            assert!(
+                !note.contains(unreachable),
+                "{surface:?} must not name {unreachable}: {note}"
+            );
         }
     }
 
