@@ -154,7 +154,15 @@ minutes earlier, indexed out of the session that is writing this README. The cor
 session you are sitting in.
 
 The query is a real query language, not a substring match: `"quoted phrases"`, `AND`/`OR`/`NOT`
-and `field:value` all work. There is no fuzzy operator — Tantivy 0.26 reads `~` as phrase slop,
+and `field:value` all work. A message is split before it is indexed: its prose is analyzed as
+English, so `compiling` finds `compiled`, while its code blocks, its inline spans and every tool
+result go through an analyzer that never stems. Both halves split identifiers, so a name is
+findable by any of its parts and by any of its spellings wherever it was written — `create`,
+`openOrCreate` and `OpenOrCreate` all find `open_or_create`, in a fence or in a sentence — and
+`"open_or_create"` in quotes is still an exact phrase. A phrase never runs across a code block
+that was lifted out from between two paragraphs. Markdown headings are indexed once more on
+their own and count double, so a hit in a section title outranks the same word in a paragraph.
+There is no fuzzy operator — Tantivy 0.26 reads `~` as phrase slop,
 not edit distance, so `widget~1` is not a near-miss search. A query that fails to parse is
 retried leniently and the discarded parts are reported on stderr, so a typo'd field name does
 not look like an empty corpus.
@@ -235,11 +243,11 @@ session-search search "" --tool-output "test result: ok" --limit 1
       **test** **result**: **ok**. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
 ```
 
-The call and its result are two fields, so you can ask about either one alone:
+The call and its result are separate fields, so you can ask about either one alone:
 
 | query | matches |
 | --- | --- |
-| `Compiling` | 14 — both fields, the default |
+| `Compiling` | 14 — every body field, the default |
 | `text:Compiling` | 10 — the tool name and its input only |
 | `tool_output:Compiling` | 5 — what the tool actually printed |
 
@@ -739,6 +747,8 @@ Accepted by `search`, `facets` and `sessions`:
                                 command=cargo`; repeatable
       --tool-output <TEXT>      Phrase the tool's *output* must contain, e.g. `--tool-output "No
                                 such file"`; repeatable, and ANDed
+      --lang <LANG>             Fenced-code language, as written in the info string (`rust`,
+                                `bash`); repeatable
       --min-thinking <N>        Only turns where the model spent at least N thinking tokens. Works
                                 even where the thinking text itself was stripped before it reached
                                 disk, which is the case for remote and web sessions
@@ -770,8 +780,8 @@ b20208d8-fbdb-5918-ba69-d203de6ed6dc  wild-spinning-puppy  agent a02e0e345842f6e
   harden:docs
 ```
 
-The ignored set is `--tool`, `--tool-input`, `--tool-output`, `--program`, `--model`, `--role`,
-`--kind`, `--errors-only`.
+The ignored set is `--tool`, `--tool-input`, `--tool-output`, `--program`, `--lang`, `--model`,
+`--role`, `--kind`, `--errors-only`.
 
 ### `index`
 
@@ -810,7 +820,8 @@ Arguments:
   [QUERY]  Query string: words, "phrases", AND/OR/NOT, `field:value`
 
 Options:
-      --facets <FIELD>    Comma-separated facet fields, e.g. `tool_name,tool_input.file_path`
+      --facets <FIELD>    Comma-separated facet fields, e.g.
+                          `tool_name,code_lang,tool_input.file_path`
       --index <DIR>       Index directory. Defaults to `$XDG_DATA_HOME/session-search` [env:
                           SESSION_SEARCH_INDEX=]
       --context <N>       Also show N turns either side of each hit [default: 0]
@@ -836,8 +847,9 @@ Count values of a fast field or any `tool_input.<path>`
 Usage: session-search facets [OPTIONS] <FIELD>
 
 Arguments:
-  <FIELD>  `tool_name`, `project`, `model`, `git_branch`, `role`, `kind`, `agent_type`,
-           `entrypoint`, or a JSON path such as `tool_input.file_path`
+  <FIELD>  `tool_name`, `code_lang`, `project`, `model`, `git_branch`, `role`, `kind`,
+           `agent_type`, `entrypoint`, or a JSON path such as `tool_input.file_path` or
+           `bash_cmd.program`
 
 Options:
       --index <DIR>    Index directory. Defaults to `$XDG_DATA_HOME/session-search` [env:
@@ -993,8 +1005,12 @@ session-search search "aggregation" -t Bash --limit 1 --json --facets tool_name
 
 (Pretty-printed here; the real output is a single line. `snippet`, `source_path`, `text`,
 `tool_output` and `tool_input.command` are truncated with `…` for width — they are complete in
-the actual output. That capture predates `bash_cmd`; a `Bash` hit now also carries the parsed
-command described in [Bash commands, parsed](#bash-commands-parsed).)
+the actual output. This capture, and the search results above it, predate both `bash_cmd` and
+the prose/code split described under [Documents](#documents): a `Bash` hit now also carries the
+parsed command described in [Bash commands, parsed](#bash-commands-parsed), a hit object also
+carries `body`, `code`, `headings` and `code_lang`, `text` is a list of prose blocks rather than
+a string, and a snippet is highlighted out of one of those fields rather than out of their
+concatenation.)
 
 ---
 
@@ -1018,10 +1034,24 @@ merge and old ones are reclaimed.
 One document per message, one per tool call. That granularity is what makes hits precise and
 facets meaningful — a hit points at the exact turn, not at a 400-line session.
 
-A tool call is one document holding both halves in separate fields: `text` carries the tool name
-and the input's own strings, `tool_output` the result that answered it, joined by `tool_use_id`
-across the records they were written in. Each is capped independently (32 KB by default), and
-both are searched by a bare query. The index for this project's own development history:
+A document's body is not one indexed field. A message is markdown, so it is split before
+indexing: its prose goes to `text` (analyzed as English, stemmed — one value per block, so no
+phrase runs across a block that was removed from between two others), its fenced blocks and
+inline spans to `code` (never stemmed), its headings to `headings` (prose, and worth double), and
+each fence's language to `code_lang`, which is a facet like `tool_name`. A tool call is not
+markdown and is never parsed as one: its name and input strings are `text`, and the file content
+of an `Edit` or `Write` is `code`. The body as it was written is kept whole beside them in
+`body`, stored and never indexed: that is what `show`, `--context` and `--json` print, so a
+message reads exactly as it was written rather than as prose-then-code.
+
+A tool call also holds the **result** that answered it, in a field of its own: `tool_output`,
+joined to the call by `tool_use_id` across the records they were written in. It is neither half
+of the split — a result is diagnostics and program output, not markdown — so it is analyzed as
+code and capped independently of the body. Every one of these fields is searched by a bare
+query, and `tool_output:"No such file"` asks about what a tool *returned* rather than what it
+was asked to do.
+
+The index for this project's own development history:
 
 ```bash
 session-search facets role
@@ -1126,7 +1156,8 @@ a single pass produced 49**, and reported 78 tool calls where there were 39.
 
 The fix is a small per-file *carry* in `state.json` (`parse::ParseCarry`): the ids — and the
 documents — a run left unfinished, plus a fingerprint of the last line it consumed. A later tail
-uses it to *complete* the waiting document (same `doc_id`, same `seq`, result text appended)
+uses it to *complete* the waiting document (same `doc_id`, same `seq`, the result added to its
+`code`)
 instead of inventing a second half-empty one, and to recognise a `message.id` it has already
 counted. `src/index.rs` carries the test:
 
@@ -1171,7 +1202,10 @@ model stopped to reason, even when you cannot read what it reasoned about.
 **Changing what is indexed needs `index --full`.** The watermarks say a file is unchanged, so
 they will not re-read it. This applies to `--no-thinking`, `--no-spilled-results`, and to any
 release that changes how a document body is built — for instance the one that split a tool
-call's result out of `text` into its own `tool_output` field.
+call's result out of `text` into its own `tool_output` field, or the one that split a message's
+markdown across `text`, `code` and `headings`. Changing an analyzer forces the rebuild by
+itself: a field's tokenizer name is part of the schema, so the index is discarded and refilled
+on the next run.
 
 **Snippet markers can collide with the text.** Matches are wrapped in `**…**`; if the indexed text
 already contains `**` (this tool's own Markdown output, for instance) you will see `****term****`.
@@ -1195,8 +1229,10 @@ cut. Lower it if you want a `cat` of a minified bundle kept out of the term dict
 through `tool_input.<key>` even when `text` did not copy all of it.
 
 **Everything is local and single-user.** No daemon, no watch mode, no incremental commit while a
-session is in flight; the index is refreshed at query time. There is no ranking tuning, no
-stemming beyond Tantivy's default tokenizer, and no cross-machine sync.
+session is in flight; the index is refreshed at query time. There is no cross-machine sync, and
+the ranking tuning amounts to one field boost on markdown headings. Language handling is English
+only: prose is stemmed by an English stemmer, and the `code` analyzer described above splits
+identifiers and stems nothing.
 
 ---
 
@@ -1210,8 +1246,8 @@ cargo test
 ```
 
 ```
-running 252 tests
-test result: ok. 248 passed; 0 failed; 4 ignored; 0 measured; 0 filtered out; finished in 2.10s
+running 317 tests
+test result: ok. 313 passed; 0 failed; 4 ignored; 0 measured; 0 filtered out; finished in 3.07s
 ```
 
 The four ignored tests all need this machine's own `~/.claude/projects` and are the ones worth

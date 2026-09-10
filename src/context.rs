@@ -78,7 +78,7 @@ mod tests {
         let mut docs = Vec::new();
         for seq in 0..10u64 {
             let mut d = blank_doc(seq);
-            d.text = format!("main turn {seq}");
+            d.body = format!("main turn {seq}");
             if seq % 3 == 0 {
                 d.kind = DocKind::ToolCall;
                 d.tool_name = Some("Bash".into());
@@ -92,7 +92,7 @@ mod tests {
             d.agent_id = Some("a10845c5ff9c7d4ec".into());
             d.agent_type = Some("Explore".into());
             d.is_sidechain = true;
-            d.text = format!("agent turn {seq}");
+            d.body = format!("agent turn {seq}");
             docs.push(d);
         }
         for seq in 0..4u64 {
@@ -100,14 +100,14 @@ mod tests {
             d.doc_id = format!("s2:-:{seq}");
             d.session_id = "s2".into();
             d.source_path = "/tmp/s2.jsonl".into();
-            d.text = format!("other session turn {seq}");
+            d.body = format!("other session turn {seq}");
             docs.push(d);
         }
         docs
     }
 
     fn texts(docs: &[Doc]) -> Vec<String> {
-        docs.iter().map(|d| d.text.clone()).collect()
+        docs.iter().map(|d| d.body.clone()).collect()
     }
 
     #[test]
@@ -188,8 +188,8 @@ mod tests {
         let (index, f) = index_docs(&corpus());
         let all = session(&index, &f, "s1", None, None, 100).unwrap();
         assert_eq!(all.len(), 10);
-        assert_eq!(all.first().unwrap().text, "main turn 0");
-        assert_eq!(all.last().unwrap().text, "main turn 9");
+        assert_eq!(all.first().unwrap().body, "main turn 0");
+        assert_eq!(all.last().unwrap().body, "main turn 9");
         assert!(all.windows(2).all(|w| w[0].seq < w[1].seq));
 
         // The cap takes the *first* docs, not an arbitrary slice.
@@ -280,7 +280,7 @@ mod tests {
             d.doc_id = format!("s1:-:relocated:{seq}");
             d.source_path = "/tmp/relocated/s1.jsonl".into();
             d.project = Some("/home/user/elsewhere".into());
-            d.text = format!("relocated turn {seq}");
+            d.body = format!("relocated turn {seq}");
             docs.push(d);
         }
         let (index, f) = index_docs(&docs);
