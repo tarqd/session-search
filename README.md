@@ -905,26 +905,36 @@ Arguments:
   [QUERY]  Query string: words, "phrases", AND/OR/NOT, `field:value`
 
 Options:
-      --facets <FIELD>    Comma-separated facet fields, e.g.
-                          `tool_name,code_lang,tool_input.file_path`
-      --index <DIR>       Index directory. Defaults to `$XDG_DATA_HOME/session-search` [env:
-                          SESSION_SEARCH_INDEX=]
-      --context <N|turn>  Also show N documents either side of each hit, or `turn` for the hit's
-                          whole enclosing turn — the prompt that opened it, what was tried, and what
-                          came back [default: 0]
-  -v, --verbose...        Raise the log level on stderr; repeatable (`-v` info, `-vv` debug, `-vvv`
-                          trace)
-      --limit <N>         [default: 20]
-      --no-color          Never colourise. Also honoured: a non-empty `$NO_COLOR`, and a non-tty
-                          stdout
-      --offset <N>        [default: 0]
-      --json              One JSON object on stdout instead of the human rendering
-      --no-refresh        Skip the incremental index refresh that normally runs first
-      --include-thinking  Search assistant thinking blocks too
-      --sort <ORDER>      Hit order. Relevance is meaningless without a query, so a filter-only
-                          search is worth ordering by time [default: relevance] [possible values:
-                          relevance, newest, oldest]
-  -h, --help              Print help
+      --facets <FIELD>      Comma-separated facet fields, e.g.
+                            `tool_name,code_lang,tool_input.file_path`
+      --index <DIR>         Index directory. Defaults to `$XDG_DATA_HOME/session-search` [env:
+                            SESSION_SEARCH_INDEX=]
+      --context <N|turn>    Also show N documents either side of each hit, or `turn` for the hit's
+                            whole enclosing turn — the prompt that opened it, what was tried, and
+                            what came back [default: 0]
+  -v, --verbose...          Raise the log level on stderr; repeatable (`-v` info, `-vv` debug,
+                            `-vvv` trace)
+      --limit <N>           [default: 20]
+      --no-color            Never colourise. Also honoured: a non-empty `$NO_COLOR`, and a non-tty
+                            stdout
+      --offset <N>          [default: 0]
+      --json                One JSON object on stdout instead of the human rendering
+      --no-refresh          Skip the incremental index refresh that normally runs first
+      --include-thinking    Search assistant thinking blocks too
+      --sort <ORDER>        Hit order. Relevance is meaningless without a query, so a filter-only
+                            search is worth ordering by time [default: relevance] [possible values:
+                            relevance, newest, oldest]
+      --similar-to <REF>    Rank by similarity to the turn a document reference names. REF is
+                            `SESSION:SEQ`, `SESSION:AGENT:SEQ`, a record uuid or a `doc_id` — any of
+                            them by unambiguous prefix. Composes with the query and with every
+                            filter
+      --similar-in <FIELD>  Which bodies of the source turn seed the similarity: `text` (the
+                            default), `code`, `tool_output`, `thinking`. Comma-separated. `thinking`
+                            additionally needs `--include-thinking` [possible values: text, code,
+                            tool_output, thinking]
+      --include-source      Keep the source turn in the results of a `--similar-to` search. It is
+                            left out by default, because it is the turn you are already looking at
+  -h, --help                Print help (see more with '--help')
 ```
 
 Plus the filter block above.
@@ -998,6 +1008,117 @@ Claude Code transcript carries a timestamp, but a record that ever reaches disk 
 nothing to be sorted by — it still matches, and still counts towards the total, but where it lands
 in a `newest` page means nothing. `--sort relevance` is unaffected.
 
+#### `--similar-to <REF>`: more turns like this one
+
+Sometimes you have found *one* good answer and what you actually want is the rest. A query cannot
+express that: you would have to guess which of the words in front of you were the ones that
+mattered. `--similar-to` takes the document instead.
+
+```bash
+session-search search --similar-to eval-buildfail:2 --limit 4
+```
+
+```
+similar to eval-buildfail:-:7b841ded:2 · turn #0 · 4 docs
+4 of 31 hits · 5 ms
+
+▌ eval-notes  (1 hit)
+▌ /home/user/scratch/notes · main · 2026-08-28 20:00
+
+   1. 20:00:06  assistant  #5  4.58
+      **Compiling** the **release** profile takes about forty seconds; the indexer itself is far quicker
+      **than** **that**
+
+▌ b20208d8-fbdb-5918-ba69-d203de6ed6dc  (2 hits)
+▌ /home/user/code/session-search · eval/turn-seq · 2026-09-03 14:00
+
+   2. 14:00:07  assistant Bash command=cargo build --release  description=Release build  #5  4.40
+      Bash **cargo** build --**release** **Release** build
+
+   4. 14:00:09  assistant Bash command=cargo run --release -- index --full  description=Reb…  #6  3.89
+      Bash **cargo** run --**release** -- index --full Rebuild the index
+
+▌ eval-buildfail  (1 hit)
+▌ /home/user/code/other-tool · eval/release · 2026-08-29 11:00
+
+   3. 11:00:10  assistant Bash command=cargo check --release  description=Release check aga…  #7  4.22
+      Bash **cargo** check --**release** **Release** check again
+```
+
+Four things in that output are decisions rather than accidents.
+
+**The header line says what the reference resolved to.** `eval-buildfail:2` is a prefix — the
+full document is `eval-buildfail:-:7b841ded:2` — so the line names the document, the turn and how
+big the turn is. A reference can be a `seq` coordinate (`SESSION:SEQ`, or `SESSION:AGENT:SEQ` with
+`-` for the main transcript), a record uuid, or a full `doc_id`, and any of them by unambiguous
+prefix. An *ambiguous* prefix is a question, not a guess:
+
+```
+session-search: ambiguous document reference "eval-" matches at least 2: eval-tokenizer:-:cb948e30:0, eval-tokenizer:a10845c5ff9c7d4ec:51f6adf2:0
+```
+
+**The source is the whole turn, not the one document you named.** `turn #0 · 4 docs` — the prompt,
+the failing `cargo check`, and the answer that explained it, all seeding one query. A single tool
+call on its own is mostly a file path and an exit code; the neighbours are what say what it was
+*about*.
+
+**The source turn is left out of the results, and nothing else is.** Hit 3 is from the same
+session — a later turn that ran `cargo check --release` again — and it is exactly the kind of
+answer this is for. What is gone is turn #0 itself, all four documents of it, because the
+four things you already have on screen are not an answer. It is removed by an explicit
+`MustNot` rather than by trusting the ranking to bury it: a turn-shaped seed does *not*
+reliably rank first, so there is nothing to trust. Pass `--include-source` to put it back.
+
+**The scores are BM25 over a query built from the source turn's own terms**, and the highlights
+show which of those terms each hit carried — so the answer to "why is this here?" is on the
+screen, not in the ranker.
+
+It composes with everything else, which is the point:
+
+```bash
+session-search search --similar-to eval-buildfail:2 --similar-in text,tool_output \
+    -p ~/code/session-search --limit 3
+```
+
+```
+similar to eval-buildfail:-:7b841ded:2 · turn #0 · 4 docs
+3 of 19 hits · 10 ms
+
+▌ b20208d8-fbdb-5918-ba69-d203de6ed6dc  (2 hits)
+▌ /home/user/code/session-search · eval/turn-seq · 2026-09-03 14:00
+
+   1. 14:00:07  assistant Bash command=cargo build --release  description=Release build  #5  5.40
+      Bash **cargo** build --**release** **Release** build
+
+   2. 14:00:09  assistant Bash command=cargo run --release -- index --full  description=Reb…  #6  4.89
+      Bash **cargo** run --**release** -- index --full Rebuild the index
+
+▌ eval-tokenizer  (1 hit)
+▌ /home/user/code/session-search · eval/tokenizer · 2026-09-01 09:00
+
+   3. 09:00:03  assistant Read file_path=/home/user/code/session-search/src/tokenizer.rs  #2  2.85
+      pub fn **open_or_create**(dir: &Path) -> Result<Index> { // the caller decides what is_**error** means
+      here
+```
+
+Every filter, a free-text query, `--facets`, `--sort newest`, `--context turn` and paging all work
+alongside it — the similarity is one more ANDed clause, not a separate mode. "More like this, but
+only in this project, only last month, only the ones that errored" is one command.
+
+`--similar-in` picks which bodies of the source turn seed the query: `text` (the default) is the
+prose, and it is what means *about the same thing*; `code` and `tool_output` mean *built out of the
+same identifiers* and *failed the same way*. `thinking` is available and needs
+`--include-thinking`, like everywhere else. `tool_input` is deliberately **not** offered:
+Tantivy's term extraction ignores JSON fields without saying so, and a flag that silently did
+nothing would be worse than no flag.
+
+Two outcomes are worth recognising. A reference whose turn holds no indexed text in the fields you
+chose is an error naming the fields and the flag — never an empty result set that reads as "nothing
+is similar". And a search that comes back empty logs a warning under `-v` saying that the seed's
+terms may all have fallen outside the tuning: too rare, too common, too short, too long. The
+tuning constants and the reason for each are in
+[`docs/DESIGN.md`](docs/DESIGN.md) under **Similarity**.
+
 ### `facets`
 
 ```
@@ -1033,27 +1154,28 @@ Print a session, or the turns around one hit
 Usage: session-search show [OPTIONS] <SESSION_ID>
 
 Arguments:
-  <SESSION_ID>
+  <SESSION_ID>  
 
 Options:
-      --agent <AGENT_ID>   Subagent id, for a sidechain transcript
-      --index <DIR>        Index directory. Defaults to `$XDG_DATA_HOME/session-search` [env:
-                           SESSION_SEARCH_INDEX=]
-      --around <UUID|SEQ>  A doc uuid or a `seq` number; prints a window instead of the whole
-                           session
-  -v, --verbose...         Raise the log level on stderr; repeatable (`-v` info, `-vv` debug, `-vvv`
-                           trace)
-      --no-color           Never colourise. Also honoured: a non-empty `$NO_COLOR`, and a non-tty
-                           stdout
-      --turn               Snap the `--around` window to the enclosing turn instead of counting
-                           documents with `--before`/`--after`. Capped by `--limit`, and what the
-                           cap left out is reported
-      --before <N>         [default: 3]
-      --after <N>          [default: 3]
-      --limit <N>          [default: 200]
-      --json
-      --no-refresh
-  -h, --help               Print help
+      --agent <AGENT_ID>  Subagent id, for a sidechain transcript
+      --index <DIR>       Index directory. Defaults to `$XDG_DATA_HOME/session-search` [env:
+                          SESSION_SEARCH_INDEX=]
+      --around <REF|SEQ>  Where to centre the window: a `seq` number, a record uuid, a
+                          `tool_use_id`, a `doc_id`, or a `SESSION[:AGENT]:SEQ` reference — the same
+                          grammar `search --similar-to` takes, by unambiguous prefix
+  -v, --verbose...        Raise the log level on stderr; repeatable (`-v` info, `-vv` debug, `-vvv`
+                          trace)
+      --no-color          Never colourise. Also honoured: a non-empty `$NO_COLOR`, and a non-tty
+                          stdout
+      --turn              Snap the `--around` window to the enclosing turn instead of counting
+                          documents with `--before`/`--after`. Capped by `--limit`, and what the cap
+                          left out is reported
+      --before <N>        [default: 3]
+      --after <N>         [default: 3]
+      --limit <N>         [default: 200]
+      --json              
+      --no-refresh        
+  -h, --help              Print help
 ```
 
 ### `sessions`
@@ -1720,8 +1842,11 @@ cargo test --all-features
 ```
 
 ```
-running 373 tests
-test result: ok. 369 passed; 0 failed; 4 ignored; 0 measured; 0 filtered out; finished in 4.11s
+running 427 tests                                            # unittests src/lib.rs
+test result: ok. 423 passed; 0 failed; 4 ignored; 0 measured; 0 filtered out; finished in 4.46s
+
+running 6 tests                                              # tests/eval — the retrieval eval
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.66s
 ```
 
 The compiler is pinned: [`rust-toolchain.toml`](rust-toolchain.toml) names the version and the
@@ -1740,6 +1865,45 @@ on real data:
 ```bash
 cargo test --release -- --ignored --nocapture
 ```
+
+### The retrieval eval harness
+
+`tests/eval/` scores search against a checked-in corpus and a graded query fixture, so a change to
+the analyzers, the schema or the query builder can be argued with a number instead of an anecdote.
+It runs as part of `cargo test`; on its own:
+
+```bash
+cargo test --test eval                    # assert: floors, invariants, committed baseline
+cargo test --test eval -- --nocapture     # ...and print the tables
+```
+
+Either way it writes seven artifacts under `target/eval/` (gitignored):
+
+| file | what it is |
+| --- | --- |
+| `report.md` | the per-class table and per-query appendix — the thing a pull request pastes |
+| `ablation.md` | the same fixture scored with and without the `context_text` header |
+| `similar.md` | `--similar-to` scored against a plain text query, with the protocol that makes that comparison mean something |
+| `facets.md` | the aggregation class's bucket tables — what those six queries report instead of a ranking, and the only place that class has a result at all |
+| `hits.md` | every query's ranked hits with the grade each one was given |
+| `similar-hits.md` | the same, for the similarity arm |
+| `corpus.md` | every document in the corpus, its reference and an excerpt |
+
+The committed baselines are `insta` snapshots — one per configuration, under
+`tests/eval/snapshots/` — so the snapshot diff
+*is* the before/after table: change something, run the tests, and read what moved. Re-baseline
+with `cargo insta review` (or `INSTA_UPDATE=always cargo test --test eval`) once you believe the
+new numbers — and quote them in the pull request, because the snapshot is the record of what the
+project thinks retrieval does.
+
+Adding a query means adding a row to `tests/fixtures/eval_queries.json`: a class, the query
+string, any filters, and graded relevance keyed by document reference
+(`"{session_id}:{agent_id|-}:{seq}"` — read `target/eval/corpus.md` for the current ones). The
+harness refuses to run if a reference does not resolve, because a stale reference scores as a
+retrieval miss and the two are indistinguishable in a results table.
+
+Design and limitations — including what a 65-document synthetic corpus cannot tell you — are in
+[`docs/DESIGN.md`](docs/DESIGN.md) under **Retrieval evaluation**.
 
 ### Continuous integration
 

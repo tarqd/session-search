@@ -17,7 +17,7 @@ use serde_json::Value;
 use crate::format::{self, OutputOpts};
 use crate::index::{self, IndexOptions, IndexStats};
 use crate::parse::SessionInfo;
-use crate::search::{self, Filters, SearchRequest, SortBy};
+use crate::search::{self, Filters, SearchRequest, SimilarField, SortBy};
 use crate::{context, discovery};
 
 /// Facet buckets returned alongside `search --facets`. `facets` has `--top` for the same knob;
@@ -25,8 +25,6 @@ use crate::{context, discovery};
 const SEARCH_FACET_TOP: usize = 15;
 /// Snippet budget, in characters, for a search hit.
 const SNIPPET_CHARS: usize = 240;
-/// Cap on the session scan that resolves `--around <UUID>` to a `seq`.
-const UUID_SCAN_LIMIT: usize = 50_000;
 /// Documents one `--context turn` window may show, per hit.
 ///
 /// A turn is not a bounded thing: one prompt can spawn hundreds of tool calls over an hour, and
@@ -144,6 +142,29 @@ pub enum Command {
         /// worth ordering by time.
         #[arg(long, value_enum, default_value_t = SortBy::Relevance, value_name = "ORDER")]
         sort: SortBy,
+        /// Rank by similarity to the turn a document reference names. REF is `SESSION:SEQ`,
+        /// `SESSION:AGENT:SEQ`, a record uuid or a `doc_id` — any of them by unambiguous
+        /// prefix. Composes with the query and with every filter.
+        #[arg(long = "similar-to", value_name = "REF")]
+        similar_to: Option<String>,
+        /// Which bodies of the source turn seed the similarity: `text` (the default), `code`,
+        /// `tool_output`, `thinking`. Comma-separated. `thinking` additionally needs
+        /// `--include-thinking`.
+        // No `default_value`: an empty vector means "the default", spelled out in `dispatch`,
+        // which keeps `SimilarField` free of the `Display` impl `default_values_t` would ask
+        // for on an enum whose display name is already its `ValueEnum` name.
+        #[arg(
+            long = "similar-in",
+            value_enum,
+            value_delimiter = ',',
+            value_name = "FIELD",
+            requires = "similar_to"
+        )]
+        similar_in: Vec<SimilarField>,
+        /// Keep the source turn in the results of a `--similar-to` search. It is left out by
+        /// default, because it is the turn you are already looking at.
+        #[arg(long = "include-source", requires = "similar_to")]
+        include_source: bool,
         #[command(flatten, next_help_heading = "Filters")]
         filters: Filters,
     },
@@ -171,8 +192,10 @@ pub enum Command {
         /// Subagent id, for a sidechain transcript.
         #[arg(long, value_name = "AGENT_ID")]
         agent: Option<String>,
-        /// A doc uuid or a `seq` number; prints a window instead of the whole session.
-        #[arg(long, value_name = "UUID|SEQ")]
+        /// Where to centre the window: a `seq` number, a record uuid, a `tool_use_id`, a
+        /// `doc_id`, or a `SESSION[:AGENT]:SEQ` reference — the same grammar
+        /// `search --similar-to` takes, by unambiguous prefix.
+        #[arg(long, value_name = "REF|SEQ")]
         around: Option<String>,
         /// Snap the `--around` window to the enclosing turn instead of counting documents with
         /// `--before`/`--after`. Capped by `--limit`, and what the cap left out is reported.
@@ -268,6 +291,8 @@ pub fn run(cli: Cli) -> Result<()> {
         color: color_enabled(cli.no_color, cli.command.wants_json()),
         context: 0,
         width: terminal_width(),
+        // Filled in by the `Search` arm once `--similar-to` has resolved to a document.
+        similar_to: None,
     };
 
     // Buffered: the human renderings are many small writes, and a `| head` should not cost a
@@ -337,9 +362,26 @@ fn dispatch(
             no_refresh,
             include_thinking,
             sort,
+            similar_to,
+            similar_in,
+            include_source,
         } => {
             refresh(index_dir, no_refresh, include_thinking);
             let (index, fields) = index::open_or_create(index_dir)?;
+            // Resolved here rather than inside `search()`: expanding a reference is an index
+            // lookup with its own ambiguity error, and "your reference matched three documents"
+            // must not reach the caller as "your search found nothing".
+            let similar = match similar_to.as_deref() {
+                Some(spec) => Some(search::resolve_similar(
+                    &index,
+                    &fields,
+                    spec,
+                    &similar_fields(&similar_in, include_thinking),
+                    include_source,
+                )?),
+                None => None,
+            };
+            opts.similar_to = similar.as_ref().map(search::SimilarSource::label);
             let request = SearchRequest {
                 query: non_empty(query),
                 filters,
@@ -350,6 +392,7 @@ fn dispatch(
                 snippet_chars: SNIPPET_CHARS,
                 include_thinking,
                 sort,
+                similar_to: similar,
             };
             let response = search::search(&index, &fields, &request)?;
             opts.context = match window {
@@ -593,6 +636,34 @@ fn resolve_roots(explicit: Vec<PathBuf>) -> Result<Vec<PathBuf>> {
     }
 }
 
+/// Which bodies `--similar-in` selected, with the defaults and the `thinking` gate applied.
+///
+/// An empty selection means `text` — the field that answers "about the same thing" rather than
+/// "built out of the same files", and the only one every document has some of. `thinking` is
+/// gated on `--include-thinking` for the same reason the query side is: the model's private
+/// reasoning is opt-in everywhere, and a seed that silently included it would let a search
+/// rank documents by something the caller never asked to look at. Asking for it without the
+/// flag is a warning rather than an error, so a saved command line keeps working when the index
+/// was built with `--no-thinking`.
+fn similar_fields(selected: &[SimilarField], include_thinking: bool) -> Vec<SimilarField> {
+    if selected.is_empty() {
+        return vec![SimilarField::Text];
+    }
+    let mut fields = Vec::with_capacity(selected.len());
+    for field in selected {
+        if *field == SimilarField::Thinking && !include_thinking {
+            tracing::warn!("--similar-in thinking needs --include-thinking; seeding without it");
+            continue;
+        }
+        fields.push(*field);
+    }
+    if fields.is_empty() {
+        vec![SimilarField::Text]
+    } else {
+        fields
+    }
+}
+
 /// One context window per hit. A failure on a single hit degrades that hit to "no context"
 /// rather than losing the whole result set.
 fn context_windows(
@@ -681,11 +752,29 @@ pub(crate) fn source_path_for(
 /// files (§9) the caller has nothing to pick one by. A uuid does — it was found by scanning
 /// the session, in exactly one document of exactly one file — and throwing that away would
 /// let the window that follows re-fetch "some document at that seq" from the *other* file.
+#[derive(Debug)]
 struct Anchor {
     seq: u64,
     source_path: Option<String>,
 }
 
+/// `--around` takes a bare `seq` or any of the document references `--similar-to` takes, and
+/// `search::resolve_doc_in` is what defines "any of them" for both commands.
+///
+/// What routing this through the shared resolver buys: `abc123` means the same document to
+/// `show` and to `--similar-to`, `--around` gains the prefix and coordinate spellings it did
+/// not have (it previously required an id in full, and answered anything else with "no document
+/// with uuid ... in session ..."), and a linear scan of up to fifty thousand documents becomes
+/// a term query.
+///
+/// The session the caller named is an **input** to the resolution, not a check after it. That
+/// distinction is the whole of `DocScope`: a reference that is unique inside the named
+/// transcript has to resolve even when the index holds another document with the same uuid
+/// somewhere else, which §9's `resetSessionFile()`/`relocated` case guarantees it sometimes
+/// does. Only when the scope finds nothing is the reference resolved index-wide again, and then
+/// solely to say where it actually lives — because "no such uuid" would be a lie about a
+/// document that plainly exists, and windowing it would print a transcript the caller never
+/// asked for under the heading of the one they did.
 fn resolve_seq(
     index: &tantivy::Index,
     fields: &crate::schema::Fields,
@@ -700,25 +789,44 @@ fn resolve_seq(
             source_path: None,
         });
     }
-    let docs = context::session(
-        index,
-        fields,
+    let scope = search::DocScope::Transcript {
         session_id,
         agent_id,
         source_path,
-        UUID_SCAN_LIMIT,
-    )?;
-    docs.iter()
-        .find(|doc| {
-            doc.uuid.as_deref() == Some(spec)
-                || doc.doc_id == spec
-                || doc.tool_use_id.as_deref() == Some(spec)
-        })
-        .map(|doc| Anchor {
+    };
+    if let Some(doc) = search::resolve_doc_in(index, fields, spec, scope)? {
+        return Ok(Anchor {
             seq: doc.seq,
-            source_path: Some(doc.source_path.clone()),
-        })
-        .ok_or_else(|| anyhow!("no document with uuid {spec:?} in session {session_id}"))
+            source_path: Some(doc.source_path),
+        });
+    }
+
+    // Nothing inside the transcript the caller named. Resolve index-wide, purely to report
+    // where the reference does live; an ambiguity out here is reported as one.
+    let doc = search::resolve_doc(index, fields, spec)?;
+    if doc.session_id != session_id || doc.agent_id.as_deref() != agent_id {
+        bail!(
+            "{spec:?} is {} of session {}{}, not of {session_id}{}",
+            doc.doc_id,
+            doc.session_id,
+            agent_label(doc.agent_id.as_deref()),
+            agent_label(agent_id)
+        );
+    }
+    bail!(
+        "{spec:?} is in {}, but this window is scoped to {}",
+        doc.source_path,
+        source_path.unwrap_or(&doc.source_path)
+    );
+}
+
+/// ` (agent <id>)`, or nothing for a main transcript. Only ever used inside an error message,
+/// where "session s1" and "session s1, agent a3" have to be distinguishable.
+fn agent_label(agent_id: Option<&str>) -> String {
+    match agent_id {
+        Some(agent) => format!(" (agent {agent})"),
+        None => String::new(),
+    }
 }
 
 /// The turn the document at `seq` belongs to, for `show --around ... --turn`.
@@ -1079,6 +1187,7 @@ mod tests {
             no_refresh,
             include_thinking,
             sort,
+            ..
         } = cli.command
         else {
             panic!("expected the search subcommand");
@@ -1122,6 +1231,9 @@ mod tests {
             include_thinking,
             sort,
             filters,
+            similar_to,
+            similar_in,
+            include_source,
         } = parse(&["session-search", "search", "tantivy"]).command
         else {
             panic!("expected search");
@@ -1132,6 +1244,13 @@ mod tests {
         assert!(!json && !no_refresh && !include_thinking);
         assert_eq!(sort, SortBy::Relevance);
         assert!(filters.project.is_none() && filters.tool.is_empty());
+        // Similarity is entirely opt-in: no reference, no seed fields, source not re-included.
+        assert!(similar_to.is_none() && similar_in.is_empty() && !include_source);
+        assert_eq!(
+            similar_fields(&similar_in, false),
+            vec![SimilarField::Text],
+            "an empty --similar-in means text"
+        );
     }
 
     #[test]
@@ -1681,5 +1800,145 @@ mod tests {
         let bare = resolve_seq(&index, &fields, "s1", None, None, "3").unwrap();
         assert_eq!(bare.seq, 3);
         assert!(bare.source_path.is_none());
+    }
+
+    /// §9's `relocated` case: one transcript indexed under two project keys, so one session id
+    /// names two files and the *same record uuid* appears in both. `--around <that uuid>` has
+    /// to keep working.
+    ///
+    /// This is the regression test for scoping the resolution rather than checking it
+    /// afterwards. Resolved index-wide, the uuid matches two documents and the shared resolver
+    /// refuses it as ambiguous — and `source_path_for` returns `None` in exactly this case, so
+    /// there is no spelling of the command the caller could have used instead. The two
+    /// candidates are the same `seq` of the same session, i.e. one record read from two files,
+    /// which is the one ambiguity with only one answer.
+    #[test]
+    fn a_uuid_duplicated_across_a_relocated_session_still_anchors() {
+        use crate::search::testkit::{blank_doc, index_docs};
+        let mut docs = Vec::new();
+        for (tag, path) in [
+            ("2c9bbdfa", "/tmp/a/s1.jsonl"),
+            ("1a3f8831", "/tmp/b/s1.jsonl"),
+        ] {
+            for seq in 0..4u64 {
+                let mut d = blank_doc(seq);
+                d.doc_id = format!("s1:-:{tag}:{seq}");
+                d.source_path = path.into();
+                // Identical uuids in both files — that is what makes it the same transcript.
+                d.uuid = Some(format!("eval-notes-a0{seq}"));
+                d.turn_seq = 2 * (seq / 2);
+                d.body = format!("{tag} {seq}");
+                docs.push(d);
+            }
+        }
+        let (index, fields) = index_docs(&docs);
+
+        // The §9 duplicate resolves to one record: two files, same session, same `seq`, so
+        // there is nothing to choose between them. That holds unscoped too, which is what lets
+        // `--similar-to` seed from a relocated transcript at all.
+        let doc = search::resolve_doc(&index, &fields, "eval-notes-a03").unwrap();
+        assert_eq!(doc.seq, 3);
+
+        let anchor = resolve_seq(&index, &fields, "s1", None, None, "eval-notes-a03").unwrap();
+        assert_eq!(anchor.seq, 3);
+        assert!(
+            anchor.source_path.is_some(),
+            "the window is pinned to a file"
+        );
+
+        // Genuine ambiguity inside the session is still a question, not a silent pick: `a0` is
+        // the prefix of four different `seq`s.
+        let err = format!(
+            "{:#}",
+            resolve_seq(&index, &fields, "s1", None, None, "eval-notes-a0").unwrap_err()
+        );
+        assert!(err.contains("ambiguous document reference"), "{err}");
+    }
+
+    /// A prefix that is unique inside the session the caller named resolves, even when the same
+    /// prefix matches other documents elsewhere in the index.
+    ///
+    /// This is the other half of scoping the resolution. The candidates here are *not* one
+    /// record — different sessions, different files, different uuids — so nothing collapses
+    /// them; the only thing that makes the reference answerable is that `show` already named a
+    /// transcript, and index-wide resolution threw that away.
+    #[test]
+    fn an_anchor_unique_inside_the_named_session_beats_a_collision_elsewhere() {
+        use crate::search::testkit::{blank_doc, index_docs};
+        let mut docs = Vec::new();
+        // One document in s1 whose uuid starts with `anchor-ab`.
+        let mut d = blank_doc(2);
+        d.uuid = Some("anchor-abc".into());
+        docs.push(d);
+        for seq in 0..2u64 {
+            let mut d = blank_doc(seq);
+            d.uuid = Some(format!("other-{seq}"));
+            docs.push(d);
+        }
+        // Two more in s2, so `anchor-ab` is a three-way prefix collision index-wide.
+        for (seq, uuid) in [(0u64, "anchor-abd"), (1, "anchor-abe")] {
+            let mut d = blank_doc(seq);
+            d.doc_id = format!("s2:-:{seq}");
+            d.session_id = "s2".into();
+            d.source_path = "/tmp/s2.jsonl".into();
+            d.uuid = Some(uuid.into());
+            docs.push(d);
+        }
+        let (index, fields) = index_docs(&docs);
+
+        // Index-wide the prefix is ambiguous, and `--similar-to` still says so.
+        let err = format!(
+            "{:#}",
+            search::resolve_doc(&index, &fields, "anchor-ab").unwrap_err()
+        );
+        assert!(err.contains("ambiguous document reference"), "{err}");
+
+        // Scoped to s1 it names exactly one document, which is the window `show` asked for.
+        let anchor = resolve_seq(&index, &fields, "s1", None, None, "anchor-ab").unwrap();
+        assert_eq!(anchor.seq, 2);
+        assert_eq!(anchor.source_path.as_deref(), Some("/tmp/s1.jsonl"));
+
+        // Scoped to s2 it is still ambiguous, because there it really is.
+        let err = format!(
+            "{:#}",
+            resolve_seq(&index, &fields, "s2", None, None, "anchor-ab").unwrap_err()
+        );
+        assert!(err.contains("ambiguous document reference"), "{err}");
+    }
+
+    /// `--around` now resolves index-wide, so it can land somewhere the caller did not ask
+    /// about. Windowing that would print one transcript under the heading of another; both
+    /// sides are named instead, because "no such uuid" would be a lie about a document that
+    /// plainly exists.
+    #[test]
+    fn an_anchor_outside_the_named_session_is_refused_rather_than_windowed() {
+        use crate::search::testkit::{blank_doc, index_docs};
+        let mut docs = Vec::new();
+        for seq in 0..3u64 {
+            docs.push(blank_doc(seq));
+        }
+        for seq in 0..3u64 {
+            let mut d = blank_doc(seq);
+            d.doc_id = format!("s2:-:{seq}");
+            d.session_id = "s2".into();
+            d.source_path = "/tmp/s2.jsonl".into();
+            d.uuid = Some(format!("v-{seq}"));
+            docs.push(d);
+        }
+        let (index, fields) = index_docs(&docs);
+
+        let err = format!(
+            "{:#}",
+            resolve_seq(&index, &fields, "s1", None, None, "v-1").unwrap_err()
+        );
+        assert!(err.contains("s2") && err.contains("s1"), "{err}");
+
+        // And the ambiguous-prefix error the shared resolver raises reaches `show` unchanged:
+        // `u-` is the prefix of every uuid in the main transcript.
+        let err = format!(
+            "{:#}",
+            resolve_seq(&index, &fields, "s1", None, None, "u-").unwrap_err()
+        );
+        assert!(err.contains("ambiguous document reference"), "{err}");
     }
 }

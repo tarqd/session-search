@@ -122,7 +122,10 @@ pub fn turn_window(
 }
 
 /// The one turn of one file: a term on `source_path` ANDed with a term on the `turn_seq` field.
-fn turn_query(f: &Fields, source_path: &str, turn_seq: u64) -> BooleanQuery {
+///
+/// Also used, negated, by `search::build_query`: a `--similar-to` search excludes the turn it was
+/// seeded from, and "the turn" there means exactly what it means here.
+pub(crate) fn turn_query(f: &Fields, source_path: &str, turn_seq: u64) -> BooleanQuery {
     BooleanQuery::new(vec![
         (
             Occur::Must,

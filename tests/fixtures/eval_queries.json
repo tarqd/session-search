@@ -1,0 +1,595 @@
+{
+  "schema_version": 1,
+  "provenance": {
+    "corpus": "synthetic — six transcripts written for this fixture and checked in under tests/fixtures/eval/, parsed by the real parser and indexed through the real schema. No real user transcript is included, and no query below was drawn from a real query log.",
+    "authored_by": "issue #21, the retrieval eval harness. Every row is a claim about what a person searching these transcripts should get back; the grades are the author's judgement of the corpus, not a recording of what search returns today.",
+    "real_slices": []
+  },
+  "queries": [
+    {
+      "id": "ident-snippet-half-a-name",
+      "class": "identifier",
+      "query": "snippet",
+      "provenance": "synthesised",
+      "note": "The invariant named in the issue: half an identifier finds the whole one, because the analyzer emits `snippetgenerator` plus `snippet` plus `generator` at one shared position.",
+      "relevant": {
+        "eval-tokenizer:-:0": 3,
+        "eval-tokenizer:-:1": 3,
+        "eval-tokenizer:-:4": 2,
+        "eval-notes:-:8": 1
+      }
+    },
+    {
+      "id": "ident-iserror-no-underscore",
+      "class": "identifier",
+      "query": "iserror",
+      "provenance": "synthesised",
+      "note": "`iserror` must find `is_error`: the separator-free whole form is what makes the two spellings share a term.",
+      "relevant": {
+        "eval-tokenizer:-:2": 3,
+        "eval-tokenizer:-:11": 3,
+        "eval-facets:-:2": 2,
+        "eval-facets:-:8": 2,
+        "eval-facets:-:10": 2
+      }
+    },
+    {
+      "id": "ident-pascal-finds-snake",
+      "class": "identifier",
+      "query": "OpenOrCreate",
+      "provenance": "synthesised",
+      "note": "PascalCase typed at a snake_case definition. Both spellings collapse to the same term set, which is the only reason this direction works.",
+      "relevant": {
+        "eval-tokenizer:-:2": 3,
+        "eval-tokenizer:-:4": 3,
+        "b20208d8-fbdb-5918-ba69-d203de6ed6dc:-:2": 3,
+        "eval-buildfail:-:2": 2,
+        "eval-buildfail:-:3": 2,
+        "eval-buildfail:-:6": 2,
+        "eval-tokenizer:-:11": 3
+      }
+    },
+    {
+      "id": "ident-snake-finds-pascal",
+      "class": "identifier",
+      "query": "open_or_create",
+      "provenance": "synthesised",
+      "note": "The reverse of the row above, asserted separately: a symmetry claim that is only tested in one direction is not tested.",
+      "relevant": {
+        "eval-tokenizer:-:2": 3,
+        "eval-tokenizer:-:4": 3,
+        "b20208d8-fbdb-5918-ba69-d203de6ed6dc:-:2": 3,
+        "eval-buildfail:-:2": 2,
+        "eval-buildfail:-:3": 2,
+        "eval-buildfail:-:6": 2,
+        "eval-tokenizer:-:11": 3
+      }
+    },
+    {
+      "id": "ident-sha256-pasted-whole",
+      "class": "identifier",
+      "query": "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08",
+      "provenance": "synthesised",
+      "note": "A 64-character hash is one term, not forty-one fragments, and it survives a length filter set to 255 rather than the stock 40. Pasting it back must find exactly the document it came from.",
+      "relevant": {
+        "eval-tokenizer:-:7": 3
+      }
+    },
+    {
+      "id": "ident-uuid-first-chunk",
+      "class": "identifier",
+      "query": "b20208d8",
+      "provenance": "synthesised",
+      "note": "The first chunk of a session uuid: eight hex digits mixing letters and digits, so the blob rule keeps it whole. The later chunk `ba69` would split into `ba` + `69`, which is why a uuid-prefix query has to use the first chunk.",
+      "relevant": {
+        "b20208d8-fbdb-5918-ba69-d203de6ed6dc:-:7": 3,
+        "eval-tokenizer:a10845c5ff9c7d4ec:4": 2
+      }
+    },
+    {
+      "id": "ident-release-flag-phrase",
+      "class": "identifier",
+      "query": "\"cargo build --release\"",
+      "provenance": "synthesised",
+      "note": "Quoted deliberately. Unquoted, the leading `-` of `--release` is the query parser's negation operator, so `cargo build --release` asks for documents that do NOT contain `release` — a hazard worth having a row about rather than a rule in a comment.",
+      "relevant": {
+        "b20208d8-fbdb-5918-ba69-d203de6ed6dc:-:5": 3
+      }
+    },
+    {
+      "id": "ident-source-path",
+      "class": "identifier",
+      "query": "src/index.rs",
+      "provenance": "synthesised",
+      "note": "A path is three terms at three positions (`src`, `index`, `rs`) ANDed, not a phrase, so a document holding `src/lib.rs` beside the word `index` also matches. That costs precision, which this harness does not score, and never costs recall.",
+      "relevant": {
+        "b20208d8-fbdb-5918-ba69-d203de6ed6dc:-:2": 3,
+        "b20208d8-fbdb-5918-ba69-d203de6ed6dc:-:3": 3,
+        "b20208d8-fbdb-5918-ba69-d203de6ed6dc:-:10": 3,
+        "b20208d8-fbdb-5918-ba69-d203de6ed6dc:-:11": 2
+      }
+    },
+    {
+      "id": "boundary-tokenizer-both-halves",
+      "class": "boundary",
+      "query": "tokenizer",
+      "provenance": "synthesised",
+      "note": "The word is English prose in eval-notes and a `let` binding inside a ```rust fence in eval-tokenizer. One query has to reach both, through two different analyzers.",
+      "relevant": {
+        "eval-notes:-:1": 3,
+        "eval-tokenizer:-:4": 3,
+        "eval-tokenizer:-:2": 2,
+        "eval-tokenizer:-:5": 2,
+        "eval-tokenizer:-:1": 2,
+        "eval-tokenizer:a10845c5ff9c7d4ec:2": 1
+      }
+    },
+    {
+      "id": "boundary-tokenizers-plural",
+      "class": "boundary",
+      "query": "tokenizers",
+      "provenance": "synthesised",
+      "note": "The same intent, typed as a plural, and graded against the same documents so the only difference between the two rows is the query string. The prose half is stemmed on both sides and still answers; the ```rust fence is not stemmed on either side, so the plural cannot reach it. A measured limitation of splitting a message between two analyzers.",
+      "relevant": {
+        "eval-notes:-:1": 3,
+        "eval-tokenizer:-:4": 3,
+        "eval-tokenizer:-:2": 2,
+        "eval-tokenizer:-:5": 2,
+        "eval-tokenizer:-:1": 2,
+        "eval-tokenizer:a10845c5ff9c7d4ec:2": 1
+      }
+    },
+    {
+      "id": "boundary-index-both-halves",
+      "class": "boundary",
+      "query": "index",
+      "provenance": "synthesised",
+      "note": "Prose in the notes session, a receiver in a ```rust fence in the uuid session, and the path `src/index.rs` in between. Everything a reader would keep is graded: grading only the two halves would leave eight matching documents ungraded and turn MRR into a statement about the fixture rather than about retrieval.",
+      "relevant": {
+        "eval-notes:-:2": 3,
+        "b20208d8-fbdb-5918-ba69-d203de6ed6dc:-:3": 3,
+        "eval-tokenizer:-:4": 2,
+        "b20208d8-fbdb-5918-ba69-d203de6ed6dc:-:11": 2,
+        "b20208d8-fbdb-5918-ba69-d203de6ed6dc:-:2": 2,
+        "b20208d8-fbdb-5918-ba69-d203de6ed6dc:-:10": 2,
+        "b20208d8-fbdb-5918-ba69-d203de6ed6dc:-:6": 1,
+        "eval-tokenizer:-:6": 1
+      }
+    },
+    {
+      "id": "boundary-indexes-plural",
+      "class": "boundary",
+      "query": "indexes",
+      "provenance": "synthesised",
+      "note": "The plural of the row above, graded against the same documents. It costs less than the `tokenizers` row does, because the one fenced document here also discusses the index in its prose — which is the useful half of the finding: a fence is reachable by a plural only when the message around it says the same thing in English.",
+      "relevant": {
+        "eval-notes:-:2": 3,
+        "b20208d8-fbdb-5918-ba69-d203de6ed6dc:-:3": 3,
+        "eval-tokenizer:-:4": 2,
+        "b20208d8-fbdb-5918-ba69-d203de6ed6dc:-:11": 2,
+        "b20208d8-fbdb-5918-ba69-d203de6ed6dc:-:2": 2,
+        "b20208d8-fbdb-5918-ba69-d203de6ed6dc:-:10": 2,
+        "b20208d8-fbdb-5918-ba69-d203de6ed6dc:-:6": 1,
+        "eval-tokenizer:-:6": 1
+      }
+    },
+    {
+      "id": "boundary-parse-verb-and-function",
+      "class": "boundary",
+      "query": "parse",
+      "provenance": "synthesised",
+      "note": "`parses` and `parsed` reach `parse` through the stemmer, `parse_whole` through the identifier split, and `src/parse.rs` through the path split — three routes to one term. The one graded document none of them reaches is the prose that says only `parser`, which the English stemmer leaves as `parser`; it is graded 1 so the miss stays visible in the number.",
+      "relevant": {
+        "eval-notes:-:3": 3,
+        "b20208d8-fbdb-5918-ba69-d203de6ed6dc:-:3": 3,
+        "b20208d8-fbdb-5918-ba69-d203de6ed6dc:-:9": 2,
+        "b20208d8-fbdb-5918-ba69-d203de6ed6dc:-:1": 1,
+        "eval-facets:-:5": 1,
+        "eval-facets:-:2": 1,
+        "eval-facets:-:10": 1,
+        "eval-facets:-:4": 1,
+        "b20208d8-fbdb-5918-ba69-d203de6ed6dc:-:11": 1
+      }
+    },
+    {
+      "id": "boundary-compiling-stems",
+      "class": "boundary",
+      "query": "compiling",
+      "provenance": "synthesised",
+      "note": "`compiling`, `compiled` and `compilation` share a stem, so prose answers all three. The compiler's own output does not: `tool_output` takes the code analyzer, where `compile` and `compiling` are different terms. That document is graded 1 to keep the miss visible in the number.",
+      "relevant": {
+        "eval-notes:-:5": 3,
+        "eval-notes:-:6": 3,
+        "eval-notes:-:8": 3,
+        "eval-buildfail:-:3": 2,
+        "eval-buildfail:-:8": 2,
+        "eval-buildfail:-:2": 1
+      }
+    },
+    {
+      "id": "boundary-fenced-identifier-only",
+      "class": "boundary",
+      "query": "writer_with_num_threads",
+      "provenance": "synthesised",
+      "note": "An identifier that exists only inside a fence. Nothing about it is English, and it has to be reachable anyway.",
+      "relevant": {
+        "b20208d8-fbdb-5918-ba69-d203de6ed6dc:-:3": 3
+      }
+    },
+    {
+      "id": "boundary-filter-prose-and-fence",
+      "class": "boundary",
+      "query": "filter",
+      "provenance": "synthesised",
+      "note": "`filter` is a word in the subagent's prose, a method call in its fence, and half of `RemoveLongFilter` in a grep result — three routings of one term, through `text`, `code` and `tool_output`.",
+      "relevant": {
+        "eval-tokenizer:a10845c5ff9c7d4ec:1": 3,
+        "eval-tokenizer:a10845c5ff9c7d4ec:3": 3,
+        "eval-tokenizer:a10845c5ff9c7d4ec:5": 2,
+        "eval-tokenizer:a10845c5ff9c7d4ec:2": 2,
+        "eval-tokenizer:a10845c5ff9c7d4ec:0": 2,
+        "eval-tokenizer:a10845c5ff9c7d4ec:4": 1,
+        "eval-tokenizer:-:8": 1
+      }
+    },
+    {
+      "id": "para-build-fails",
+      "class": "paraphrase",
+      "query": "build fails",
+      "provenance": "synthesised",
+      "note": "The words `build` and `fail` appear nowhere in any body of the eval-buildfail session — only in its title. Without the context header this query returns nothing at all, which is the whole argument for issue #23.",
+      "relevant": {
+        "eval-buildfail:-:2": 3,
+        "eval-buildfail:-:3": 3,
+        "eval-buildfail:-:10": 3,
+        "eval-buildfail:-:11": 3,
+        "eval-buildfail:-:0": 2,
+        "eval-buildfail:-:8": 2,
+        "eval-buildfail:-:12": 2,
+        "eval-buildfail:-:7": 1
+      }
+    },
+    {
+      "id": "para-retrieval-notes",
+      "class": "paraphrase",
+      "query": "retrieval",
+      "provenance": "synthesised",
+      "note": "`retrieval` is in the notes session's title and opening prompt and in no other body. Every document of that session is about it and only one of them says so.",
+      "relevant": {
+        "eval-notes:-:1": 3,
+        "eval-notes:-:2": 3,
+        "eval-notes:-:3": 3,
+        "eval-notes:-:8": 3,
+        "eval-notes:-:0": 2,
+        "eval-notes:-:5": 2,
+        "eval-notes:-:6": 2,
+        "eval-notes:-:7": 1
+      }
+    },
+    {
+      "id": "para-split-identifiers",
+      "class": "paraphrase",
+      "query": "split identifiers",
+      "provenance": "synthesised",
+      "note": "The canonical fragment problem: `yes, do that` is a whole turn of the conversation and is reachable by nothing a person would type unless its session's title is indexed with it.",
+      "relevant": {
+        "eval-tokenizer:-:3": 3,
+        "eval-tokenizer:-:0": 2,
+        "eval-tokenizer:-:1": 2,
+        "eval-tokenizer:-:11": 2,
+        "eval-notes:-:1": 2,
+        "eval-tokenizer:-:8": 1,
+        "eval-tokenizer:a10845c5ff9c7d4ec:3": 1
+      }
+    },
+    {
+      "id": "para-incremental-indexing",
+      "class": "paraphrase",
+      "query": "incremental indexing",
+      "provenance": "synthesised",
+      "note": "`make it incremental` says one of the two words and the session title says the other. Neither document is reachable by the pair on its own.",
+      "relevant": {
+        "b20208d8-fbdb-5918-ba69-d203de6ed6dc:-:11": 3,
+        "b20208d8-fbdb-5918-ba69-d203de6ed6dc:-:4": 3,
+        "b20208d8-fbdb-5918-ba69-d203de6ed6dc:-:6": 2,
+        "b20208d8-fbdb-5918-ba69-d203de6ed6dc:-:9": 2,
+        "b20208d8-fbdb-5918-ba69-d203de6ed6dc:-:8": 1,
+        "b20208d8-fbdb-5918-ba69-d203de6ed6dc:-:10": 1
+      }
+    },
+    {
+      "id": "para-hash-rule-subagent",
+      "class": "paraphrase",
+      "query": "hash rule",
+      "provenance": "synthesised",
+      "note": "A subagent transcript has no title record at all, so its header is built from the prompt the parent synthesised for it. That is the only context a sidechain document has, and it is what makes one retrievable.",
+      "relevant": {
+        "eval-tokenizer:a10845c5ff9c7d4ec:1": 3,
+        "eval-tokenizer:a10845c5ff9c7d4ec:4": 3,
+        "eval-tokenizer:a10845c5ff9c7d4ec:0": 2,
+        "eval-tokenizer:a10845c5ff9c7d4ec:3": 2,
+        "eval-tokenizer:a10845c5ff9c7d4ec:5": 2,
+        "eval-tokenizer:a10845c5ff9c7d4ec:2": 1
+      }
+    },
+    {
+      "id": "para-error-log",
+      "class": "paraphrase",
+      "query": "error log",
+      "provenance": "synthesised",
+      "note": "The two `Read` calls that went looking for a log carry the word `log` in their path and no word for what they were for; the summary at the end carries `errors` and no `log`. The pair is only in the header.",
+      "relevant": {
+        "eval-facets:-:12": 3,
+        "eval-facets:-:0": 2,
+        "eval-facets:-:1": 2,
+        "eval-facets:-:6": 2,
+        "eval-facets:-:2": 1,
+        "eval-facets:-:7": 1
+      }
+    },
+    {
+      "id": "para-release-artifact",
+      "class": "paraphrase",
+      "query": "release artifact",
+      "provenance": "synthesised",
+      "note": "`artifact` is a word of the opening prompt and of no other body in the session. Every document but the opener needs the header to carry it, and `release` is everywhere, so the pair is a clean read on what the session row buys.",
+      "relevant": {
+        "eval-buildfail:-:2": 3,
+        "eval-buildfail:-:3": 3,
+        "eval-buildfail:-:0": 2,
+        "eval-buildfail:-:7": 2,
+        "eval-buildfail:-:8": 1
+      }
+    },
+    {
+      "id": "filtered-project-other-tool",
+      "class": "filtered",
+      "query": "cargo",
+      "filters": {
+        "project": "/home/user/code/other-tool"
+      },
+      "provenance": "synthesised",
+      "note": "The project prefix is written as a literal absolute path. A `~/code` prefix would be expanded against the runner's own $HOME and match nothing in CI.",
+      "relevant": {
+        "eval-buildfail:-:2": 3,
+        "eval-buildfail:-:7": 3,
+        "eval-buildfail:-:0": 2,
+        "eval-facets:-:4": 2
+      }
+    },
+    {
+      "id": "filtered-lang-rust",
+      "class": "filtered",
+      "query": "index",
+      "filters": {
+        "lang": [
+          "rust"
+        ]
+      },
+      "provenance": "synthesised",
+      "note": "`--lang` matches the fence info string exactly and lowercased, so the corpus writes ```rust and never ```Rust or ```rs.",
+      "relevant": {
+        "eval-tokenizer:-:4": 3,
+        "b20208d8-fbdb-5918-ba69-d203de6ed6dc:-:3": 3
+      }
+    },
+    {
+      "id": "filtered-lang-python",
+      "class": "filtered",
+      "query": "def",
+      "filters": {
+        "lang": [
+          "python"
+        ]
+      },
+      "provenance": "synthesised",
+      "note": "Two python fences in two different projects, reached by a keyword that only exists inside a fence.",
+      "relevant": {
+        "eval-facets:-:8": 3,
+        "eval-notes:-:7": 3
+      }
+    },
+    {
+      "id": "filtered-program-cargo",
+      "class": "filtered",
+      "query": "release",
+      "filters": {
+        "program": [
+          "cargo"
+        ]
+      },
+      "provenance": "synthesised",
+      "note": "`--program` reads `bash_cmd.program`, which only exists when the brush grammar accepted the command, so this row also asserts that the corpus's Bash commands actually parse.",
+      "relevant": {
+        "b20208d8-fbdb-5918-ba69-d203de6ed6dc:-:5": 3,
+        "b20208d8-fbdb-5918-ba69-d203de6ed6dc:-:6": 3,
+        "eval-buildfail:-:2": 3,
+        "eval-buildfail:-:7": 3
+      }
+    },
+    {
+      "id": "filtered-errors-only-exit-101",
+      "class": "filtered",
+      "query": "101",
+      "filters": {
+        "errors_only": true
+      },
+      "provenance": "synthesised",
+      "note": "An exit code is a digit run, which is its own part of any identifier it sits in, so it is searchable on its own.",
+      "relevant": {
+        "eval-buildfail:-:2": 3,
+        "eval-buildfail:-:10": 3,
+        "eval-facets:-:4": 3
+      }
+    },
+    {
+      "id": "filtered-date-window",
+      "class": "filtered",
+      "query": "cargo",
+      "filters": {
+        "since": "2026-09-03",
+        "until": "2026-09-05"
+      },
+      "provenance": "synthesised",
+      "note": "The `--since 7d` case, pinned. `date_range()` resolves a relative span against `chrono::Utc::now()`, so a relative filter over a corpus with frozen timestamps matches a shrinking set every day until the row silently means nothing. Absolute dates are the only form that is still true next year.",
+      "relevant": {
+        "b20208d8-fbdb-5918-ba69-d203de6ed6dc:-:5": 3,
+        "b20208d8-fbdb-5918-ba69-d203de6ed6dc:-:6": 3,
+        "eval-facets:-:4": 3
+      }
+    },
+    {
+      "id": "filtered-sidechains-only",
+      "class": "filtered",
+      "query": "RemoveLongFilter",
+      "filters": {
+        "sidechains_only": true
+      },
+      "provenance": "synthesised",
+      "note": "The corpus carries one real subagent file at subagents/agent-<id>.jsonl, so `is_sidechain` comes from the path the way it does in a real transcript tree.",
+      "relevant": {
+        "eval-tokenizer:a10845c5ff9c7d4ec:1": 3,
+        "eval-tokenizer:a10845c5ff9c7d4ec:3": 3,
+        "eval-tokenizer:a10845c5ff9c7d4ec:2": 2
+      }
+    },
+    {
+      "id": "filtered-agent-type",
+      "class": "filtered",
+      "query": "limit",
+      "filters": {
+        "agent_type": "Explore"
+      },
+      "provenance": "synthesised",
+      "note": "`agent_type` comes from `attributionAgent` on the sidechain's assistant records, which is the only place a subagent's type is written in a transcript the indexer can see without the .meta.json sidecar.",
+      "relevant": {
+        "eval-tokenizer:a10845c5ff9c7d4ec:1": 3,
+        "eval-tokenizer:a10845c5ff9c7d4ec:2": 2,
+        "eval-tokenizer:a10845c5ff9c7d4ec:3": 2
+      }
+    },
+    {
+      "id": "filtered-session-prefix",
+      "class": "filtered",
+      "query": "watermark",
+      "filters": {
+        "session": "b20208d8"
+      },
+      "provenance": "synthesised",
+      "note": "`--session` matches by prefix, which is what anyone pasting the first block of a uuid expects.",
+      "relevant": {
+        "b20208d8-fbdb-5918-ba69-d203de6ed6dc:-:7": 3,
+        "b20208d8-fbdb-5918-ba69-d203de6ed6dc:-:9": 3,
+        "b20208d8-fbdb-5918-ba69-d203de6ed6dc:-:11": 2
+      }
+    },
+    {
+      "id": "filtered-branch",
+      "class": "filtered",
+      "query": "incremental",
+      "filters": {
+        "branch": "eval/turn-seq"
+      },
+      "provenance": "synthesised",
+      "note": "`--branch` is an exact term match on a STRING field, so the slash in a branch name is not a tokenizer problem.",
+      "relevant": {
+        "b20208d8-fbdb-5918-ba69-d203de6ed6dc:-:4": 3,
+        "b20208d8-fbdb-5918-ba69-d203de6ed6dc:-:11": 3
+      }
+    },
+    {
+      "id": "agg-which-tools-errored",
+      "class": "aggregation",
+      "shape": "facet",
+      "query": "error",
+      "filters": {
+        "errors_only": true
+      },
+      "facet_field": "tool_name",
+      "expect_facet_values": [
+        "Bash",
+        "Read",
+        "Grep",
+        "Edit"
+      ],
+      "provenance": "synthesised",
+      "note": "\"What errors did we see\" has no defensible top-k: seven failures spread over four tools, and any ten of them ranked by BM25 is an arbitrary sample of a distribution. The answer is the bucket counts, so scoring the ranking would book a modelling mistake as a retrieval miss.",
+      "relevant": {}
+    },
+    {
+      "id": "agg-which-projects-errored",
+      "class": "aggregation",
+      "shape": "facet",
+      "query": "error",
+      "filters": {
+        "errors_only": true
+      },
+      "facet_field": "project",
+      "expect_facet_values": [
+        "/home/user/code/other-tool"
+      ],
+      "provenance": "synthesised",
+      "note": "\"Where are the failures\" is a question about how errors are distributed across projects. A ranked list answers it only by accident, and answers it differently for every k a caller happens to pass.",
+      "relevant": {}
+    },
+    {
+      "id": "agg-which-sessions-ran-cargo",
+      "class": "aggregation",
+      "shape": "facet",
+      "query": "cargo",
+      "facet_field": "session_id",
+      "expect_facet_values": [
+        "eval-tokenizer",
+        "eval-buildfail",
+        "b20208d8-fbdb-5918-ba69-d203de6ed6dc"
+      ],
+      "provenance": "synthesised",
+      "note": "\"Which sessions used cargo\" is a set membership question. A top-k list over-represents whichever session mentioned cargo most often, which is the opposite of what was asked.",
+      "relevant": {}
+    },
+    {
+      "id": "agg-which-programs-ran",
+      "class": "aggregation",
+      "shape": "facet",
+      "query": "src",
+      "facet_field": "bash_cmd.program",
+      "expect_facet_values": [
+        "grep",
+        "rg"
+      ],
+      "provenance": "synthesised",
+      "note": "\"What did we actually run\" is a terms aggregation over a multi-valued JSON subpath: one shell one-liner contributes several programs, so a document count and a value count are different numbers and a ranking reports neither.",
+      "relevant": {}
+    },
+    {
+      "id": "agg-which-languages-were-quoted",
+      "class": "aggregation",
+      "shape": "facet",
+      "query": "index",
+      "facet_field": "code_lang",
+      "expect_facet_values": [
+        "rust"
+      ],
+      "provenance": "synthesised",
+      "note": "\"What languages show up around the index\" is a distribution over fence info strings. `code_lang` is multi-valued, so one answer holding a rust fence and a bash fence is one document and two bucket increments — a fact a ranked list cannot express at all.",
+      "relevant": {}
+    },
+    {
+      "id": "agg-which-files-were-missing",
+      "class": "aggregation",
+      "shape": "facet",
+      "query": "error",
+      "filters": {
+        "errors_only": true
+      },
+      "facet_field": "tool_input.file_path",
+      "expect_facet_values": [
+        "/home/user/code/other-tool/logs/missing.txt",
+        "/home/user/code/other-tool/logs/archive.txt"
+      ],
+      "provenance": "synthesised",
+      "note": "\"Which files were we unable to read\" aggregates a tool parameter that is not in the schema at all — a JSON subpath of `tool_input`. There is no ranking of documents that answers it; the answer is the list of distinct values and their counts.",
+      "relevant": {}
+    }
+  ]
+}

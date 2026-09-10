@@ -373,6 +373,11 @@ impl SearchBody {
             snippet_chars: self.snippet_chars.unwrap_or(defaults.snippet_chars),
             include_thinking: self.include_thinking.unwrap_or(defaults.include_thinking),
             sort,
+            // Spelled out rather than left to `..defaults`, so that adding a field to
+            // `SearchRequest` is a compile error here and somebody has to decide, once, whether
+            // the HTTP envelope carries it. This one deliberately does not — see
+            // `similar_to_is_not_a_search_parameter`.
+            similar_to: None,
         };
 
         Ok(PreparedSearch {
@@ -1322,6 +1327,24 @@ mod tests {
             err.contains("tool_input"),
             "must list what is accepted: {err}"
         );
+    }
+
+    /// The HTTP surface deliberately does **not** carry `--similar-to`, and this pins the
+    /// decision rather than leaving it to look like an oversight.
+    ///
+    /// Three reasons, spelled out in `docs/DESIGN.md`: `SearchBody` exists to be Elastic Search
+    /// UI's `RequestState`, which has no notion of "documents like this one"; resolving a
+    /// document reference has its own ambiguity error that wants its own status shape and,
+    /// honestly, its own route (`GET /api/similar/{ref}`); and the bundled UI has no affordance
+    /// to trigger it, so it would be dead, unauthenticated surface on a port that already
+    /// serves every secret in every transcript. `reject_unknown` gives the right answer for
+    /// free — a 400 that lists what this endpoint does take.
+    #[test]
+    fn similar_to_is_not_a_search_parameter() {
+        let err = params("q=x&similar_to=abc123")
+            .reject_unknown(SEARCH_PARAMS)
+            .unwrap_err();
+        assert!(err.contains("\"similar_to\""), "{err}");
     }
 
     // --- GET -> body -------------------------------------------------------

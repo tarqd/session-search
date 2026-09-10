@@ -1,0 +1,106 @@
+---
+source: tests/eval/main.rs
+expression: table
+---
+## Retrieval eval — context_text on
+
+| class       | queries | scored | ceiling | recall@10 |       MRR |   nDCG@10 | pinned |
+| ----------- | ------- | ------ | ------- | --------- | --------- | --------- | ------ |
+| identifier  |       8 |      8 |       7 |     1.000 |     1.000 |     0.928 |      2 |
+| boundary    |       8 |      8 |       2 |     0.913 |     1.000 |     0.774 |      1 |
+| paraphrase  |       7 |      7 |       1 |     0.844 |     1.000 |     0.782 |      0 |
+| filtered    |      10 |     10 |       7 |     1.000 |     1.000 |     0.981 |      5 |
+| aggregation |       6 |      0 |       0 |         — |         — |         — |      0 |
+| overall     |      39 |     33 |      17 |     0.946 |     1.000 |     0.876 |      8 |
+
+6 of 39 queries are aggregation-shaped: recorded, never scored. Top-k is the wrong answer shape for them, and scoring one as a ranking would book a modelling mistake as a retrieval miss.
+
+`ceiling` counts scored queries whose recall was forced to 1.000 by the fixture rather than earned by the ranker: the query matched fewer documents than the cutoff and every one of them is graded relevant, so `found == relevant == the whole match set` and no ranking could have scored it differently. 17 of 33 scored queries are in that state, marked † in the per-query table. Their recall cannot rise, cannot fall except by a document leaving the matched set entirely, and says nothing about ordering. A class whose `ceiling` equals its `scored` has a recall column that measures the corpus, not retrieval.
+
+`pinned` counts scored queries whose nDCG@10 was forced to 1.000: the run returned exactly the graded set and every returned grade is equal, so DCG and IDCG are the same sum under any permutation and no reordering could change the number. 8 of 33 scored queries are in that state, marked ‡ in the per-query table. A class mean whose rows are mostly pinned has less headroom than the column suggests, and a delta on it is spread over the movable rows rather than over all of them.
+
+### Per query
+
+| query                            | class       | hits |  rel | recall@10 |       MRR |   nDCG@10 |
+| -------------------------------- | ----------- | ---- | ---- | --------- | --------- | --------- |
+| ident-snippet-half-a-name        | identifier  |   10 |    4 |     1.000 |     1.000 |     0.990 |
+| ident-iserror-no-underscore      | identifier  |    5 |    5 |    1.000† |     1.000 |     0.852 |
+| ident-pascal-finds-snake         | identifier  |    7 |    7 |    1.000† |     1.000 |     0.944 |
+| ident-snake-finds-pascal         | identifier  |    7 |    7 |    1.000† |     1.000 |     0.944 |
+| ident-sha256-pasted-whole        | identifier  |    1 |    1 |    1.000† |     1.000 |    1.000‡ |
+| ident-uuid-first-chunk           | identifier  |    2 |    2 |    1.000† |     1.000 |     0.834 |
+| ident-release-flag-phrase        | identifier  |    1 |    1 |    1.000† |     1.000 |    1.000‡ |
+| ident-source-path                | identifier  |    4 |    4 |    1.000† |     1.000 |     0.860 |
+| boundary-tokenizer-both-halves   | boundary    |   10 |    6 |     1.000 |     1.000 |     0.762 |
+| boundary-tokenizers-plural       | boundary    |   10 |    6 |     0.833 |     1.000 |     0.621 |
+| boundary-index-both-halves       | boundary    |   10 |    8 |     0.875 |     1.000 |     0.715 |
+| boundary-indexes-plural          | boundary    |   10 |    8 |     0.875 |     1.000 |     0.585 |
+| boundary-parse-verb-and-function | boundary    |    8 |    9 |     0.889 |     1.000 |     0.672 |
+| boundary-compiling-stems         | boundary    |    5 |    6 |     0.833 |     1.000 |     0.964 |
+| boundary-fenced-identifier-only  | boundary    |    1 |    1 |    1.000† |     1.000 |    1.000‡ |
+| boundary-filter-prose-and-fence  | boundary    |    7 |    7 |    1.000† |     1.000 |     0.875 |
+| para-build-fails                 | paraphrase  |   10 |    8 |     0.750 |     1.000 |     0.697 |
+| para-retrieval-notes             | paraphrase  |    9 |    8 |     1.000 |     1.000 |     0.858 |
+| para-split-identifiers           | paraphrase  |   10 |    7 |     0.857 |     1.000 |     0.695 |
+| para-incremental-indexing        | paraphrase  |   10 |    6 |     0.667 |     1.000 |     0.886 |
+| para-hash-rule-subagent          | paraphrase  |    6 |    6 |    1.000† |     1.000 |     0.863 |
+| para-error-log                   | paraphrase  |   10 |    6 |     0.833 |     1.000 |     0.712 |
+| para-release-artifact            | paraphrase  |   10 |    5 |     0.800 |     1.000 |     0.761 |
+| filtered-project-other-tool      | filtered    |   10 |    4 |     1.000 |     1.000 |     1.000 |
+| filtered-lang-rust               | filtered    |    2 |    2 |    1.000† |     1.000 |    1.000‡ |
+| filtered-lang-python             | filtered    |    2 |    2 |    1.000† |     1.000 |    1.000‡ |
+| filtered-program-cargo           | filtered    |    4 |    4 |    1.000† |     1.000 |    1.000‡ |
+| filtered-errors-only-exit-101    | filtered    |    3 |    3 |    1.000† |     1.000 |    1.000‡ |
+| filtered-date-window             | filtered    |    3 |    3 |    1.000† |     1.000 |    1.000‡ |
+| filtered-sidechains-only         | filtered    |    6 |    3 |     1.000 |     1.000 |     0.808 |
+| filtered-agent-type              | filtered    |    3 |    3 |    1.000† |     1.000 |     1.000 |
+| filtered-session-prefix          | filtered    |    3 |    3 |    1.000† |     1.000 |     1.000 |
+| filtered-branch                  | filtered    |   10 |    2 |     1.000 |     1.000 |     1.000 |
+| agg-which-tools-errored          | aggregation |    9 |    0 | wrong shape |         — |         — |
+| agg-which-projects-errored       | aggregation |    9 |    0 | wrong shape |         — |         — |
+| agg-which-sessions-ran-cargo     | aggregation |   10 |    0 | wrong shape |         — |         — |
+| agg-which-programs-ran           | aggregation |   10 |    0 | wrong shape |         — |         — |
+| agg-which-languages-were-quoted  | aggregation |   10 |    0 | wrong shape |         — |         — |
+| agg-which-files-were-missing     | aggregation |    9 |    0 | wrong shape |         — |         — |
+
+### Notes
+
+- `ident-snippet-half-a-name` — The invariant named in the issue: half an identifier finds the whole one, because the analyzer emits `snippetgenerator` plus `snippet` plus `generator` at one shared position.
+- `ident-iserror-no-underscore` — `iserror` must find `is_error`: the separator-free whole form is what makes the two spellings share a term.
+- `ident-pascal-finds-snake` — PascalCase typed at a snake_case definition. Both spellings collapse to the same term set, which is the only reason this direction works.
+- `ident-snake-finds-pascal` — The reverse of the row above, asserted separately: a symmetry claim that is only tested in one direction is not tested.
+- `ident-sha256-pasted-whole` — A 64-character hash is one term, not forty-one fragments, and it survives a length filter set to 255 rather than the stock 40. Pasting it back must find exactly the document it came from.
+- `ident-uuid-first-chunk` — The first chunk of a session uuid: eight hex digits mixing letters and digits, so the blob rule keeps it whole. The later chunk `ba69` would split into `ba` + `69`, which is why a uuid-prefix query has to use the first chunk.
+- `ident-release-flag-phrase` — Quoted deliberately. Unquoted, the leading `-` of `--release` is the query parser's negation operator, so `cargo build --release` asks for documents that do NOT contain `release` — a hazard worth having a row about rather than a rule in a comment.
+- `ident-source-path` — A path is three terms at three positions (`src`, `index`, `rs`) ANDed, not a phrase, so a document holding `src/lib.rs` beside the word `index` also matches. That costs precision, which this harness does not score, and never costs recall.
+- `boundary-tokenizer-both-halves` — The word is English prose in eval-notes and a `let` binding inside a ```rust fence in eval-tokenizer. One query has to reach both, through two different analyzers.
+- `boundary-tokenizers-plural` — The same intent, typed as a plural, and graded against the same documents so the only difference between the two rows is the query string. The prose half is stemmed on both sides and still answers; the ```rust fence is not stemmed on either side, so the plural cannot reach it. A measured limitation of splitting a message between two analyzers.
+- `boundary-index-both-halves` — Prose in the notes session, a receiver in a ```rust fence in the uuid session, and the path `src/index.rs` in between. Everything a reader would keep is graded: grading only the two halves would leave eight matching documents ungraded and turn MRR into a statement about the fixture rather than about retrieval.
+- `boundary-indexes-plural` — The plural of the row above, graded against the same documents. It costs less than the `tokenizers` row does, because the one fenced document here also discusses the index in its prose — which is the useful half of the finding: a fence is reachable by a plural only when the message around it says the same thing in English.
+- `boundary-parse-verb-and-function` — `parses` and `parsed` reach `parse` through the stemmer, `parse_whole` through the identifier split, and `src/parse.rs` through the path split — three routes to one term. The one graded document none of them reaches is the prose that says only `parser`, which the English stemmer leaves as `parser`; it is graded 1 so the miss stays visible in the number.
+- `boundary-compiling-stems` — `compiling`, `compiled` and `compilation` share a stem, so prose answers all three. The compiler's own output does not: `tool_output` takes the code analyzer, where `compile` and `compiling` are different terms. That document is graded 1 to keep the miss visible in the number.
+- `boundary-fenced-identifier-only` — An identifier that exists only inside a fence. Nothing about it is English, and it has to be reachable anyway.
+- `boundary-filter-prose-and-fence` — `filter` is a word in the subagent's prose, a method call in its fence, and half of `RemoveLongFilter` in a grep result — three routings of one term, through `text`, `code` and `tool_output`.
+- `para-build-fails` — The words `build` and `fail` appear nowhere in any body of the eval-buildfail session — only in its title. Without the context header this query returns nothing at all, which is the whole argument for issue #23.
+- `para-retrieval-notes` — `retrieval` is in the notes session's title and opening prompt and in no other body. Every document of that session is about it and only one of them says so.
+- `para-split-identifiers` — The canonical fragment problem: `yes, do that` is a whole turn of the conversation and is reachable by nothing a person would type unless its session's title is indexed with it.
+- `para-incremental-indexing` — `make it incremental` says one of the two words and the session title says the other. Neither document is reachable by the pair on its own.
+- `para-hash-rule-subagent` — A subagent transcript has no title record at all, so its header is built from the prompt the parent synthesised for it. That is the only context a sidechain document has, and it is what makes one retrievable.
+- `para-error-log` — The two `Read` calls that went looking for a log carry the word `log` in their path and no word for what they were for; the summary at the end carries `errors` and no `log`. The pair is only in the header.
+- `para-release-artifact` — `artifact` is a word of the opening prompt and of no other body in the session. Every document but the opener needs the header to carry it, and `release` is everywhere, so the pair is a clean read on what the session row buys.
+- `filtered-project-other-tool` — The project prefix is written as a literal absolute path. A `~/code` prefix would be expanded against the runner's own $HOME and match nothing in CI.
+- `filtered-lang-rust` — `--lang` matches the fence info string exactly and lowercased, so the corpus writes ```rust and never ```Rust or ```rs.
+- `filtered-lang-python` — Two python fences in two different projects, reached by a keyword that only exists inside a fence.
+- `filtered-program-cargo` — `--program` reads `bash_cmd.program`, which only exists when the brush grammar accepted the command, so this row also asserts that the corpus's Bash commands actually parse.
+- `filtered-errors-only-exit-101` — An exit code is a digit run, which is its own part of any identifier it sits in, so it is searchable on its own.
+- `filtered-date-window` — The `--since 7d` case, pinned. `date_range()` resolves a relative span against `chrono::Utc::now()`, so a relative filter over a corpus with frozen timestamps matches a shrinking set every day until the row silently means nothing. Absolute dates are the only form that is still true next year.
+- `filtered-sidechains-only` — The corpus carries one real subagent file at subagents/agent-<id>.jsonl, so `is_sidechain` comes from the path the way it does in a real transcript tree.
+- `filtered-agent-type` — `agent_type` comes from `attributionAgent` on the sidechain's assistant records, which is the only place a subagent's type is written in a transcript the indexer can see without the .meta.json sidecar.
+- `filtered-session-prefix` — `--session` matches by prefix, which is what anyone pasting the first block of a uuid expects.
+- `filtered-branch` — `--branch` is an exact term match on a STRING field, so the slash in a branch name is not a tokenizer problem.
+- `agg-which-tools-errored` — "What errors did we see" has no defensible top-k: seven failures spread over four tools, and any ten of them ranked by BM25 is an arbitrary sample of a distribution. The answer is the bucket counts, so scoring the ranking would book a modelling mistake as a retrieval miss.
+- `agg-which-projects-errored` — "Where are the failures" is a question about how errors are distributed across projects. A ranked list answers it only by accident, and answers it differently for every k a caller happens to pass.
+- `agg-which-sessions-ran-cargo` — "Which sessions used cargo" is a set membership question. A top-k list over-represents whichever session mentioned cargo most often, which is the opposite of what was asked.
+- `agg-which-programs-ran` — "What did we actually run" is a terms aggregation over a multi-valued JSON subpath: one shell one-liner contributes several programs, so a document count and a value count are different numbers and a ranking reports neither.
+- `agg-which-languages-were-quoted` — "What languages show up around the index" is a distribution over fence info strings. `code_lang` is multi-valued, so one answer holding a rust fence and a bash fence is one document and two bucket increments — a fact a ranked list cannot express at all.
+- `agg-which-files-were-missing` — "Which files were we unable to read" aggregates a tool parameter that is not in the schema at all — a JSON subpath of `tool_input`. There is no ranking of documents that answers it; the answer is the list of distinct values and their counts.
