@@ -859,8 +859,8 @@ The nice part is that nothing had to be stored. The split that makes a skeleton 
 for query semantics: a tool call already keeps the **call** (its name plus the input's own
 strings) in `text` and the **result** in `tool_output`, so *the skeleton is the `text` side of a
 turn's documents*. Measured on the two real captures and the eval corpus, a turn's JSON context
-costs 5872 bytes on average and its skeleton 555 — 9.5% overall, and the worst turn in the
-corpus goes from 19992 bytes to 1642 ([`EVAL.md` §5](EVAL.md#5-turn-skeletons--issue-25)).
+costs 5651 bytes on average and its skeleton 555 — 9.8% overall, and the worst turn in the
+corpus goes from 19541 bytes to 1642 ([`EVAL.md` §5](EVAL.md#5-turn-skeletons--issue-25)).
 
 **Derived at query time, never materialised.** A stored `turn_skeleton` field on the leading
 document would save the fetch and cost the thing `build_replacements` exists to protect: a late

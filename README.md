@@ -489,7 +489,7 @@ the whole point of `--errors-only`; the frames under that first line are what `s
 The saving is the point. As `--json`, the two commands above are 39,709 bytes and 6,197: the
 skeleton replaces the turn's documents rather than joining them, so what you pay for context
 drops by an order of magnitude. Measured across the whole eval corpus and both real captures, a
-turn's context costs 5,872 bytes on average and its skeleton 555 — 9.5%, recorded in
+turn's context costs 5,651 bytes on average and its skeleton 555 — 9.8%, recorded in
 [`EVAL.md` §5](docs/EVAL.md#5-turn-skeletons--issue-25). The hit itself is untouched: it is still
 the full document, with its own `body` and `tool_output`.
 

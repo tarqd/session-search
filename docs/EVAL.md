@@ -405,29 +405,35 @@ functions the CLI renders them with, so the ratio cannot drift away from the pro
 The corpus is wider here than in §1–§4: the two `real_*_slice.jsonl` captures come first,
 because they are what makes this "on a real corpus", and the eval fixtures follow.
 
+One normalisation, and it matters for whether this table can be checked at all: `Doc::source_path`
+is absolute, so it is a property of the *checkout* rather than of the transcript — twenty-odd
+bytes per document more on a CI runner than in a home directory, all of them on the context side.
+It is replaced with the file's own name before measuring. That errs the safe way: a real absolute
+path adds to the context side and nothing to the skeleton, so these ratios understate the saving.
+
 ```
 | transcript                                 |     turns |      docs |     ctx B |    skel B |  skel % |
 |--------------------------------------------|-----------|-----------|-----------|-----------|---------|
-| real_main_slice.jsonl                      |         1 |         9 |     14371 |      1596 |    11.1 |
-| real_sidechain_slice.jsonl                 |         1 |        11 |     19992 |      1642 |     8.2 |
-| b20208d8-fbdb-5918-ba69-d203de6ed6dc.jsonl |         3 |        12 |     13560 |      1078 |     7.9 |
-| eval-buildfail.jsonl                       |         3 |        13 |     12429 |      1096 |     8.8 |
-| eval-facets.jsonl                          |         2 |        13 |     12832 |      1261 |     9.8 |
-| eval-notes.jsonl                           |         2 |         9 |      8419 |       954 |    11.3 |
-| eval-tokenizer.jsonl                       |         4 |        12 |     12360 |      1259 |    10.2 |
-| ALL                                        |        16 |        79 |     93963 |      8886 |     9.5 |
+| real_main_slice.jsonl                      |         1 |         9 |     14002 |      1596 |    11.4 |
+| real_sidechain_slice.jsonl                 |         1 |        11 |     19541 |      1642 |     8.4 |
+| b20208d8-fbdb-5918-ba69-d203de6ed6dc.jsonl |         3 |        12 |     13008 |      1078 |     8.3 |
+| eval-buildfail.jsonl                       |         3 |        13 |     11831 |      1096 |     9.3 |
+| eval-facets.jsonl                          |         2 |        13 |     12234 |      1261 |    10.3 |
+| eval-notes.jsonl                           |         2 |         9 |      8005 |       954 |    11.9 |
+| eval-tokenizer.jsonl                       |         4 |        12 |     11808 |      1259 |    10.7 |
+| ALL                                        |        16 |        79 |     90429 |      8886 |     9.8 |
 
-mean turn: 5872 B of context, 555 B of skeleton
-worst turn: 19992 B of context, 1642 B of skeleton
+mean turn: 5651 B of context, 555 B of skeleton
+worst turn: 19541 B of context, 1642 B of skeleton
 ```
 
 Bytes, not tokens: a token count needs a tokenizer this crate does not ship and would not agree
 with whichever model reads the output. Divide by ~4 for an English-and-JSON estimate — the mean
-turn goes from roughly 1500 tokens to 140, and the worst turn in the corpus from roughly 5000
+turn goes from roughly 1400 tokens to 140, and the worst turn in the corpus from roughly 4900
 to 410.
 
 **What the shape of the table says.** The saving is not an average trick: every file lands
-between 7.9% and 11.3%, and the *worst* turn — `real_sidechain_slice.jsonl`, which is a whole
+between 8.3% and 11.9%, and the *worst* turn — `real_sidechain_slice.jsonl`, which is a whole
 subagent transcript, because rule 3 of the Turns section makes a sidechain one turn — is also
 the one where the byte cap does the most work. The consistency is the mechanism showing through:
 what a skeleton drops is `tool_output`, and `tool_output` is the overwhelming majority of the
@@ -471,7 +477,7 @@ unless they are this blunt.
 7. **§3 says almost nothing about the similarity tuning.** See the last paragraph of §3: the
    parameter that governs `--similar-to` on a real index is inert at this corpus size.
 8. **§5 is sixteen turns.** The skeleton ratio is consistent across all sixteen and across two
-   real captures, which is why it is quotable as an order of magnitude and not as `9.5%`. A
+   real captures, which is why it is quotable as an order of magnitude and not as `9.8%`. A
    corpus with a forty-call turn in it would move the mean and would be the first real test of
    the byte cap; there is no such turn in `tests/fixtures/`.
 

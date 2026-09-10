@@ -106,20 +106,43 @@ fn skeleton_json_bytes(turn: &[&Doc]) -> usize {
     .unwrap_or(0)
 }
 
+/// `Doc::source_path` is absolute, so it is a property of the *checkout* rather than of the
+/// transcript: `/home/user/session-search/...` locally and `/home/runner/work/...` on the runner
+/// differ by about twenty bytes per document, all of them on the context side, and a snapshot
+/// taken on one machine fails on the other. The same trap `corpus::doc_ref` documents for
+/// document ids.
+///
+/// Replacing it with the file's own name makes the table reproducible, and errs the safe way:
+/// a real absolute path *adds* to the context side and nothing to the skeleton, so what is
+/// measured here understates the saving rather than inflating it.
+fn without_the_checkout_path(docs: Vec<Doc>, path: &Path) -> Vec<Doc> {
+    let name = path
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    docs.into_iter()
+        .map(|d| Doc {
+            source_path: name.clone(),
+            ..d
+        })
+        .collect()
+}
+
 pub fn measure() -> anyhow::Result<Vec<Measured>> {
     let opts = ParseOptions::default();
     let mut out = Vec::new();
     for path in transcripts()? {
         let parsed = parse_whole(&path, &opts)?;
         anyhow::ensure!(!parsed.docs.is_empty(), "{path:?} produced no documents");
-        let turns = by_turn(&parsed.docs);
+        let docs = without_the_checkout_path(parsed.docs, &path);
+        let turns = by_turn(&docs);
         let mut measured = Measured {
             label: path
                 .file_name()
                 .map(|n| n.to_string_lossy().into_owned())
                 .unwrap_or_default(),
             turns: turns.len(),
-            docs: parsed.docs.len(),
+            docs: docs.len(),
             context_bytes: 0,
             skeleton_bytes: 0,
             worst_context: 0,
