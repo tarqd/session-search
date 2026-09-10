@@ -59,6 +59,9 @@ pub struct QueryRow {
     /// This query's recall@k was arithmetically forced to `1.000` by the fixture rather than
     /// earned by the ranker. See [`at_recall_ceiling`] for exactly what that means.
     pub ceiling: bool,
+    /// The same fact about nDCG: this query's nDCG@[`NDCG_K`] could not have been anything but
+    /// `1.000`. See [`at_ndcg_ceiling`].
+    pub ndcg_pinned: bool,
     pub recall: f64,
     pub mrr: f64,
     pub ndcg: f64,
@@ -80,6 +83,9 @@ pub struct ClassMetrics {
     /// Of those, how many could not have scored anything but `recall = 1.000`. A class whose
     /// `ceiling` equals its `scored` has a recall column that measures the fixture.
     pub ceiling: usize,
+    /// Of those, how many could not have scored anything but `nDCG = 1.000`. Same failure mode
+    /// as `ceiling`, on the metric the write-ups tell readers to reason from.
+    pub ndcg_pinned: usize,
     pub recall: f64,
     pub mrr: f64,
     pub ndcg: f64,
@@ -98,6 +104,16 @@ pub struct Report {
 
 /// Score `run` over every query in `fixture`, cutting each ranked list at `k`.
 pub fn evaluate(fixture: &Fixture, label: &str, run: Run<'_>, k: usize) -> anyhow::Result<Report> {
+    // The cut below is what `ndcg` sees, and `ndcg` divides by an ideal that always runs to
+    // `NDCG_K`. With `k < NDCG_K` the actual DCG would be computed over `k` documents and the
+    // ideal over up to ten, and the quotient would still be printed under a column headed
+    // `nDCG@10` — systematically understated, and mislabelled, which is the drift `NDCG_K`'s
+    // own documentation promises does not happen. Loud rather than latent.
+    assert!(
+        k >= NDCG_K,
+        "evaluate(k = {k}) is below NDCG_K = {NDCG_K}: nDCG would be computed over {k} \
+         documents, divided by an ideal over {NDCG_K}, and printed as nDCG@{NDCG_K}"
+    );
     let mut rows = Vec::with_capacity(fixture.queries.len());
     for query in &fixture.queries {
         // The closure runs for aggregation-shaped rows too. What it returns is recorded and
@@ -156,6 +172,7 @@ fn score(query: &EvalQuery, hits: &[String], k: usize) -> QueryRow {
         relevant: relevant.len(),
         found,
         ceiling: scored && at_recall_ceiling(hits.len(), found, relevant.len(), k),
+        ndcg_pinned: scored && at_ndcg_ceiling(query, hits, found, relevant.len()),
         recall: if scored { recall } else { 0.0 },
         mrr: if scored { mrr } else { 0.0 },
         ndcg: if scored { ndcg(query, hits) } else { 0.0 },
@@ -197,6 +214,37 @@ fn score(query: &EvalQuery, hits: &[String], k: usize) -> QueryRow {
 /// solved.
 fn at_recall_ceiling(retrieved: usize, found: usize, relevant: usize, k: usize) -> bool {
     retrieved < k && found == retrieved && found == relevant && relevant > 0
+}
+
+/// Was this query's nDCG arithmetically pinned at `1.000` by the fixture?
+///
+/// The same failure mode [`at_recall_ceiling`] exists for, on the metric the write-ups then tell
+/// readers to reason from — and it is the more dangerous of the two, because nDCG is the column
+/// that is supposed to still move when recall has saturated.
+///
+/// It is pinned when the run returned exactly the graded set (`found == retrieved == relevant`)
+/// **and every returned grade is the same**. DCG and IDCG are then the same multiset of gains
+/// against the same discounts, so they are equal under *any* permutation: no reordering the
+/// ranker could produce would change the number. A one-document row with a single grade is the
+/// commonest case; two documents both graded 3 is the same thing.
+///
+/// The equal-grades condition is what makes this narrower than the recall ceiling: a row that
+/// retrieved exactly its graded set with grades 3 and 1 is *not* pinned, because putting the 1
+/// first would cost it.
+///
+/// Counted per class rather than asserted on, for the same reason as the recall ceiling: it is
+/// a fact about the fixture that a reader of the table needs, not a bug to fix.
+fn at_ndcg_ceiling(query: &EvalQuery, hits: &[String], found: usize, relevant: usize) -> bool {
+    if relevant == 0 || found != relevant || found != hits.len() {
+        return false;
+    }
+    let mut grades = hits
+        .iter()
+        .map(|hit| query.relevant.get(hit).copied().unwrap_or(0));
+    let Some(first) = grades.next() else {
+        return false;
+    };
+    grades.all(|g| g == first)
 }
 
 /// nDCG@[`NDCG_K`]: `sum((2^g - 1) / log2(i + 2))` over the returned order, divided by the same
@@ -250,6 +298,7 @@ fn mean(rows: &[&QueryRow]) -> ClassMetrics {
         queries: rows.len(),
         scored: n,
         ceiling: scored.iter().filter(|r| r.ceiling).count(),
+        ndcg_pinned: scored.iter().filter(|r| r.ndcg_pinned).count(),
         recall: avg(|r| r.recall),
         mrr: avg(|r| r.mrr),
         ndcg: avg(|r| r.ndcg),

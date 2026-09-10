@@ -55,6 +55,7 @@ impl Report {
             self.overall.queries
         ));
         out.push_str(&ceiling_footnote(&self.overall));
+        out.push_str(&pinned_footnote(&self.overall));
         out.push_str(&self.appendix());
         out
     }
@@ -92,7 +93,15 @@ impl Report {
                 } else {
                     f3(r.recall)
                 };
-                (recall, f3(r.mrr), f3(r.ndcg))
+                // The same mark on nDCG, with its own symbol: the two conditions overlap but
+                // are not the same, and a row can be at the recall ceiling with an nDCG that
+                // still moves (`ident-iserror-no-underscore` is one).
+                let ndcg = if r.ndcg_pinned {
+                    format!("{}\u{2021}", f3(r.ndcg))
+                } else {
+                    f3(r.ndcg)
+                };
+                (recall, f3(r.mrr), ndcg)
             } else {
                 // Spelled out rather than left blank: a blank cell reads as zero.
                 ("wrong shape".into(), "—".into(), "—".into())
@@ -216,8 +225,8 @@ impl Report {
 /// The class table's header and rule, shared by [`Report::table`] and [`class_table_only`].
 fn header(k: usize) -> String {
     format!(
-        "| {:<CLASS_W$} | {:>7} | {:>6} | {:>7} | {:>NUM_W$} | {:>NUM_W$} | {:>NUM_W$} |\n\
-         | {} | {} | {} | {} | {} | {} | {} |\n",
+        "| {:<CLASS_W$} | {:>7} | {:>6} | {:>7} | {:>NUM_W$} | {:>NUM_W$} | {:>NUM_W$} | {:>6} |\n\
+         | {} | {} | {} | {} | {} | {} | {} | {} |\n",
         "class",
         "queries",
         "scored",
@@ -225,6 +234,7 @@ fn header(k: usize) -> String {
         format!("recall@{k}"),
         "MRR",
         format!("nDCG@{NDCG_K}"),
+        "pinned",
         "-".repeat(CLASS_W),
         "-".repeat(7),
         "-".repeat(6),
@@ -232,6 +242,7 @@ fn header(k: usize) -> String {
         "-".repeat(NUM_W),
         "-".repeat(NUM_W),
         "-".repeat(NUM_W),
+        "-".repeat(6),
     )
 }
 
@@ -249,8 +260,8 @@ fn row(label: &str, m: &ClassMetrics) -> String {
         (f3(m.recall), f3(m.mrr), f3(m.ndcg))
     };
     format!(
-        "| {:<CLASS_W$} | {:>7} | {:>6} | {:>7} | {:>NUM_W$} | {:>NUM_W$} | {:>NUM_W$} |\n",
-        label, m.queries, m.scored, m.ceiling, recall, mrr, ndcg,
+        "| {:<CLASS_W$} | {:>7} | {:>6} | {:>7} | {:>NUM_W$} | {:>NUM_W$} | {:>NUM_W$} | {:>6} |\n",
+        label, m.queries, m.scored, m.ceiling, recall, mrr, ndcg, m.ndcg_pinned,
     )
 }
 
@@ -279,7 +290,29 @@ pub fn class_table_only(report: &Report) -> String {
     }
     out.push_str(&row("overall", &report.overall));
     out.push_str(&ceiling_footnote(&report.overall));
+    out.push_str(&pinned_footnote(&report.overall));
     out
+}
+
+/// The sentence that has to travel with every table carrying a `pinned` column.
+///
+/// Same contract as [`ceiling_footnote`], on the metric that is otherwise described as the one
+/// with headroom everywhere: a `pinned` row's nDCG is 1.000 under every ordering the ranker
+/// could produce, so a class mean over rows that are mostly pinned is not measuring ranking.
+fn pinned_footnote(overall: &ClassMetrics) -> String {
+    if overall.ndcg_pinned == 0 {
+        return String::new();
+    }
+    format!(
+        "\n`pinned` counts scored queries whose nDCG@{NDCG_K} was forced to 1.000: the run \
+         returned exactly the graded set and every returned grade is equal, so DCG and IDCG are \
+         the same sum under any permutation and no reordering could change the number. {} of {} \
+         scored queries are in that state, marked \u{2021} in the per-query table. A class mean \
+         whose rows are mostly pinned has less \
+         headroom than the column suggests, and a delta on it is spread over the movable rows \
+         rather than over all of them.\n",
+        overall.ndcg_pinned, overall.scored,
+    )
 }
 
 /// The sentence that has to travel with every table carrying a `ceiling` column.

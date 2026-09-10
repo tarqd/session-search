@@ -19,8 +19,11 @@
 //! 4. A query whose graded set is *only* the seed's turn is dropped from this arm and counted
 //!    in the report's preamble. Its recall would be 0/0.
 //!
-//! Both arms — plain search and MoreLikeThis — are then scored over that same narrowed fixture,
-//! so the diff table compares two answers to one question rather than two questions.
+//! Both arms — plain search and MoreLikeThis — are then scored over that same narrowed fixture
+//! **and search the same narrowed candidate set**: rule 3 removes the seed's turn from the
+//! graded set, and [`text_run`] removes it from the text arm's hits as well, because a graded
+//! set one arm is scored against and the other is also filtered by is not one question asked
+//! twice. See `text_run` for what that asymmetry was worth on this fixture.
 //!
 //! **What each class means for this arm.** `identifier` and `boundary` measure analyzer
 //! behaviour on a typed query; there is no typed query here, so those rows say only "having
@@ -156,16 +159,36 @@ pub fn narrow(fixture: &Fixture, placements: &Placements) -> Narrowed {
 
 /// The plain-search arm over the narrowed fixture: the comparison column, and the reason the
 /// MoreLikeThis numbers can be read at all.
+///
+/// **This arm gets the narrowing's exclusion too, and that is not a detail.** `narrow` deletes
+/// the seed's whole turn from every row's graded set, because `--similar-to` cannot return it.
+/// Scoring the text arm on that narrowed graded set while still letting it *retrieve* the seed
+/// turn charges it for slots the protocol has already decided cannot count: on this fixture
+/// every narrowed row had the text arm returning at least one seed-turn document, and twelve
+/// rows were truncated at `k` with those documents occupying real slots — `para-build-fails`
+/// spent 4 of its 10 on them. The MoreLikeThis arm loses nothing that way, by construction. The
+/// resulting gap is not a fact about ranking, it is the protocol scoring one arm against a rule
+/// it never told the other about.
+///
+/// So the seed's turn is removed from this arm's hits before the cut at `k`, and the request
+/// asks for `k + |turn|` so the cut still has `k` candidates to make. Both arms then rank the
+/// same candidate set and are cut at the same depth.
 pub fn text_run<'a>(
     index: &'a Index,
     fields: &'a Fields,
+    placements: &'a Placements,
+    seeds: &'a BTreeMap<String, String>,
     k: usize,
 ) -> impl Fn(&EvalQuery) -> anyhow::Result<Vec<String>> + 'a {
     move |query: &EvalQuery| {
+        let seed = seeds
+            .get(&query.id)
+            .ok_or_else(|| anyhow::anyhow!("query {:?} has no seed", query.id))?;
+        let excluded = placements.turn_of(seed);
         let request = SearchRequest {
             query: Some(query.query.clone()),
             filters: query.filters.clone(),
-            limit: k,
+            limit: k + excluded.len(),
             include_thinking: query.include_thinking,
             ..SearchRequest::default()
         };
@@ -173,6 +196,8 @@ pub fn text_run<'a>(
             .hits
             .iter()
             .map(|hit| doc_ref(&hit.doc))
+            .filter(|reference| !excluded.contains(reference))
+            .take(k)
             .collect())
     }
 }
@@ -234,8 +259,9 @@ pub fn preamble(narrowed: &Narrowed, total: usize) -> String {
          because `--similar-to` excludes it by default. {} of {total} fixture rows are scored \
          here: {} were dropped for having no graded document outside the seed's own turn, and \
          the aggregation-shaped rows are not ranked answers at all.\n\n\
-         Read `recall` and ignore nothing else: MRR and nDCG are reported for symmetry with the \
-         baseline table, but a similarity search has no notion of \"the answer\" to rank first.\n",
+         Read `recall` and ignore everything else: MRR and nDCG are reported for symmetry with \
+         the baseline table, but a similarity search has no notion of \"the answer\" to rank \
+         first.\n",
         narrowed.fixture.queries.len(),
         narrowed.dropped.len(),
     )

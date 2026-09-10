@@ -41,7 +41,7 @@ pub enum Variant {
     /// * `doc_to_json(doc, None, true)` drops the title and the first prompt but still composes
     ///   a header out of the project basename, the git branch and the turn prompt — that
     ///   measures the `sessions.json` half of the feature, not the feature. It is available
-    ///   here as [`Variant::SessionRowOnly`], labelled as what it is.
+    ///   here as [`Variant::WithoutSessionRow`], labelled as what it is.
     /// * clearing `doc.project` / `doc.git_branch` / `doc.turn_prompt` on a cloned `Doc` also
     ///   empties the `project` and `git_branch` *schema* fields, which breaks `--project` and
     ///   `--branch` on the ablated arm and stops the two arms being comparable at all.
@@ -54,7 +54,7 @@ pub enum Variant {
     /// `doc_to_json(doc, None, ..)`: no session row, but the per-document pieces of the header
     /// (project basename, branch, turn prompt) still compose one. The third arm, and the one
     /// that answers "how much of the win comes from `sessions.json`".
-    SessionRowOnly,
+    WithoutSessionRow,
 }
 
 impl Variant {
@@ -63,7 +63,7 @@ impl Variant {
         match self {
             Variant::WithContext => "context_text on",
             Variant::WithoutContext => "context_text off",
-            Variant::SessionRowOnly => "context_text without the session row",
+            Variant::WithoutSessionRow => "context_text without the session row",
         }
     }
 }
@@ -165,7 +165,7 @@ impl Corpus {
                     // skipping the composition: every *other* field then comes off exactly the
                     // same code path on both arms, which is what makes them comparable.
                     Variant::WithContext | Variant::WithoutContext => Some(&transcript.session),
-                    Variant::SessionRowOnly => None,
+                    Variant::WithoutSessionRow => None,
                 };
                 let mut json = doc_to_json(doc, session, true);
                 if variant == Variant::WithoutContext {

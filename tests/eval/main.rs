@@ -202,9 +202,9 @@ fn the_context_header_is_what_answers_a_paraphrase() -> anyhow::Result<()> {
     // The third arm: the per-document half of the header (project basename, branch, turn
     // prompt) with no session row behind it. Reported, not asserted on — it answers "how much
     // of the win is sessions.json" and nothing in the product depends on the answer.
-    let (row_index, row_fields) = corpus.index(Variant::SessionRowOnly)?;
+    let (row_index, row_fields) = corpus.index(Variant::WithoutSessionRow)?;
     let row_run = search_run(&row_index, &row_fields);
-    let session_row_only = evaluate(&fixture, Variant::SessionRowOnly.label(), &row_run, K)?;
+    let without_session_row = evaluate(&fixture, Variant::WithoutSessionRow.label(), &row_run, K)?;
 
     let paraphrase_before = without.by_class[&Class::Paraphrase];
     let paraphrase_after = with.by_class[&Class::Paraphrase];
@@ -241,7 +241,7 @@ fn the_context_header_is_what_answers_a_paraphrase() -> anyhow::Result<()> {
     out.push('\n');
     out.push_str(&report::query_delta_table(&without, &with));
     out.push_str("\n\n");
-    out.push_str(&Report::diff(&without, &session_row_only));
+    out.push_str(&Report::diff(&without, &without_session_row));
     out.push_str(
         "\nThe second table is the third arm: `doc_to_json(doc, None, ..)`, which drops the \
          session title and the opening prompt but still composes a header out of the project \
@@ -249,7 +249,7 @@ fn the_context_header_is_what_answers_a_paraphrase() -> anyhow::Result<()> {
          feature, not the feature.\n",
     );
     out.push('\n');
-    out.push_str(&report::class_table_only(&session_row_only));
+    out.push_str(&report::class_table_only(&without_session_row));
     publish("ablation.md", &out)?;
     insta::assert_snapshot!(Report::diff(&without, &with));
     Ok(())
@@ -257,22 +257,42 @@ fn the_context_header_is_what_answers_a_paraphrase() -> anyhow::Result<()> {
 
 /// The analyzer invariants the issue names, as hard assertions over the indexed corpus rather
 /// than as an average. A metric can absorb one of these breaking; an assertion cannot.
+///
+/// **Every assertion here has to be one identifier splitting can fail.** That is not automatic,
+/// and getting it wrong is the quiet way this test becomes decoration. A transcript *about* the
+/// tokenizer discusses `snippet` and `is_error` in prose, so a document that spells the query
+/// verbatim answers it whether or not `SplitIdentifiers` ever ran — asserting against one of
+/// those proves the corpus contains the word, not that the analyzer split anything. Worse,
+/// `context_text` copies a session's first prompt onto *every* document of that session, so on
+/// the `WithContext` index a word in the opening question is reachable from every document in
+/// the file by a route that has nothing to do with splitting.
+///
+/// So the targets below are chosen against both leaks: each one is a document that does not
+/// spell the query, reached from a session whose header does not spell it either. The check
+/// that this is still true is mechanical — delete `.filter(SplitIdentifiers)` from both
+/// analyzers in `src/tokenizer.rs` and every `splitting_only` assertion here must fail.
 #[test]
 fn analyzer_invariants_hold_over_the_indexed_corpus() -> anyhow::Result<()> {
     let corpus = Corpus::load()?;
     let (index, fields) = corpus.index(Variant::WithContext)?;
-    let hits = |query: &str| -> anyhow::Result<Vec<String>> {
+    // The same corpus without the header, for the assertions whose target is only reachable
+    // through `context_text` on the shipped index. Scoring is irrelevant here — this test asks
+    // what is retrievable, not in what order — so the ablated arm is a legitimate place to ask.
+    let (bare_index, bare_fields) = corpus.index(Variant::WithoutContext)?;
+
+    let hits_in = |index: &Index, fields: &Fields, query: &str| -> anyhow::Result<Vec<String>> {
         let request = SearchRequest {
             query: Some(query.to_string()),
             limit: 20,
             ..SearchRequest::default()
         };
-        Ok(search(&index, &fields, &request)?
+        Ok(search(index, fields, &request)?
             .hits
             .iter()
             .map(|hit| doc_ref(&hit.doc))
             .collect())
     };
+    let hits = |query: &str| hits_in(&index, &fields, query);
     let contains = |query: &str, doc: &str| -> anyhow::Result<()> {
         let found = hits(query)?;
         assert!(
@@ -282,11 +302,39 @@ fn analyzer_invariants_hold_over_the_indexed_corpus() -> anyhow::Result<()> {
         Ok(())
     };
 
-    // Half a name finds the whole one, in both directions and in both spellings.
-    contains("snippet", "eval-tokenizer:-:1")?;
+    // The four invariants issue #21 names, each aimed at a document that has to be *split* into
+    // reach. `splitting_only` marks them: remove the filter and these are the ones that go red.
+
+    // splitting_only: `eval-facets:-:2` is the `grep -rn is_error src` tool call, in a session
+    // about error facets whose header never says "iserror". Only the underscore-stripped whole
+    // form puts it in reach of this query. (`eval-tokenizer:-:11` — asserted below — spells
+    // "iserror" in prose, so it answers this query either way and proves nothing on its own.)
+    contains("iserror", "eval-facets:-:2")?;
+    // Not splitting_only — the tool call spells `is_error` — but the pair is the invariant:
+    // both spellings have to reach the same document.
+    contains("is_error", "eval-facets:-:2")?;
+
+    // splitting_only: the ```rust fence holding `SnippetGenerator::create`, which spells neither
+    // "snippet" nor "generator". Asserted on the ablated index because on the shipped one the
+    // session's opening question ("Why does searching for snippet never find ...") rides along
+    // in `context_text` on every document of the file, so the `WithContext` arm cannot tell
+    // splitting from the header.
+    let bare = hits_in(&bare_index, &bare_fields, "snippet")?;
+    assert!(
+        bare.iter().any(|r| r == "eval-tokenizer:-:4"),
+        "\"snippet\" did not reach the SnippetGenerator fence without the header; it retrieved \
+         {bare:?}"
+    );
+
+    // splitting_only: same document, the other half of the name.
     contains("generator", "eval-tokenizer:-:1")?;
+
+    // And the plain-prose spellings, which a user does type and which must keep working — but
+    // which the assertions above are what actually pin.
+    contains("snippet", "eval-tokenizer:-:1")?;
     contains("iserror", "eval-tokenizer:-:11")?;
     contains("is_error", "eval-tokenizer:-:11")?;
+    // splitting_only: `eval-tokenizer:-:2` names `open_or_create` only inside the tool result.
     contains("OpenOrCreate", "eval-tokenizer:-:2")?;
     contains("open_or_create", "eval-tokenizer:-:2")?;
     contains("openOrCreate", "eval-tokenizer:-:2")?;
@@ -428,9 +476,11 @@ fn aggregation_shaped_queries_are_a_facet_not_a_ranking() -> anyhow::Result<()> 
 /// Two assertions and no floor. A floor would be a claim that a particular similarity quality
 /// is required, which nothing in the product depends on yet. What is asserted is that the
 /// configuration *works*: it answers every query without erroring, it finds something relevant
-/// overall, and with `--include-source` the seed comes back ranked first — the property
-/// `MoreLikeThis` has by construction, and therefore the one whose absence would mean the query
-/// is not being built from the seed at all.
+/// overall, and with `--include-source` the seed's turn is **retrievable** — which is the
+/// property whose absence would mean the query is not being built from the seed at all.
+///
+/// Retrievable, not first. See the comment on that assertion: "the source ranks first" is a
+/// property of a single-document seed and is measurably false for a turn-shaped one.
 #[test]
 fn more_like_this_is_scored_as_the_similarity_baseline() -> anyhow::Result<()> {
     let (fixture, corpus, _) = loaded()?;
@@ -438,7 +488,7 @@ fn more_like_this_is_scored_as_the_similarity_baseline() -> anyhow::Result<()> {
     let placements = similar::Placements::of(&corpus);
     let narrowed = similar::narrow(&fixture, &placements);
 
-    let text_run = similar::text_run(&index, &fields, K);
+    let text_run = similar::text_run(&index, &fields, &placements, &narrowed.seeds, K);
     let text = evaluate(
         &narrowed.fixture,
         "text query, seed's turn ungraded",

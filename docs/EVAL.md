@@ -21,12 +21,24 @@ Each run also writes `target/eval/report.md` (§1), `target/eval/ablation.md` (�
 `target/eval/similar.md` (§3), `target/eval/facets.md` (§4), plus `corpus.md`, `hits.md` and
 `similar-hits.md`, which are the per-document listings a person grading a new query reads.
 
-**Taken at:** `cb810a164f25166d2562ff689490bd341e3adb73` (`cb810a1`, *Expose MoreLikeThis as `--similar-to` (#26)*). The commit that
-adds this file changes `tests/eval/report.rs` and `tests/eval/metrics.rs` to print two things the
-harness was computing implicitly and never showing — the `ceiling` column of §1–§3 and the facet
-table of §4 — and changes nothing else. `src/` and `tests/fixtures/` are byte-identical to
-`cb810a1`, so every metric here is main's, and the snapshot diff for that commit adds columns
-without moving a single digit.
+**Taken at:** the review-fix commit on `claude/issues-21-23-26-workflow`, which is where these
+numbers were last regenerated. `tests/fixtures/` is byte-identical to `cb810a1`, so the corpus and
+the grades are unchanged; three things in the harness and one in `src/` moved, and each one is
+visible in a table above:
+
+- `tests/eval/metrics.rs` and `report.rs` gained the **`pinned`** column and its footnote —
+  `nDCG@10` rows that are arithmetically fixed at `1.000`, the nDCG analogue of `ceiling`. It
+  adds a column to §1–§3 and moves no digit of recall, MRR or nDCG.
+- `tests/eval/similar.rs` gave the **text arm the same seed-turn exclusion the MoreLikeThis arm
+  has**. Only the `text` column of §3's diff table moves, and it moves *up*: it had been charged
+  for top-k slots spent on documents the protocol deletes from the graded set, which the
+  similarity arm cannot return at all. §3's MoreLikeThis column is unchanged.
+- `src/search.rs` replaced `MoreLikeThisQuery` with a deterministic reimplementation of the same
+  query shape (see [DESIGN](DESIGN.md#similarity)). Every number in §3 is unchanged by it — the
+  seeds in this corpus stay under the term cap, which is where the old implementation's
+  non-determinism began — but before the fix these numbers were only stable by luck.
+
+§1, §2 and §4's metrics are therefore identical to `cb810a1`'s.
 
 **Corpus: 65 documents, 6 synthetic transcripts, 39 queries, 33 of them scored.** Read
 [§5](#5-what-these-numbers-cannot-support) before quoting any of it. Two of the four scored
@@ -41,18 +53,20 @@ The shipped configuration (`context_text` on), scored per class at k = 10.
 
 ## Retrieval eval — context_text on
 
-| class       | queries | scored | ceiling | recall@10 |       MRR |   nDCG@10 |
-| ----------- | ------- | ------ | ------- | --------- | --------- | --------- |
-| identifier  |       8 |      8 |       7 |     1.000 |     1.000 |     0.928 |
-| boundary    |       8 |      8 |       2 |     0.913 |     1.000 |     0.774 |
-| paraphrase  |       7 |      7 |       1 |     0.844 |     1.000 |     0.782 |
-| filtered    |      10 |     10 |       7 |     1.000 |     1.000 |     0.981 |
-| aggregation |       6 |      0 |       0 |         — |         — |         — |
-| overall     |      39 |     33 |      17 |     0.946 |     1.000 |     0.876 |
+| class       | queries | scored | ceiling | recall@10 |       MRR |   nDCG@10 | pinned |
+| ----------- | ------- | ------ | ------- | --------- | --------- | --------- | ------ |
+| identifier  |       8 |      8 |       7 |     1.000 |     1.000 |     0.928 |      2 |
+| boundary    |       8 |      8 |       2 |     0.913 |     1.000 |     0.774 |      1 |
+| paraphrase  |       7 |      7 |       1 |     0.844 |     1.000 |     0.782 |      0 |
+| filtered    |      10 |     10 |       7 |     1.000 |     1.000 |     0.981 |      5 |
+| aggregation |       6 |      0 |       0 |         — |         — |         — |      0 |
+| overall     |      39 |     33 |      17 |     0.946 |     1.000 |     0.876 |      8 |
 
 6 of 39 queries are aggregation-shaped: recorded, never scored. Top-k is the wrong answer shape for them, and scoring one as a ranking would book a modelling mistake as a retrieval miss.
 
 `ceiling` counts scored queries whose recall was forced to 1.000 by the fixture rather than earned by the ranker: the query matched fewer documents than the cutoff and every one of them is graded relevant, so `found == relevant == the whole match set` and no ranking could have scored it differently. 17 of 33 scored queries are in that state, marked † in the per-query table. Their recall cannot rise, cannot fall except by a document leaving the matched set entirely, and says nothing about ordering. A class whose `ceiling` equals its `scored` has a recall column that measures the corpus, not retrieval.
+
+`pinned` counts scored queries whose nDCG@10 was forced to 1.000: the run returned exactly the graded set and every returned grade is equal, so DCG and IDCG are the same sum under any permutation and no reordering could change the number. 8 of 33 scored queries are in that state, marked ‡ in the per-query table. A class mean whose rows are mostly pinned has less headroom than the column suggests, and a delta on it is spread over the movable rows rather than over all of them.
 
 And the class that has no retrieval score, because a ranking is the wrong answer shape for it — §4
 is what it reports instead.
@@ -89,29 +103,33 @@ field's posting lists and in nothing else.
 
 ## Retrieval eval — context_text off
 
-| class       | queries | scored | ceiling | recall@10 |       MRR |   nDCG@10 |
-| ----------- | ------- | ------ | ------- | --------- | --------- | --------- |
-| identifier  |       8 |      8 |       8 |     1.000 |     1.000 |     0.928 |
-| boundary    |       8 |      8 |       1 |     0.875 |     1.000 |     0.767 |
-| paraphrase  |       7 |      7 |       0 |     0.206 |     0.857 |     0.255 |
-| filtered    |      10 |     10 |       9 |     1.000 |     1.000 |     0.977 |
-| aggregation |       6 |      0 |       0 |         — |         — |         — |
-| overall     |      39 |     33 |      18 |     0.801 |     0.970 |     0.761 |
+| class       | queries | scored | ceiling | recall@10 |       MRR |   nDCG@10 | pinned |
+| ----------- | ------- | ------ | ------- | --------- | --------- | --------- | ------ |
+| identifier  |       8 |      8 |       8 |     1.000 |     1.000 |     0.928 |      2 |
+| boundary    |       8 |      8 |       1 |     0.875 |     1.000 |     0.767 |      1 |
+| paraphrase  |       7 |      7 |       0 |     0.206 |     0.857 |     0.255 |      0 |
+| filtered    |      10 |     10 |       9 |     1.000 |     1.000 |     0.977 |      6 |
+| aggregation |       6 |      0 |       0 |         — |         — |         — |      0 |
+| overall     |      39 |     33 |      18 |     0.801 |     0.970 |     0.761 |      9 |
 
 `ceiling` counts scored queries whose recall was forced to 1.000 by the fixture rather than earned by the ranker: the query matched fewer documents than the cutoff and every one of them is graded relevant, so `found == relevant == the whole match set` and no ranking could have scored it differently. 18 of 33 scored queries are in that state, marked † in the per-query table. Their recall cannot rise, cannot fall except by a document leaving the matched set entirely, and says nothing about ordering. A class whose `ceiling` equals its `scored` has a recall column that measures the corpus, not retrieval.
 
+`pinned` counts scored queries whose nDCG@10 was forced to 1.000: the run returned exactly the graded set and every returned grade is equal, so DCG and IDCG are the same sum under any permutation and no reordering could change the number. 9 of 33 scored queries are in that state, marked ‡ in the per-query table. A class mean whose rows are mostly pinned has less headroom than the column suggests, and a delta on it is spread over the movable rows rather than over all of them.
+
 ## Retrieval eval — context_text on
 
-| class       | queries | scored | ceiling | recall@10 |       MRR |   nDCG@10 |
-| ----------- | ------- | ------ | ------- | --------- | --------- | --------- |
-| identifier  |       8 |      8 |       7 |     1.000 |     1.000 |     0.928 |
-| boundary    |       8 |      8 |       2 |     0.913 |     1.000 |     0.774 |
-| paraphrase  |       7 |      7 |       1 |     0.844 |     1.000 |     0.782 |
-| filtered    |      10 |     10 |       7 |     1.000 |     1.000 |     0.981 |
-| aggregation |       6 |      0 |       0 |         — |         — |         — |
-| overall     |      39 |     33 |      17 |     0.946 |     1.000 |     0.876 |
+| class       | queries | scored | ceiling | recall@10 |       MRR |   nDCG@10 | pinned |
+| ----------- | ------- | ------ | ------- | --------- | --------- | --------- | ------ |
+| identifier  |       8 |      8 |       7 |     1.000 |     1.000 |     0.928 |      2 |
+| boundary    |       8 |      8 |       2 |     0.913 |     1.000 |     0.774 |      1 |
+| paraphrase  |       7 |      7 |       1 |     0.844 |     1.000 |     0.782 |      0 |
+| filtered    |      10 |     10 |       7 |     1.000 |     1.000 |     0.981 |      5 |
+| aggregation |       6 |      0 |       0 |         — |         — |         — |      0 |
+| overall     |      39 |     33 |      17 |     0.946 |     1.000 |     0.876 |      8 |
 
 `ceiling` counts scored queries whose recall was forced to 1.000 by the fixture rather than earned by the ranker: the query matched fewer documents than the cutoff and every one of them is graded relevant, so `found == relevant == the whole match set` and no ranking could have scored it differently. 17 of 33 scored queries are in that state, marked † in the per-query table. Their recall cannot rise, cannot fall except by a document leaving the matched set entirely, and says nothing about ordering. A class whose `ceiling` equals its `scored` has a recall column that measures the corpus, not retrieval.
+
+`pinned` counts scored queries whose nDCG@10 was forced to 1.000: the run returned exactly the graded set and every returned grade is equal, so DCG and IDCG are the same sum under any permutation and no reordering could change the number. 8 of 33 scored queries are in that state, marked ‡ in the per-query table. A class mean whose rows are mostly pinned has less headroom than the column suggests, and a delta on it is spread over the movable rows rather than over all of them.
 
 ## context_text off → context_text on
 
@@ -252,43 +270,45 @@ thirds" is a measurement of: seven queries.
 
 The MoreLikeThis arm answers a different question from the fixture's own. Each row is seeded from the document that row graded highest, the query string is discarded, the row's filters are kept, and the seed's whole turn is removed from the graded set because `--similar-to` excludes it by default. 27 of 39 fixture rows are scored here: 6 were dropped for having no graded document outside the seed's own turn, and the aggregation-shaped rows are not ranked answers at all.
 
-Read `recall` and ignore nothing else: MRR and nDCG are reported for symmetry with the baseline table, but a similarity search has no notion of "the answer" to rank first.
+Read `recall` and ignore everything else: MRR and nDCG are reported for symmetry with the baseline table, but a similarity search has no notion of "the answer" to rank first.
 
 ## Retrieval eval — more like this, seeded from the top-graded document
 
-| class       | queries | scored | ceiling | recall@10 |       MRR |   nDCG@10 |
-| ----------- | ------- | ------ | ------- | --------- | --------- | --------- |
-| identifier  |       6 |      6 |       0 |     0.361 |     0.333 |     0.210 |
-| boundary    |       7 |      7 |       0 |     0.570 |     0.571 |     0.526 |
-| paraphrase  |       6 |      6 |       0 |     0.589 |     0.297 |     0.334 |
-| filtered    |       8 |      8 |       1 |     0.875 |     0.547 |     0.643 |
-| overall     |      27 |     27 |       1 |     0.618 |     0.450 |     0.448 |
+| class       | queries | scored | ceiling | recall@10 |       MRR |   nDCG@10 | pinned |
+| ----------- | ------- | ------ | ------- | --------- | --------- | --------- | ------ |
+| identifier  |       6 |      6 |       0 |     0.361 |     0.333 |     0.210 |      0 |
+| boundary    |       7 |      7 |       0 |     0.570 |     0.571 |     0.526 |      0 |
+| paraphrase  |       6 |      6 |       0 |     0.589 |     0.297 |     0.334 |      0 |
+| filtered    |       8 |      8 |       1 |     0.875 |     0.547 |     0.643 |      1 |
+| overall     |      27 |     27 |       1 |     0.618 |     0.450 |     0.448 |      1 |
 
 0 of 27 queries are aggregation-shaped: recorded, never scored. Top-k is the wrong answer shape for them, and scoring one as a ranking would book a modelling mistake as a retrieval miss.
 
 `ceiling` counts scored queries whose recall was forced to 1.000 by the fixture rather than earned by the ranker: the query matched fewer documents than the cutoff and every one of them is graded relevant, so `found == relevant == the whole match set` and no ranking could have scored it differently. 1 of 27 scored queries are in that state, marked † in the per-query table. Their recall cannot rise, cannot fall except by a document leaving the matched set entirely, and says nothing about ordering. A class whose `ceiling` equals its `scored` has a recall column that measures the corpus, not retrieval.
+
+`pinned` counts scored queries whose nDCG@10 was forced to 1.000: the run returned exactly the graded set and every returned grade is equal, so DCG and IDCG are the same sum under any permutation and no reordering could change the number. 1 of 27 scored queries are in that state, marked ‡ in the per-query table. A class mean whose rows are mostly pinned has less headroom than the column suggests, and a delta on it is spread over the movable rows rather than over all of them.
 
 ## text query, seed's turn ungraded → more like this, seeded from the top-graded document
 
 | class       | metric    |    before |     after |     delta |
 | ----------- | --------- | --------- | --------- | --------- |
 | identifier  | recall    |     1.000 |     0.361 |    -0.639 |
-| identifier  | MRR       |     0.889 |     0.333 |    -0.556 |
-| identifier  | nDCG      |     0.851 |     0.210 |    -0.640 |
-| boundary    | recall    |     0.894 |     0.570 |    -0.324 |
-| boundary    | MRR       |     0.643 |     0.571 |    -0.071 |
-| boundary    | nDCG      |     0.573 |     0.526 |    -0.047 |
-| paraphrase  | recall    |     0.706 |     0.589 |    -0.117 |
-| paraphrase  | MRR       |     0.774 |     0.297 |    -0.477 |
-| paraphrase  | nDCG      |     0.714 |     0.334 |    -0.380 |
+| identifier  | MRR       |     1.000 |     0.333 |    -0.667 |
+| identifier  | nDCG      |     0.903 |     0.210 |    -0.693 |
+| boundary    | recall    |     0.914 |     0.570 |    -0.344 |
+| boundary    | MRR       |     1.000 |     0.571 |    -0.429 |
+| boundary    | nDCG      |     0.793 |     0.526 |    -0.267 |
+| paraphrase  | recall    |     1.000 |     0.589 |    -0.411 |
+| paraphrase  | MRR       |     0.889 |     0.297 |    -0.592 |
+| paraphrase  | nDCG      |     0.865 |     0.334 |    -0.531 |
 | filtered    | recall    |     1.000 |     0.875 |    -0.125 |
-| filtered    | MRR       |     0.750 |     0.547 |    -0.203 |
-| filtered    | nDCG      |     0.801 |     0.643 |    -0.158 |
-| overall     | recall    |     0.907 |     0.618 |    -0.289 |
-| overall     | MRR       |     0.758 |     0.450 |    -0.308 |
-| overall     | nDCG      |     0.734 |     0.448 |    -0.286 |
+| filtered    | MRR       |     1.000 |     0.547 |    -0.453 |
+| filtered    | nDCG      |     1.000 |     0.643 |    -0.357 |
+| overall     | recall    |     0.978 |     0.618 |    -0.360 |
+| overall     | MRR       |     0.975 |     0.450 |    -0.525 |
+| overall     | nDCG      |     0.895 |     0.448 |    -0.447 |
 
-Recall ceiling: 0 of 27 scored queries before and 1 of 27 after had their recall forced to 1.000 by the fixture — the query matched fewer documents than the cutoff and every one of them is graded relevant. A delta of 0.000 on a class made mostly of those rows means the class could not have moved, which is a different claim from the change being neutral.
+Recall ceiling: 13 of 27 scored queries before and 1 of 27 after had their recall forced to 1.000 by the fixture — the query matched fewer documents than the cutoff and every one of them is graded relevant. A delta of 0.000 on a class made mostly of those rows means the class could not have moved, which is a different claim from the change being neutral.
 
 Dropped from this arm: ident-sha256-pasted-whole, ident-release-flag-phrase, boundary-fenced-identifier-only, para-hash-rule-subagent, filtered-sidechains-only, filtered-agent-type.
 
@@ -312,7 +332,11 @@ evidence that the *measurement* does not transfer rather than that the *feature*
   is arithmetic — and read 0.875 as "the filters compose", not as a similarity score.
 - **paraphrase (0.589) is the only fair test in the table**, because it is the class where the
   query words are deliberately not the transcript's words, which is the situation similarity is
-  for. It loses 0.117 recall to a text query that has the `context_text` header working for it.
+  for. It loses 0.411 recall to a text query that has the `context_text` header working for it —
+  and that text arm now searches the *same* candidate set, with the seed's turn removed from its
+  hits as well as from the graded set. Before that symmetry it scored 0.706 here, understated,
+  because it was spending top-k slots on documents the protocol had already deleted from the
+  graded set while the MoreLikeThis arm could not return them at all.
 - **MRR (0.450) and nDCG (0.448) should not be quoted at all.** A similarity search has no notion
   of "the answer" belonging at rank 1; those columns are printed for shape-compatibility with the
   baseline table and mean nothing here.

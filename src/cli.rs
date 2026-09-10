@@ -162,7 +162,7 @@ pub enum Command {
         )]
         similar_in: Vec<SimilarField>,
         /// Keep the source turn in the results of a `--similar-to` search. It is left out by
-        /// default, because `MoreLikeThis` ranks the source first by construction.
+        /// default, because it is the turn you are already looking at.
         #[arg(long = "include-source", requires = "similar_to")]
         include_source: bool,
         #[command(flatten, next_help_heading = "Filters")]
@@ -759,19 +759,22 @@ struct Anchor {
 }
 
 /// `--around` takes a bare `seq` or any of the document references `--similar-to` takes, and
-/// `search::resolve_doc` is what defines "any of them" for both commands.
+/// `search::resolve_doc_in` is what defines "any of them" for both commands.
 ///
-/// Routing this through the shared resolver is what makes `abc123` mean the same document to
-/// `show` and to `--similar-to`, and it replaces a linear scan of up to fifty thousand
-/// documents with a term query. It also gains the ambiguous-prefix error: this used to take the
-/// *first* document whose uuid started with what was typed, in `seq` order, which is a silently
-/// wrong window rather than a question.
+/// What routing this through the shared resolver buys: `abc123` means the same document to
+/// `show` and to `--similar-to`, `--around` gains the prefix and coordinate spellings it did
+/// not have (it previously required an id in full, and answered anything else with "no document
+/// with uuid ... in session ..."), and a linear scan of up to fifty thousand documents becomes
+/// a term query.
 ///
-/// The session the caller named still wins. A reference resolves index-wide, so it can land in
-/// another session — or in a subagent file when the caller asked for the main transcript — and
-/// windowing that would print a transcript the caller never asked for under the heading of the
-/// one they did. Both are named in the error, because "no such uuid" would be a lie about a
-/// document that plainly exists.
+/// The session the caller named is an **input** to the resolution, not a check after it. That
+/// distinction is the whole of `DocScope`: a reference that is unique inside the named
+/// transcript has to resolve even when the index holds another document with the same uuid
+/// somewhere else, which §9's `resetSessionFile()`/`relocated` case guarantees it sometimes
+/// does. Only when the scope finds nothing is the reference resolved index-wide again, and then
+/// solely to say where it actually lives — because "no such uuid" would be a lie about a
+/// document that plainly exists, and windowing it would print a transcript the caller never
+/// asked for under the heading of the one they did.
 fn resolve_seq(
     index: &tantivy::Index,
     fields: &crate::schema::Fields,
@@ -786,6 +789,20 @@ fn resolve_seq(
             source_path: None,
         });
     }
+    let scope = search::DocScope::Transcript {
+        session_id,
+        agent_id,
+        source_path,
+    };
+    if let Some(doc) = search::resolve_doc_in(index, fields, spec, scope)? {
+        return Ok(Anchor {
+            seq: doc.seq,
+            source_path: Some(doc.source_path),
+        });
+    }
+
+    // Nothing inside the transcript the caller named. Resolve index-wide, purely to report
+    // where the reference does live; an ambiguity out here is reported as one.
     let doc = search::resolve_doc(index, fields, spec)?;
     if doc.session_id != session_id || doc.agent_id.as_deref() != agent_id {
         bail!(
@@ -796,16 +813,11 @@ fn resolve_seq(
             agent_label(agent_id)
         );
     }
-    if let Some(path) = source_path.filter(|p| *p != doc.source_path) {
-        bail!(
-            "{spec:?} is in {}, but this window is scoped to {path}",
-            doc.source_path
-        );
-    }
-    Ok(Anchor {
-        seq: doc.seq,
-        source_path: Some(doc.source_path),
-    })
+    bail!(
+        "{spec:?} is in {}, but this window is scoped to {}",
+        doc.source_path,
+        source_path.unwrap_or(&doc.source_path)
+    );
 }
 
 /// ` (agent <id>)`, or nothing for a main transcript. Only ever used inside an error message,
@@ -1788,6 +1800,110 @@ mod tests {
         let bare = resolve_seq(&index, &fields, "s1", None, None, "3").unwrap();
         assert_eq!(bare.seq, 3);
         assert!(bare.source_path.is_none());
+    }
+
+    /// §9's `relocated` case: one transcript indexed under two project keys, so one session id
+    /// names two files and the *same record uuid* appears in both. `--around <that uuid>` has
+    /// to keep working.
+    ///
+    /// This is the regression test for scoping the resolution rather than checking it
+    /// afterwards. Resolved index-wide, the uuid matches two documents and the shared resolver
+    /// refuses it as ambiguous — and `source_path_for` returns `None` in exactly this case, so
+    /// there is no spelling of the command the caller could have used instead. The two
+    /// candidates are the same `seq` of the same session, i.e. one record read from two files,
+    /// which is the one ambiguity with only one answer.
+    #[test]
+    fn a_uuid_duplicated_across_a_relocated_session_still_anchors() {
+        use crate::search::testkit::{blank_doc, index_docs};
+        let mut docs = Vec::new();
+        for (tag, path) in [
+            ("2c9bbdfa", "/tmp/a/s1.jsonl"),
+            ("1a3f8831", "/tmp/b/s1.jsonl"),
+        ] {
+            for seq in 0..4u64 {
+                let mut d = blank_doc(seq);
+                d.doc_id = format!("s1:-:{tag}:{seq}");
+                d.source_path = path.into();
+                // Identical uuids in both files — that is what makes it the same transcript.
+                d.uuid = Some(format!("eval-notes-a0{seq}"));
+                d.turn_seq = 2 * (seq / 2);
+                d.body = format!("{tag} {seq}");
+                docs.push(d);
+            }
+        }
+        let (index, fields) = index_docs(&docs);
+
+        // The §9 duplicate resolves to one record: two files, same session, same `seq`, so
+        // there is nothing to choose between them. That holds unscoped too, which is what lets
+        // `--similar-to` seed from a relocated transcript at all.
+        let doc = search::resolve_doc(&index, &fields, "eval-notes-a03").unwrap();
+        assert_eq!(doc.seq, 3);
+
+        let anchor = resolve_seq(&index, &fields, "s1", None, None, "eval-notes-a03").unwrap();
+        assert_eq!(anchor.seq, 3);
+        assert!(
+            anchor.source_path.is_some(),
+            "the window is pinned to a file"
+        );
+
+        // Genuine ambiguity inside the session is still a question, not a silent pick: `a0` is
+        // the prefix of four different `seq`s.
+        let err = format!(
+            "{:#}",
+            resolve_seq(&index, &fields, "s1", None, None, "eval-notes-a0").unwrap_err()
+        );
+        assert!(err.contains("ambiguous document reference"), "{err}");
+    }
+
+    /// A prefix that is unique inside the session the caller named resolves, even when the same
+    /// prefix matches other documents elsewhere in the index.
+    ///
+    /// This is the other half of scoping the resolution. The candidates here are *not* one
+    /// record — different sessions, different files, different uuids — so nothing collapses
+    /// them; the only thing that makes the reference answerable is that `show` already named a
+    /// transcript, and index-wide resolution threw that away.
+    #[test]
+    fn an_anchor_unique_inside_the_named_session_beats_a_collision_elsewhere() {
+        use crate::search::testkit::{blank_doc, index_docs};
+        let mut docs = Vec::new();
+        // One document in s1 whose uuid starts with `anchor-ab`.
+        let mut d = blank_doc(2);
+        d.uuid = Some("anchor-abc".into());
+        docs.push(d);
+        for seq in 0..2u64 {
+            let mut d = blank_doc(seq);
+            d.uuid = Some(format!("other-{seq}"));
+            docs.push(d);
+        }
+        // Two more in s2, so `anchor-ab` is a three-way prefix collision index-wide.
+        for (seq, uuid) in [(0u64, "anchor-abd"), (1, "anchor-abe")] {
+            let mut d = blank_doc(seq);
+            d.doc_id = format!("s2:-:{seq}");
+            d.session_id = "s2".into();
+            d.source_path = "/tmp/s2.jsonl".into();
+            d.uuid = Some(uuid.into());
+            docs.push(d);
+        }
+        let (index, fields) = index_docs(&docs);
+
+        // Index-wide the prefix is ambiguous, and `--similar-to` still says so.
+        let err = format!(
+            "{:#}",
+            search::resolve_doc(&index, &fields, "anchor-ab").unwrap_err()
+        );
+        assert!(err.contains("ambiguous document reference"), "{err}");
+
+        // Scoped to s1 it names exactly one document, which is the window `show` asked for.
+        let anchor = resolve_seq(&index, &fields, "s1", None, None, "anchor-ab").unwrap();
+        assert_eq!(anchor.seq, 2);
+        assert_eq!(anchor.source_path.as_deref(), Some("/tmp/s1.jsonl"));
+
+        // Scoped to s2 it is still ambiguous, because there it really is.
+        let err = format!(
+            "{:#}",
+            resolve_seq(&index, &fields, "s2", None, None, "anchor-ab").unwrap_err()
+        );
+        assert!(err.contains("ambiguous document reference"), "{err}");
     }
 
     /// `--around` now resolves index-wide, so it can land somewhere the caller did not ask

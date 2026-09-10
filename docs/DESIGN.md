@@ -118,8 +118,20 @@ each of which changes the design rather than decorating it:
   requires to enable scoring."), and `BooleanQuery`/`BoostQuery` forward `enable_scoring`
   verbatim, so wrapping does not rescue it. `Searcher::search` passes `Disabled` whenever
   `collector.requires_scoring()` is false — which is `TopDocs::order_by_fast_field`,
-  `docs_with_value`'s bare `Count`, and all of `facets()`. `search::ScoredQuery` rewrites
-  `Disabled { searcher_opt: Some(s) }` back to `enabled_from_searcher(s)`.
+  `docs_with_value`'s bare `Count`, and all of `facets()`.
+- **Its term selection is not reproducible, and this is the one that cannot be worked around
+  from outside.** `create_score_term` accumulates term frequencies in a
+  `std::collections::HashMap<Term, usize>` and picks the best `max_query_terms` with a
+  `BinaryHeap` whose `Ord` compares **only the score**. `score = tf * idf`, so two terms with the
+  same term frequency and the same document frequency tie exactly — the common case for a
+  turn-shaped seed, where nearly every token occurs once — and which of the tied terms survives
+  is then decided by `HashMap` iteration order. `RandomState` reseeds per instance, so the
+  surviving set differs between two calls *in one process against one unchanged index*. The
+  visible symptoms: `--similar-to` returned a different hit set and a different `total` on every
+  invocation; `--limit`/`--offset` paged over a different query each time, repeating and skipping
+  documents; and because `search()` re-derives a weight for the hit pass, the `Count`, the
+  aggregation and `docs_with_value`, a single `--facets` command could print `62 of 58 matching
+  docs have a value`.
 
 Two more, smaller: an empty `field_to_values` slice is an `Err` whose message blames missing
 stored fields (a lie for any caller using `with_document_fields`), while a non-empty source whose
@@ -128,6 +140,18 @@ at all — two different outcomes needing two different guards. And `max_query_t
 one (`if score_terms.len() > limit`), so 32 admits 33 clauses. `MoreLikeThis` itself — the struct
 with the tuning fields — is **not** exported; only `MoreLikeThisQuery` and its builder are, so
 there is no way to inspect or reuse the `BooleanQuery` it builds.
+
+**So `MoreLikeThisQuery` is not used.** `search::similar_terms` and `search::similar_query`
+rebuild the same shape — tokenize the seed per field with that field's own analyzer, keep the
+terms inside the document-frequency band and the word-length bounds, score them `tf * idf`, and
+OR the best `SIMILAR_MAX_QUERY_TERMS` of them into a `BooleanQuery` of `BoostQuery(TermQuery)`
+normalised by the best term's score. The selection is ordered by `(score, field, token)`, which
+is total, so the same seed against the same index yields the same query every time; the cap is
+exact rather than off by one; and because the result is a concrete `BooleanQuery` rather than a
+query type that recomputes itself inside `weight()`, every pass of one request sees the same
+clauses. Rebuilding it also settles the two edges above it: a `BooleanQuery` of `TermQuery`s
+reports its own `query_terms` and skips scoring when a collector asks it to, so no scoring
+adapter is needed.
 
 ## The two analyzers (`tokenizer.rs`)
 
@@ -981,11 +1005,20 @@ just session ids — `cli::resolve_id` is still what expands a session id for `s
 argument.
 
 `show --around` was rerouted through the same resolver. Two commands disagreeing about what
-`abc123` means would be worse than either behaviour alone, and it retires a linear scan of up to
-50 000 documents in favour of a term query. It also gains the ambiguity error: `--around` used to
-take the *first* document whose uuid started with what was typed, in `seq` order. A reference that
-resolves outside the session named on the command line is refused with both sides named, because
-"no such uuid" would be a lie about a document that plainly exists.
+`abc123` means would be worse than either behaviour alone; `--around` gains the prefix and
+coordinate spellings it did not have (it previously required an id in full, and answered anything
+else with `no document with uuid ... in session ...` — an error, never a wrong window); and a
+linear scan of up to 50 000 documents is retired in favour of a term query.
+
+The session named on the command line is an **input** to that resolution, not a check applied
+after it (`search::DocScope`). This matters because a reference can be unique inside the named
+transcript and ambiguous outside it — §9's `resetSessionFile()`/`relocated` case indexes one
+transcript under two project keys, so the same record uuid legitimately appears twice, and
+`source_path_for` returns `None` in exactly that case, leaving the caller no narrower spelling to
+use. Resolving index-wide first would refuse a question that has one answer. Two candidates that
+are the same `seq` of the same session are collapsed for the same reason: they are one record read
+from two files. A reference that resolves only *outside* the named session is still refused with
+both sides named, because "no such uuid" would be a lie about a document that plainly exists.
 
 **The source is the whole turn.** A default, not a flag. A turn is the unit a person remembers —
 the prompt, the calls it made, the answer — and each of those alone is a fragment: a tool call on
@@ -1076,10 +1109,11 @@ question confidently and wrongly. The one filter not applied is `max_query_terms
 "best 32" depends on a `tf * idf` ordering there is no reason to recompute; the surplus terms are
 ones the hit genuinely contains and the `1 / (1 + doc_freq)` weighting sorts them last anyway.
 
-**Sorting.** With `ScoredQuery` in place, `--similar-to --sort newest` means "documents similar to
-this one, most recent first", which is a legitimate request. The scores it discards were being
-zeroed anyway (`search()` replaces every hit's score with `0.0` under a time order), so re-enabling
-scoring for those collectors costs a BM25 computation nobody reads and changes no output.
+**Sorting.** `--similar-to --sort newest` means "documents similar to this one, most recent
+first", which is a legitimate request, and it works because the similarity clause is an ordinary
+`BooleanQuery` of `TermQuery`s: those skip scoring when the collector disables it, where a
+`MoreLikeThisQuery` would have returned an error instead of an answer. The scores a time order
+discards were being zeroed anyway — `search()` replaces every hit's score with `0.0` under one.
 
 **The HTTP API deliberately does not carry it.** Three reasons. `dto::SearchBody` exists to be
 Elastic Search UI's `RequestState`, and Search UI has no notion of "documents like this one", so a
@@ -1209,20 +1243,29 @@ and "the identifier fixture graded whatever the query matched", and only one of 
 
 The same reasoning applies to MRR, which is `1.000` in every scored class. The top hit is graded
 relevant on all 33 queries; a metric pinned at its maximum can register a collapse and nothing
-else. Keep it for that and never argue *for* a change from it. **nDCG@10 is the only metric with
-headroom in all four scored classes**, and it is the one to reason from.
+else. Keep it for that and never argue *for* a change from it.
+
+**nDCG@10 has the most headroom, and it is the one to reason from — but it is not free of the
+same problem.** A row whose run returned exactly its graded set with every grade equal has an nDCG
+of `1.000` under any permutation: DCG and IDCG are then the same sum, so no reordering the ranker
+could produce would move it. `metrics::at_ndcg_ceiling` is the definition and the `pinned` column
+beside `nDCG@10` is the count. Eight of the 33 scored rows are in that state, and **five of them
+are in the filtered class** — so `filtered nDCG@10 = 0.981` is a mean over ten rows of which half
+have exactly one reachable value, and a delta on that class is spread over the five movable rows
+rather than over all ten. Read the filtered nDCG with that in mind; the other three classes have
+at most two pinned rows each.
 
 **The numbers on main today**, at k = 10 over 33 scored queries (`target/eval/report.md`, and
 [`EVAL.md` §1](EVAL.md#1-baseline--issue-21) for the reading):
 
-| class | queries | ceiling | recall@10 | MRR | nDCG@10 |
-| --- | --- | --- | --- | --- | --- |
-| identifier | 8 | 7 | 1.000 | 1.000 | 0.928 |
-| boundary | 8 | 2 | 0.913 | 1.000 | 0.774 |
-| paraphrase | 7 | 1 | 0.844 | 1.000 | 0.782 |
-| filtered | 10 | 7 | 1.000 | 1.000 | 0.981 |
-| aggregation | 6 | 0 | — | — | — |
-| overall | 39 | 17 | 0.946 | 1.000 | 0.876 |
+| class | queries | ceiling | recall@10 | MRR | nDCG@10 | pinned |
+| --- | --- | --- | --- | --- | --- | --- |
+| identifier | 8 | 7 | 1.000 | 1.000 | 0.928 | 2 |
+| boundary | 8 | 2 | 0.913 | 1.000 | 0.774 | 1 |
+| paraphrase | 7 | 1 | 0.844 | 1.000 | 0.782 | 0 |
+| filtered | 10 | 7 | 1.000 | 1.000 | 0.981 | 5 |
+| aggregation | 6 | 0 | — | — | — | 0 |
+| overall | 39 | 17 | 0.946 | 1.000 | 0.876 | 8 |
 
 and the header ablation, which is issue #23's outstanding acceptance box
 ([`EVAL.md` §2](EVAL.md#2-context-header-onoff--issue-23)):
@@ -1268,17 +1311,21 @@ query string entirely, searches by `--similar-to <seed>`, and keeps the row's fi
 set is **narrowed** to what that arm could possibly return — the seed and every other document of
 the seed's turn are dropped, because the shipped default excludes the source turn — and a row
 whose graded set was *only* the seed's turn is dropped from the arm and counted. Both arms are
-scored over that same narrowed fixture, so the table compares two answers to one question.
+scored over that same narrowed fixture **and search the same narrowed candidate set**: the text
+arm has the seed's turn removed from its hits before the cut at k, exactly as the similarity arm
+has it removed by a `MustNot`. Without that second half the text arm spent top-k slots on
+documents the protocol had already deleted from the graded set while the similarity arm
+structurally could not, which understated the text column and flattered the comparison.
 
 27 of the 39 rows survive that narrowing. At k = 10 (`target/eval/similar.md`):
 
 | class | scored | recall@10 text | recall@10 MLT | Δ | nDCG@10 text | nDCG@10 MLT |
 | --- | --- | --- | --- | --- | --- | --- |
-| identifier | 6 | 1.000 | 0.361 | −0.639 | 0.851 | 0.210 |
-| boundary | 7 | 0.894 | 0.570 | −0.324 | 0.573 | 0.526 |
-| paraphrase | 6 | 0.706 | 0.589 | −0.117 | 0.714 | 0.334 |
-| filtered | 8 | 1.000 | 0.875 | −0.125 | 0.801 | 0.643 |
-| overall | 27 | 0.907 | 0.618 | −0.289 | 0.734 | 0.448 |
+| identifier | 6 | 1.000 | 0.361 | −0.639 | 0.903 | 0.210 |
+| boundary | 7 | 0.914 | 0.570 | −0.344 | 0.793 | 0.526 |
+| paraphrase | 6 | 1.000 | 0.589 | −0.411 | 0.865 | 0.334 |
+| filtered | 8 | 1.000 | 0.875 | −0.125 | 1.000 | 0.643 |
+| overall | 27 | 0.978 | 0.618 | −0.360 | 0.895 | 0.448 |
 
 **Read that as a baseline, not as a verdict, and read only the recall column.** Three of the four
 classes are asking this arm a question it is not for. `identifier` and `boundary` are analyzer
@@ -1288,7 +1335,7 @@ than a design goal, and the −0.639 is exactly what one should expect. `filtere
 cleanly, and its 0.875 is the property that actually matters — the filters still AND on top of
 the similarity clause. `paraphrase` is the fairest of the four, because it is the class where the
 query words are *not* the transcript's words, which is the situation similarity exists for; MLT
-loses 0.117 recall there against a text query that has the `context_text` header working for it.
+loses 0.411 recall there against a text query that has the `context_text` header working for it.
 MRR and nDCG are printed for symmetry and mean little: a similarity search has no notion of "the
 answer" that belongs at rank 1.
 

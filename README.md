@@ -933,8 +933,7 @@ Options:
                             additionally needs `--include-thinking` [possible values: text, code,
                             tool_output, thinking]
       --include-source      Keep the source turn in the results of a `--similar-to` search. It is
-                            left out by default, because `MoreLikeThis` ranks the source first by
-                            construction
+                            left out by default, because it is the turn you are already looking at
   -h, --help                Print help (see more with '--help')
 ```
 
@@ -1065,9 +1064,10 @@ call on its own is mostly a file path and an exit code; the neighbours are what 
 
 **The source turn is left out of the results, and nothing else is.** Hit 3 is from the same
 session — a later turn that ran `cargo check --release` again — and it is exactly the kind of
-answer this is for. What is gone is turn #0 itself, all four documents of it, because
-"documents like this one" ranks *this one* first by construction and the four things you already
-have on screen are not an answer. Pass `--include-source` to put it back.
+answer this is for. What is gone is turn #0 itself, all four documents of it, because the
+four things you already have on screen are not an answer. It is removed by an explicit
+`MustNot` rather than by trusting the ranking to bury it: a turn-shaped seed does *not*
+reliably rank first, so there is nothing to trust. Pass `--include-source` to put it back.
 
 **The scores are BM25 over a query built from the source turn's own terms**, and the highlights
 show which of those terms each hit carried — so the answer to "why is this here?" is on the
@@ -1877,13 +1877,14 @@ cargo test --test eval                    # assert: floors, invariants, committe
 cargo test --test eval -- --nocapture     # ...and print the tables
 ```
 
-Either way it writes six artifacts under `target/eval/` (gitignored):
+Either way it writes seven artifacts under `target/eval/` (gitignored):
 
 | file | what it is |
 | --- | --- |
 | `report.md` | the per-class table and per-query appendix — the thing a pull request pastes |
 | `ablation.md` | the same fixture scored with and without the `context_text` header |
 | `similar.md` | `--similar-to` scored against a plain text query, with the protocol that makes that comparison mean something |
+| `facets.md` | the aggregation class's bucket tables — what those six queries report instead of a ranking, and the only place that class has a result at all |
 | `hits.md` | every query's ranked hits with the grade each one was given |
 | `similar-hits.md` | the same, for the similarity arm |
 | `corpus.md` | every document in the corpus, its reference and an excerpt |
