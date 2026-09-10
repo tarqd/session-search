@@ -220,6 +220,34 @@ session-search search "" --tool-input file_path=DESIGN.md --limit 2
       4 files and must code against the signatures here rather than …
 ```
 
+Filter on what a tool **returned** with `--tool-output`, a phrase over the result text —
+"which commands printed a passing test summary?", with no free-text query at all:
+
+```bash
+session-search search "" --tool-output "test result: ok" --limit 1
+```
+
+```
+1 of 10 hits · 6 ms
+
+▌ 246d26f9-45fd-5656-aaa1-1768c41a6448  (1 hit)
+▌ /home/user/session-search · claude/tool-outputs-indexing-9l87sj · 2026-09-09 23:38
+
+   1. 23:38:26  assistant Bash command=cargo test --all-features 2>&1 | grep -E "test resu…  #63  6.48
+      **test** **result**: **ok**. 176 passed; 0 failed; 4 ignored; 0 measured; 0 filtered out
+      **test** **result**: **ok**. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
+```
+
+The call and its result are two fields, so you can ask about either one alone:
+
+| query | matches |
+| --- | --- |
+| `Compiling` | 14 — both fields, the default |
+| `text:Compiling` | 10 — the tool name and its input only |
+| `tool_output:Compiling` | 5 — what the tool actually printed |
+
+A bare query still spans the pair, so nothing that used to match stops matching.
+
 ### 5. Read the conversation around a hit
 
 `--context N` pulls the surrounding turns in next to each hit:
@@ -358,9 +386,10 @@ session-search search 'tool_input.command:"cargo test"'
 ```
 
 `tool_input` is full-text indexed, so every parameter is searchable whether or not it is worth
-faceting. Nothing derives an "executable name" facet from a command, because doing that honestly
-would mean parsing shell grammar — `FOO=bar cmd`, `cd x && cargo build`, subshells, quoting — and
-a wrong bucket is worse than no bucket.
+faceting. No "executable name" is pattern-matched out of a command line, because `FOO=bar cmd`,
+`cd x && cargo build`, subshells and quoting all defeat that, and a wrong bucket is worse than no
+bucket. `Bash` calls get an actual shell parse into a separate field instead:
+[Bash commands, parsed](#bash-commands-parsed).
 
 Numeric parameters work exactly the same way — here, the timeouts the agent picked for its Bash
 calls:
@@ -425,6 +454,13 @@ kind  2 values · 978 of 978 matching docs have a value
 And `search --facets a,b` returns hits and aggregations in one pass, so a single call answers
 "show me the top matches *and* the distribution behind them".
 
+> **Colons.** `tool_input` is a JSON field in the default search fields, so `word:value` is a
+> lookup on that JSON subpath — which is why `command:cargo` works as shorthand for
+> `tool_input.command:cargo`. A colon followed by whitespace or `/` is treated as ordinary
+> punctuation instead, so `https://github.com` and `note: this` search as text. If an
+> unqualified `word:value` returns nothing, the tool says so on stderr rather than letting a
+> misread colon look like an empty corpus; quote the term to force a literal search.
+
 > One asymmetry worth knowing: **facets key on the raw, untokenized value; search matches words
 > inside it.** So `facets tool_input.command` shows whole command lines, while
 > `search --tool-input command=cargo` matches any command *containing* `cargo`. That is
@@ -435,6 +471,214 @@ And `search --facets a,b` returns hits and aggregations in one pass, so a single
 > distinct values (HyperLogLog, hence the tilde). Summing the printed rows is **not** the total —
 > on a long-tail field the visible rows can be a fraction of a percent of the matches. The JSON
 > carries the same four numbers as `matching_docs`, `docs_with_value`, `other_docs` and `distinct`.
+
+---
+
+## Bash commands, parsed
+
+`tool_input.command` is one long string, which is exactly why faceting it hands back a list
+instead of a distribution. So every `Bash` tool call carries a second field, `bash_cmd`, holding
+the command after it has been through a real shell parser
+([`brush-parser`](https://crates.io/crates/brush-parser), wrapped in `src/bash.rs`). The blocks
+in this section were captured later than the ones above, against a fresh index of this machine, so
+the session ids and the totals differ:
+
+```bash
+session-search search 'bash_cmd.args:"--release"' --limit 1 --json |
+  jq '.hits[0] | {command: .tool_input.command, bash_cmd}'
+```
+
+```json
+{
+  "command": "cargo build --release 2>&1 | tail -5",
+  "bash_cmd": {
+    "args": [
+      "build",
+      "--release",
+      "-5"
+    ],
+    "program": [
+      "cargo",
+      "tail"
+    ]
+  }
+}
+```
+
+`program` is the `argv[0]` of every *simple command* in the script; `args` is every suffix word of
+every one of those commands, flags included, flattened in the same order. That one line is two
+commands, so it contributes two programs, and the arguments of both land in `args`.
+
+"Every simple command" is meant literally: both sides of a pipeline, every link of an `&&` or
+`||` chain, the bodies of `if`, `while`, `until`, `for` and `case`, subshells and brace groups,
+function bodies, coprocesses and process substitutions. One tool call that makes a directory,
+writes a file through a heredoc, patches it with `sed` and runs the tests reports all of it:
+
+```bash
+session-search search 'bash_cmd.args:"--nocapture"' --program mkdir --limit 1 --json |
+  jq -c '.hits[0].bash_cmd.program'
+```
+
+```json
+["mkdir","cat","cd","sed","cargo","tail"]
+```
+
+Words are the raw text of the script with one layer of matching outer quotes removed, and nothing
+else is done to them. `"*.snap*"` is indexed as `*.snap*`, and `'"command":"[^"]*"'` keeps its
+inner double quotes. Variables are **not** expanded and a `$(…)` or backtick substitution is left
+as opaque text, because a transcript records what was typed, not what the shell made of it at the
+time. The examples in this section were themselves run through a `B=./target/release/session-search`
+shorthand, and the index has them under the program `$B`, exactly as written:
+
+```bash
+session-search search 'bash_cmd.program:"$B"' --limit 0
+```
+
+```
+0 of 4 hits · 1 ms
+```
+
+Three things are deliberately not args: assignment prefixes (`FOO=bar cmd` gives the program `cmd`
+and no argument), redirect operators and their targets, and heredoc bodies. The call above is
+`cat > …/src/bash.rs <<'RSEOF'` followed by the file body, and its `args` contain neither the
+redirect target nor a word of the heredoc. A command the shell grammar rejects, an unterminated
+quote for instance, gets no `bash_cmd` at all rather than a guess. There is no heuristic fallback, so
+every value you see came out of a script that really parsed.
+
+### Counting programs
+
+```bash
+session-search facets bash_cmd.program --top 8
+```
+
+```
+bash_cmd.program  showing 8 of ~24 values · 120 of 207 matching docs have a value
+  grep     42  ████████████████████████████████████████
+  echo     37  ███████████████████████████████████
+  sed      34  ████████████████████████████████
+  cargo    28  ███████████████████████████
+  python3  27  ██████████████████████████
+  head     26  █████████████████████████
+  tail     25  ████████████████████████
+  cat      14  █████████████
+```
+
+Unlike whole command lines, program names repeat, so this is a distribution rather than a listing:
+the same question asked of `tool_input.command` is the long tail in the section above.
+
+Two numbers in that header need care. The bucket counts tally *values*, not documents:
+`bash_cmd.program` is multi-valued, so a script that runs six programs contributes six, and the
+rows above sum well past the 120 documents that carry the field. And the right-hand number is the
+whole match set, every indexed document whether it is a Bash call or not, because nothing narrowed this facet.
+Add `--program` or `-t Bash` to make that denominator Bash calls.
+
+### Filtering
+
+`--program NAME` keeps documents in which any simple command ran that program. Repeat the flag for
+OR, and it ANDs with every other filter, exactly like `--tool` or `--since`.
+
+```bash
+session-search search --program cargo --limit 2
+```
+
+```
+2 of 28 hits · 1 ms
+
+▌ d0fa9bec-abe1-51fb-aed6-b510f75ea5dd  agent a1b37fc38b2bdf0f7 · workflow-subagent  (1 hit)
+▌ /home/user/session-search · claude/search-retrieval-improvements-g5z0mb · 2026-09-09 23:46
+
+   1. 23:46:20  assistant Bash command=cargo build --release 2>&1 | tail -5  descr…  #12  3.05
+      Bash cargo build --release 2>&1 | tail -5 Build release binary Compiling
+      tracing-subscriber v0.3.23 Compiling clap v4.6.6 Compiling owo-colors v4.4.0 Compiling
+      session-search v0.1.0 (/home/user/session-search) Finished `release` profile [op…
+
+▌ d0fa9bec-abe1-51fb-aed6-b510f75ea5dd  agent ac29c4862275df7d6 · workflow-subagent  (1 hit)
+▌ /home/user/session-search · claude/search-retrieval-improvements-g5z0mb · 2026-09-09 23:30
+
+   2. 23:30:22  assistant Bash command=mkdir -p /tmp/claude-0/-home-user-session-s…  #16  3.05
+      Bash mkdir -p
+      /tmp/claude-0/-home-user-session-search/d0fa9bec-abe1-51fb-aed6-b510f75ea5dd/scratchp…
+      && cat > /home/user/session-search/src/bash.rs <<'RSEOF' //! probe #[cfg(test)] mod
+      probe { #[test] fn dump() { let cases = [ "cd X && car…
+```
+
+That is the question a substring filter cannot answer honestly. `--limit 0` prints the totals and
+no hits, so the two are easy to compare:
+
+```bash
+session-search search --tool-input command=cargo --limit 0
+session-search search --program cargo --limit 0
+```
+
+```
+0 of 55 hits · 2 ms
+0 of 28 hits · 1 ms
+```
+
+The 55 are calls whose command *text* contains `cargo` anywhere: a `grep` or a `sed` over a path
+under `~/.cargo/registry`, a heredoc quoting an example command line. The 28 ran it.
+
+The filter narrows a facet too, so "what am I passing cargo" is one call:
+
+```bash
+session-search facets bash_cmd.args --program cargo --top 8
+```
+
+```
+bash_cmd.args  showing 8 of ~98 values · 28 of 28 matching docs have a value
+  test           19  ████████████████████████████████████████
+  --lib          14  █████████████████████████████
+  --             12  █████████████████████████
+  -               8  █████████████████
+  fmt             8  █████████████████
+  --all-targets   5  ███████████
+  -5              5  ███████████
+  warnings        5  ███████████
+```
+
+With one caveat worth stating plainly: the filter selects *documents*, and `args` is flattened
+across the whole script, so this counts every argument of every command in the scripts that ran
+cargo, not only the arguments cargo itself was given. `-5` is the `| tail -5` on the end of those
+lines and `-` is a `python3 -` earlier in them, while `--` and `warnings` really are cargo's, out
+of `cargo clippy --all-targets -- -D warnings`. `bash_cmd` is a per-document summary, not a
+per-command index.
+
+### Exact, not tokenized
+
+`bash_cmd` is indexed with the `raw` tokenizer, unlike `tool_input`. Values match whole and
+case-sensitively, which is what makes a bare flag a searchable thing at all:
+
+```bash
+session-search search 'bash_cmd.args:"--release"'
+```
+
+```
+1 of 1 hit · 1 ms
+
+▌ d0fa9bec-abe1-51fb-aed6-b510f75ea5dd  agent a1b37fc38b2bdf0f7 · workflow-subagent  (1 hit)
+▌ /home/user/session-search · claude/search-retrieval-improvements-g5z0mb · 2026-09-09 23:46
+
+   1. 23:46:20  assistant Bash command=cargo build --release 2>&1 | tail -5  descr…  #12  7.55
+      Bash cargo build --release 2>&1 | tail -5 Build release binary Compiling
+      tracing-subscriber v0.3.23 Compiling clap v4.6.6 Compiling owo-colors v4.4.0 Compiling
+      session-search v0.1.0 (/home/user/session-search) Finished `release` profile [op…
+```
+
+Quote the value. Unquoted, the query parser reads the leading `-` of `--release` as a `NOT`, the
+query is a syntax error, and you land in the lenient retry with a warning on stderr.
+
+`bash_cmd.args:release` is a *different* query, and on this corpus it returns a different single
+hit: a `grep -ln "release" tests/fixtures/*.jsonl`, whose argument really is the bare word
+`release` once the quotes came off. `bash_cmd.program:Cargo` and `bash_cmd.program:CARGO` return
+nothing at all. That is the mirror image of the `tool_input` asymmetry noted above, and it is the
+point: `tool_input` is for finding text, `bash_cmd` is for counting facts.
+
+### One rebuild on upgrade
+
+`bash_cmd` changed the shape of a document, so `state.json`'s `version` went from 2 to 3; the
+`agent` field and per-agent roots took it to 4. The first run of a build that has a new field
+sees the mismatch, throws the watermarks away and reindexes every transcript from byte zero. Nothing is asked of you and `index --full` is not
+needed; it costs one full pass, 76 ms for the 193 documents on this machine.
 
 ---
 
@@ -476,6 +720,13 @@ Accepted by `search`, `facets` and `sessions`:
   -t, --tool <NAME>             Tool name; repeatable
       --tool-input <KEY=VALUE>  Tool parameter filter as `key=value`, e.g. `--tool-input
                                 command=cargo`; repeatable
+      --tool-output <TEXT>      Phrase the tool's *output* must contain, e.g. `--tool-output "No
+                                such file"`; repeatable, and ANDed
+      --min-thinking <N>        Only turns where the model spent at least N thinking tokens. Works
+                                even where the thinking text itself was stripped before it reached
+                                disk, which is the case for remote and web sessions
+      --program <NAME>          Program run by a Bash command — any simple command in the script,
+                                e.g. `--program cargo`; repeatable, OR
       --branch <BRANCH>
       --model <MODEL>
       --role <ROLE>
@@ -504,7 +755,8 @@ b20208d8-fbdb-5918-ba69-d203de6ed6dc  wild-spinning-puppy  agent a02e0e345842f6e
   harden:docs
 ```
 
-The ignored set is `--tool`, `--tool-input`, `--model`, `--role`, `--kind`, `--errors-only`.
+The ignored set is `--tool`, `--tool-input`, `--tool-output`, `--program`, `--model`, `--role`,
+`--kind`, `--errors-only`.
 
 ### `index`
 
@@ -716,6 +968,7 @@ session-search search "aggregation" -t Bash --limit 1 --json --facets tool_name
         "description": "Check tantivy aggregation module availability"
       },
       "tool_name": "Bash",
+      "tool_output": "192:pub mod aggregation;\n193:pub mod collector;…",
       "tool_use_id": "toolu_01QtnP3F5Y8o8sPGoePwD6Ug",
       "uuid": "cfbf460d-4921-4c09-b9f2-ff341c7141d6",
       "version": "2.1.266"
@@ -725,8 +978,10 @@ session-search search "aggregation" -t Bash --limit 1 --json --facets tool_name
 }
 ```
 
-(Pretty-printed here; the real output is a single line. `snippet`, `source_path`, `text` and
-`tool_input.command` are truncated with `…` for width — they are complete in the actual output.)
+(Pretty-printed here; the real output is a single line. `snippet`, `source_path`, `text`,
+`tool_output` and `tool_input.command` are truncated with `…` for width — they are complete in
+the actual output. That capture predates `bash_cmd`; a `Bash` hit now also carries the parsed
+command described in [Bash commands, parsed](#bash-commands-parsed).)
 
 ---
 
@@ -748,8 +1003,12 @@ merge and old ones are reclaimed.
 ### Documents
 
 One document per message, one per tool call. That granularity is what makes hits precise and
-facets meaningful — a hit points at the exact turn, not at a 400-line session. The index for this
-project's own development history:
+facets meaningful — a hit points at the exact turn, not at a 400-line session.
+
+A tool call is one document holding both halves in separate fields: `text` carries the tool name
+and the input's own strings, `tool_output` the result that answered it, joined by `tool_use_id`
+across the records they were written in. Each is capped independently (32 KB by default), and
+both are searched by a bare query. The index for this project's own development history:
 
 ```bash
 session-search facets role
@@ -765,13 +1024,16 @@ role  4 values · 978 of 978 matching docs have a value
 
 ### Incremental
 
-`state.json` records `{size, mtime_ms, byte_offset, docs}` for every transcript file:
+`state.json` records `{agent, size, mtime_ms, byte_offset, docs}` for every transcript file,
+and the roots the index is bound to, each paired with the adapter that reads it:
 
 ```json
 {
-  "version": 1,
+  "version": 4,
+  "roots": [{ "agent": "claude-code", "path": "/root/.claude/projects" }],
   "files": {
     "/root/.claude/projects/-home-user-session-search/b20208d8-….jsonl": {
+      "agent": "claude-code",
       "size": 1029179,
       "mtime_ms": 1788982251799,
       "byte_offset": 1029179,
@@ -852,7 +1114,7 @@ API message's block records. Both cases used to re-emit work the previous run ha
 indexed: replaying one real 147-line transcript one line at a time produced **88 documents where
 a single pass produced 49**, and reported 78 tool calls where there were 39.
 
-The fix is a small per-file *carry* in `state.json` (`parse::ParseCarry`): the ids — and the
+The fix is a small per-file *carry* in `state.json` (`doc::ParseCarry`): the ids — and the
 documents — a run left unfinished, plus a fingerprint of the last line it consumed. A later tail
 uses it to *complete* the waiting document (same `doc_id`, same `seq`, result text appended)
 instead of inventing a second half-empty one, and to recognise a `message.id` it has already
@@ -885,11 +1147,21 @@ waits for `index --full`.
 and `elapsed 0 ms` — meaningless for a static read — and labels the index's document count as
 `documents added`.
 
-**Thinking is off by default and index-time.** `--include-thinking` on `index` decides whether
-thinking blocks are searchable at all; `--include-thinking` on `search` only opts the query into
-them. Flipping the index-time one requires `index --full`. Note also that remote sessions strip
-thinking text before it reaches disk, so on some machines every thinking block is empty and there
-is nothing to index either way.
+**Thinking is indexed but not searched by default.** `index` stores thinking blocks unless you
+pass `--no-thinking`; `search --include-thinking` opts a query into them. So the common case needs
+no rebuild — only opting *out* and back in does.
+
+Remote and web sessions strip thinking text before it reaches disk: the block survives with its
+`signature` intact but `"thinking": ""`, so on those machines there is nothing to index. Empty
+blocks are skipped rather than indexed as blank documents — in a corpus with 453 stripped blocks,
+the index holds none of them. What *does* survive is the cost: `thinking_tokens` is indexed as a
+fast field, so `--min-thinking N` and `facets thinking_tokens` still find the turns where the
+model stopped to reason, even when you cannot read what it reasoned about.
+
+**Changing what is indexed needs `index --full`.** The watermarks say a file is unchanged, so
+they will not re-read it. This applies to `--no-thinking`, `--no-spilled-results`, and to any
+release that changes how a document body is built — for instance the one that split a tool
+call's result out of `text` into its own `tool_output` field.
 
 **Snippet markers can collide with the text.** Matches are wrapped in `**…**`; if the indexed text
 already contains `**` (this tool's own Markdown output, for instance) you will see `****term****`.
@@ -903,6 +1175,14 @@ written to `tool-results/<id>.txt` and the transcript carries a `Full output sav
 pointer, which the indexer follows by default (`index --no-spilled-results` opts out). That is
 content-directed file I/O — fine for your own `~/.claude` tree, worth remembering if you ever
 index transcripts from elsewhere.
+
+**Bodies are capped, and the cut is silent.** Each indexed body field of a document is truncated
+at `index --max-text-bytes N`, 1 MiB by default, at a UTF-8 boundary with no marker. The default
+is far above anything a transcript carries — Claude Code bounds tool output before it reaches
+disk, and on a real corpus the largest inline result measured 18.7 KB — so in practice nothing is
+cut. Lower it if you want a `cat` of a minified bundle kept out of the term dictionary. Note that
+`raw` and `tool_input` are stored uncapped regardless, so a large input is always searchable
+through `tool_input.<key>` even when `text` did not copy all of it.
 
 **Everything is local and single-user.** No daemon, no watch mode, no incremental commit while a
 session is in flight; the index is refreshed at query time. There is no ranking tuning, no
@@ -920,8 +1200,8 @@ cargo test
 ```
 
 ```
-running 177 tests
-test result: ok. 173 passed; 0 failed; 4 ignored; 0 measured; 0 filtered out; finished in 1.9s
+running 252 tests
+test result: ok. 248 passed; 0 failed; 4 ignored; 0 measured; 0 filtered out; finished in 2.10s
 ```
 
 The four ignored tests all need this machine's own `~/.claude/projects` and are the ones worth
@@ -932,6 +1212,43 @@ on real data:
 ```bash
 cargo test --release -- --ignored --nocapture
 ```
+
+### Continuous integration
+
+[`.github/workflows/ci.yml`](.github/workflows/ci.yml) runs exactly the four commands above on
+every push to `main` and every pull request, as a single Linux job — `fmt`, then `clippy` with
+`-D warnings`, then `build --all-targets`, then `test`. The ignored four are not among them: a
+runner has no `~/.claude/projects`, so they stay a by-hand check.
+
+The crate resolves `~/.claude` through `$HOME`, which Windows does not set, so Windows is neither
+built nor tested. macOS is: `cargo test` runs there weekly (Mondays 07:00 UTC) and on demand via
+**Actions → CI → Run workflow**, rather than on every pull request, because macOS runners bill at
+ten times the Linux rate on a private repository.
+
+[`.github/dependabot.yml`](.github/dependabot.yml) proposes dependency bumps weekly and action
+bumps monthly. `Cargo.lock` is committed and every CI command passes `--locked`, so a dependency
+moves only in a pull request that has run the whole suite first.
+
+### Cutting a release
+
+[`.github/workflows/release.yml`](.github/workflows/release.yml) is driven by an annotated tag:
+
+```bash
+# Cargo.toml must already say 0.1.0 — the workflow refuses a tag that disagrees with it.
+git tag -a v0.1.0 -m 'v0.1.0'
+git push origin v0.1.0
+```
+
+It re-runs `fmt`, `clippy` and `test`, builds `x86_64-unknown-linux-gnu` and
+`aarch64-apple-darwin`, checks that each binary starts (`--version`), and publishes a GitHub
+Release carrying one `.tar.gz` per target plus a `SHA256SUMS` covering both. Each archive unpacks
+into its own directory holding the binary, the README and the LICENSE.
+
+The Linux binary is built on `ubuntu-22.04` rather than the newest image so that it needs only
+glibc 2.35 and runs on distributions older than the runner.
+
+**Actions → Release → Run workflow** does everything except publish: the archives land on the
+workflow run as artifacts, which is the way to check a packaging change without spending a tag.
 
 Two documents are worth reading before changing anything:
 

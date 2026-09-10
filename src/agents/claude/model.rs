@@ -253,6 +253,19 @@ pub struct Usage {
     pub cache_creation_input_tokens: Option<u64>,
     #[serde(deserialize_with = "flex_u64")]
     pub cache_read_input_tokens: Option<u64>,
+    /// Survives even when the thinking text itself is stripped, which is what makes it the
+    /// only handle on reasoning in remote and web transcripts.
+    pub output_tokens_details: Option<OutputTokenDetails>,
+    #[serde(flatten)]
+    pub extra: Extra,
+}
+
+/// Note: the API `usage` block is snake_case, unlike the transcript envelope around it.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default)]
+pub struct OutputTokenDetails {
+    #[serde(deserialize_with = "flex_u64")]
+    pub thinking_tokens: Option<u64>,
     #[serde(flatten)]
     pub extra: Extra,
 }
@@ -741,6 +754,24 @@ mod tests {
         assert_eq!(a.attachment.as_ref().unwrap().kind.as_deref(), Some("date"));
         assert_eq!(a.rendered[0].content.as_deref(), Some("today"));
         assert!(a.rendered_in_human_turn.is_empty());
+    }
+
+    #[test]
+    fn thinking_tokens_parse_from_a_real_usage_block() {
+        let line = r#"{"type":"assistant","uuid":"a","message":{"id":"m","role":"assistant",
+          "usage":{"input_tokens":2,"output_tokens":623,
+            "output_tokens_details":{"thinking_tokens":300},
+            "cache_creation_input_tokens":22034}}}"#;
+        let parsed = parse_line(line.as_bytes()).expect("parses");
+        let Record::Assistant(a) = parsed.record else {
+            panic!("assistant")
+        };
+        let usage = a.message.unwrap().usage.unwrap();
+        assert_eq!(
+            usage.output_tokens_details.unwrap().thinking_tokens,
+            Some(300),
+            "the usage block is snake_case; a camelCase rename would silently read None"
+        );
     }
 
     #[test]

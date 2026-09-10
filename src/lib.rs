@@ -6,6 +6,7 @@
 
 pub mod agent;
 pub mod agents;
+pub mod bash;
 pub mod cli;
 pub mod context;
 pub mod doc;
@@ -15,6 +16,7 @@ pub mod schema;
 pub mod search;
 
 pub use agent::{Agent, Root, SessionFile};
+pub use bash::{BashCmd, extract};
 pub use doc::{
     Doc, DocKind, FileContext, ParseCarry, ParseError, ParseOptions, ParseOutput, SessionInfo,
 };

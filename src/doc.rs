@@ -54,6 +54,15 @@ pub struct Doc {
     pub tool_name: Option<String>,
     pub tool_use_id: Option<String>,
     pub tool_input: Option<Value>,
+    /// Structured view of a shell command — `{"program": [...], "args": [...]}` as produced
+    /// by [`crate::bash::extract`]. `None` for every other tool, and for a command the shell
+    /// grammar rejects. Agent-neutral: any adapter whose shell tool carries a command line
+    /// can fill it, and `--program` then works across agents.
+    ///
+    /// `#[serde(default)]` because a `Doc` also travels inside [`ParseCarry`] in
+    /// `state.json`: state written before this field existed must still load.
+    #[serde(default)]
+    pub bash_cmd: Option<Value>,
     pub is_error: bool,
     pub is_sidechain: bool,
     /// Compaction summaries, meta turns — excluded from "human prompt".
@@ -62,10 +71,18 @@ pub struct Doc {
     pub permission_mode: Option<String>,
     pub version: Option<String>,
     pub slug: Option<String>,
-    /// The indexed body.
+    /// The indexed body. For a tool call this is the name and the input's own strings; the
+    /// result lives in [`Doc::tool_output`], so a match can be attributed to one or the other.
     pub text: String,
+    /// The joined tool result text, indexed and stored in its own right. `None` on a
+    /// message, and on a tool call whose result has not been read yet.
+    pub tool_output: Option<String>,
     /// Stored; indexed only with `include_thinking`.
     pub thinking: Option<String>,
+    /// Reasoning tokens charged to exactly ONE document per API message so sums and facets
+    /// are not multiplied by the block count. Claude Code: `usage.output_tokens_details.
+    /// thinking_tokens`, which remote and web sessions keep even when they strip the text.
+    pub thinking_tokens: Option<u64>,
     /// The original JSONL line.
     pub raw: String,
 }
@@ -170,6 +187,10 @@ pub struct ParseCarry {
     pub pending_tool_uses: Vec<PendingToolCall>,
     /// API `message.id`s already counted towards [`SessionInfo::messages`].
     pub counted_message_ids: Vec<String>,
+    /// API `message.id`s whose thinking cost has already been charged to a document. Separate
+    /// from `counted_message_ids` because the record carrying `thinking_tokens` is usually the
+    /// `tool_use` one, not whichever block record emitted first.
+    pub charged_message_ids: Vec<String>,
     /// `(start offset, hash)` of the last complete line consumed.
     pub tail_line: Option<TailLine>,
     /// Whatever else *this agent's* parser needs across a tail boundary, opaque to the
@@ -233,7 +254,17 @@ pub fn file_tag(source_path: &str) -> String {
 
 #[derive(Debug, Clone)]
 pub struct ParseOptions {
-    /// Cap on the indexed body of one doc.
+    /// Cap on the indexed body of one doc. `tool_output` is capped separately, at the same
+    /// number: a tool call's input and its result are two fields now, not one shared budget.
+    ///
+    /// The default is deliberately far above what a transcript actually carries. Claude Code
+    /// bounds tool output before it reaches disk — anything oversized is spilled to
+    /// `tool-results/<id>.txt` and referenced by a stub — so on a real corpus the largest
+    /// inline result measured 18.7 KB and *nothing* reached the old 32 KiB cap. The one place
+    /// that cap did bite was the spill path, which exists to go and fetch precisely the outputs
+    /// too big to inline: a 54.5 KB spill lost 40% of itself on the way in. A cap this size
+    /// still bounds a `cat` of something enormous, without cutting any output a person would
+    /// call reasonable.
     pub max_text_bytes: usize,
     /// Follow `<persisted-output>` pointers into `tool-results/<id>.txt`.
     pub load_spilled_results: bool,
@@ -242,7 +273,7 @@ pub struct ParseOptions {
 impl Default for ParseOptions {
     fn default() -> Self {
         ParseOptions {
-            max_text_bytes: 32 * 1024,
+            max_text_bytes: 1024 * 1024,
             load_spilled_results: false,
         }
     }
@@ -254,11 +285,14 @@ pub struct PartialDoc {
     pub kind: DocKind,
     pub role: String,
     pub text: String,
+    pub tool_output: Option<String>,
     pub thinking: Option<String>,
+    pub thinking_tokens: Option<u64>,
     pub model: Option<String>,
     pub tool_name: Option<String>,
     pub tool_use_id: Option<String>,
     pub tool_input: Option<Value>,
+    pub bash_cmd: Option<Value>,
     pub is_error: bool,
     pub is_meta: bool,
 }
@@ -269,16 +303,21 @@ impl PartialDoc {
             kind: DocKind::Message,
             role: role.to_string(),
             text,
+            tool_output: None,
             thinking: None,
+            thinking_tokens: None,
             model: None,
             tool_name: None,
             tool_use_id: None,
             tool_input: None,
+            bash_cmd: None,
             is_error: false,
             is_meta: false,
         }
     }
 
+    /// `text` is the call side — the tool name and the input's own strings. The result goes in
+    /// `tool_output` via [`PartialDoc::output`], never concatenated onto `text`.
     pub fn tool_call(
         tool_name: Option<String>,
         tool_use_id: Option<String>,
@@ -290,11 +329,14 @@ impl PartialDoc {
             kind: DocKind::ToolCall,
             role: "assistant".to_string(),
             text,
+            tool_output: None,
             thinking: None,
+            thinking_tokens: None,
             model: None,
             tool_name,
             tool_use_id,
             tool_input,
+            bash_cmd: None,
             is_error,
             is_meta: false,
         }
@@ -312,6 +354,16 @@ impl PartialDoc {
         self.thinking = thinking;
         self
     }
+    /// Empty output is `None`, not `Some("")`: "the tool returned nothing" and "the result has
+    /// not arrived yet" both render as absent, and neither should occupy a posting list.
+    pub fn output(mut self, output: String) -> Self {
+        self.tool_output = Some(output).filter(|s| !s.is_empty());
+        self
+    }
+    pub fn bash_cmd(mut self, bash_cmd: Option<Value>) -> Self {
+        self.bash_cmd = bash_cmd;
+        self
+    }
     pub fn meta(mut self, is_meta: bool) -> Self {
         self.is_meta = is_meta;
         self
@@ -324,5 +376,6 @@ impl PartialDoc {
 
 /// A copy of a document small enough to sit in `state.json` until its result arrives.
 pub fn carryable(doc: &Doc) -> Option<Box<Doc>> {
-    (doc.text.len() + doc.raw.len() <= PENDING_DOC_CAP).then(|| Box::new(doc.clone()))
+    let size = doc.text.len() + doc.raw.len() + doc.tool_output.as_deref().map_or(0, str::len);
+    (size <= PENDING_DOC_CAP).then(|| Box::new(doc.clone()))
 }
