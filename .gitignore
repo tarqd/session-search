@@ -29,3 +29,6 @@ target
 **/tantivy/state.json
 **/tantivy/meta.json
 **/tantivy/*.store
+
+# Scratch worktrees the Claude Code harness creates for parallel agents.
+.claude/worktrees/

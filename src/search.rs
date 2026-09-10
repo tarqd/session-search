@@ -55,6 +55,9 @@ const TIMESTAMP_FIELD: &str = "timestamp";
 /// How much more a term in a markdown heading is worth than the same term in a paragraph.
 const HEADING_BOOST: Score = 2.0;
 
+/// Weight of a match in the `context_text` header. See `build_query`.
+const CONTEXT_BOOST: Score = 0.3;
+
 #[derive(Debug, Clone, Default, clap::Args, serde::Serialize, serde::Deserialize)]
 #[serde(default)]
 pub struct Filters {
@@ -568,7 +571,10 @@ fn build_query(
         // text lived in `text`, so leaving it out would make a bare query stop matching things
         // it has always matched. `code` and `headings` are default for the same reason —
         // the split moved a message's snippets and titles out of `text`.
-        let mut default_fields = vec![f.text, f.code, f.headings, f.tool_output];
+        // `context_text` joins them for the reason it exists: a document torn out of a
+        // conversation is not retrievable by what it was *for* unless the header is searched
+        // by the same bare query as the body.
+        let mut default_fields = vec![f.text, f.code, f.headings, f.tool_output, f.context_text];
         if req.include_thinking {
             default_fields.push(f.thinking);
         }
@@ -578,6 +584,12 @@ fn build_query(
         // same word buried in a paragraph. 2.0 is enough to reorder two otherwise comparable
         // documents without letting one heading beat a document that matches repeatedly.
         qp.set_field_boost(f.headings, HEADING_BOOST);
+        // Below 1.0, and deliberately well below: the header is a claim about what a document
+        // was for, the body is what it says. A near-constant prefix repeated over every
+        // document of a session would otherwise let scaffolding outrank the one document that
+        // genuinely discusses the term — and every document in that session carries it, so
+        // without the discount the header decides the ordering of the whole session at once.
+        qp.set_field_boost(f.context_text, CONTEXT_BOOST);
         // Bare multi-word input reads as "all of these words", which is what people mean;
         // explicit `OR` / `AND` / `"phrases"` / `field:value` still work.
         qp.set_conjunction_by_default();
@@ -1251,6 +1263,12 @@ pub fn doc_from_stored(f: &Fields, stored: &TantivyDocument) -> Doc {
         kind,
         source_path: s(f.source_path).unwrap_or_default(),
         seq: u(f.seq).unwrap_or(0),
+        turn_seq: u(f.turn_seq).unwrap_or(0),
+        // Never read back: `context_text` is indexed and not stored, so there is nothing in
+        // the payload to read. That is deliberate — a header is scaffolding the indexer
+        // assembled, not something the transcript said, and a `Doc` handed to a renderer or to
+        // `--json` must only carry what was actually written.
+        turn_prompt: None,
         session_id: s(f.session_id).unwrap_or_default(),
         agent_id: s(f.agent_id),
         agent_type: s(f.agent_type),
@@ -1364,6 +1382,8 @@ pub(crate) mod testkit {
             kind: DocKind::Message,
             source_path: "/tmp/s1.jsonl".into(),
             seq,
+            turn_seq: 0,
+            turn_prompt: None,
             session_id: "s1".into(),
             agent_id: None,
             agent_type: None,
@@ -1403,7 +1423,7 @@ pub(crate) mod testkit {
         let index = crate::tokenizer::create_in_ram(schema.clone());
         let mut writer = index.writer_with_num_threads(1, 15_000_000).unwrap();
         for doc in docs {
-            let json = doc_to_json(doc, true).to_string();
+            let json = doc_to_json(doc, None, true).to_string();
             writer
                 .add_document(TantivyDocument::parse_json(&schema, &json).unwrap())
                 .unwrap();
@@ -3238,5 +3258,226 @@ mod tests {
                 .any(|c| c.value.starts_with("ls -la")),
             "{commands:?}"
         );
+    }
+
+    /// A RAM index whose documents carry the `context_text` header composed against one session
+    /// row — what `index.rs` does with the merged `sessions.json` entry.
+    fn index_with_session(
+        docs: &[Doc],
+        session: &crate::parse::SessionInfo,
+    ) -> (tantivy::Index, Fields) {
+        let (schema, fields) = crate::schema::build_schema();
+        let index = crate::tokenizer::create_in_ram(schema.clone());
+        let mut writer = index.writer_with_num_threads(1, 15_000_000).unwrap();
+        for doc in docs {
+            let json = crate::schema::doc_to_json(doc, Some(session), true).to_string();
+            writer
+                .add_document(TantivyDocument::parse_json(&schema, &json).unwrap())
+                .unwrap();
+        }
+        writer.commit().unwrap();
+        (index, fields)
+    }
+
+    /// One turn: a prompt, the answer to it, and a tool call inside it. `turn_prompt` is what
+    /// `parse.rs` puts on every document of a turn.
+    fn one_turn() -> Vec<Doc> {
+        let prompt = "fix the tokenizer";
+        let mut opener = blank_doc(0);
+        opener.text = vec![prompt.into()];
+        opener.body = prompt.into();
+        opener.turn_prompt = Some(prompt.into());
+
+        let mut agreement = blank_doc(1);
+        agreement.text = vec!["yes".into()];
+        agreement.body = "yes".into();
+        agreement.turn_prompt = Some(prompt.into());
+
+        let mut call = blank_doc(2);
+        call.kind = DocKind::ToolCall;
+        call.role = "assistant".into();
+        call.tool_name = Some("Bash".into());
+        call.tool_input = Some(json!({"command": "cargo build --release"}));
+        call.text = vec!["Bash\ncargo build --release".into()];
+        call.body = "Bash\ncargo build --release".into();
+        call.turn_prompt = Some(prompt.into());
+
+        vec![opener, agreement, call]
+    }
+
+    /// The defect contextual BM25 exists to fix. Half of all user messages are "yes", "do
+    /// that", "still broken", and a tool call is a program name and a command line; neither is
+    /// retrievable by anything a person would type. With the turn's prompt in the header they
+    /// are — and the prompt itself is still one hit, not two.
+    #[test]
+    fn a_bare_yes_is_found_by_what_its_turn_asked() {
+        let (index, f) = index_with_session(&one_turn(), &crate::parse::SessionInfo::default());
+        let r = search(&index, &f, &req("tokenizer")).unwrap();
+        let seqs: Vec<u64> = r.hits.iter().map(|h| h.doc.seq).collect();
+        // The whole turn: the prompt through its body, the bare `yes` and the tool call
+        // through the header the prompt gave them.
+        assert_eq!(r.total, 3, "{seqs:?}");
+        assert!(seqs.contains(&1), "the bare `yes` is reachable: {seqs:?}");
+        assert!(seqs.contains(&2), "so is the tool call: {seqs:?}");
+        assert_eq!(
+            seqs.iter().filter(|s| **s == 0).count(),
+            1,
+            "the prompt matches its body and is not doubled by a header repeating it"
+        );
+    }
+
+    /// The session half of the header, which only the indexer's merged `sessions.json` row
+    /// knows: a `Bash cargo build --release` document says nothing about what it was for, and
+    /// is found anyway by a word out of the session's title.
+    #[test]
+    fn a_tool_call_is_found_by_the_words_of_its_session() {
+        let session = crate::parse::SessionInfo {
+            title: Some("Tuning the markdown analyzer".into()),
+            first_prompt: Some("make retrieval find fragments by their context".into()),
+            ..crate::parse::SessionInfo::default()
+        };
+        let (index, f) = index_with_session(&one_turn(), &session);
+        for query in ["analyzer", "retrieval", "session-search", "main"] {
+            let r = search(&index, &f, &req(query)).unwrap();
+            assert!(
+                r.hits
+                    .iter()
+                    .any(|h| h.doc.tool_name.as_deref() == Some("Bash")),
+                "{query:?} did not reach the tool call"
+            );
+        }
+    }
+
+    /// The header is scaffolding, so it may decide *whether* a document is retrieved and never
+    /// what the reader is shown. It cannot be a snippet — it is not stored — but the fallback
+    /// has to produce something honest rather than a blank line, and the `Doc` handed back must
+    /// carry none of it.
+    #[test]
+    fn a_hit_matched_only_through_its_header_still_shows_its_own_body() {
+        let session = crate::parse::SessionInfo {
+            title: Some("Tuning the markdown analyzer".into()),
+            ..crate::parse::SessionInfo::default()
+        };
+        let (index, f) = index_with_session(&one_turn(), &session);
+        let r = search(&index, &f, &req("analyzer")).unwrap();
+        let hit = r
+            .hits
+            .iter()
+            .find(|h| h.doc.seq == 1)
+            .expect("the bare `yes` matched through its header");
+        assert_eq!(hit.snippet, "yes", "the snippet comes from the body");
+        assert!(!hit.snippet.contains("analyzer"), "{}", hit.snippet);
+        assert!(
+            !hit.snippet.contains("**"),
+            "nothing to highlight in a body"
+        );
+        // Nothing of the header survives into what the caller reads back.
+        assert!(hit.doc.turn_prompt.is_none());
+        assert!(!hit.doc.body.contains("analyzer"));
+        assert!(!hit.doc.text.join(" ").contains("analyzer"));
+    }
+
+    /// The discount, pinned by a corpus where it decides the order.
+    ///
+    /// Within one session the IDF collapse already makes a shared header cheap — every document
+    /// carries it, so the term is common — and a body match wins at any boost. The case that
+    /// needs the discount is the opposite one: a *small* session whose title names the term,
+    /// beside larger sessions where the term is written in a document's body. Across the
+    /// corpus the header term is then the rarer one, and at a boost of 1.0 BM25 ranks the two
+    /// documents that merely happened in a session *about* tokenizers above the two that
+    /// discuss one. The body wins below roughly 0.8; 0.3 leaves a margin, and this corpus
+    /// fails the assertion at 1.0.
+    #[test]
+    fn a_body_term_outranks_the_same_term_in_a_header() {
+        let doc = |seq: u64, session: &str, text: &str| {
+            let mut d = blank_doc(seq);
+            d.doc_id = format!("{session}:-:{seq}");
+            d.session_id = session.into();
+            d.source_path = format!("/tmp/{session}.jsonl");
+            d.project = None;
+            d.git_branch = None;
+            d.text = vec![text.into()];
+            d.body = text.into();
+            d
+        };
+        let titled = |title: &str| crate::parse::SessionInfo {
+            title: Some(title.into()),
+            ..crate::parse::SessionInfo::default()
+        };
+        // Two documents in a session titled by the term, with bodies that never say it.
+        let about = titled("tokenizer");
+        // Six documents in two other sessions, two of which say the term in their bodies.
+        let facets = titled("adding facets to the cli");
+        let windows = titled("snapping context windows to turns");
+        let corpus = [
+            (
+                doc(0, "a", "yes please do exactly that and nothing more"),
+                &about,
+            ),
+            (
+                doc(1, "a", "the parts of a name share one position now"),
+                &about,
+            ),
+            (
+                doc(
+                    0,
+                    "b",
+                    "the tokenizer splits identifiers at a case boundary",
+                ),
+                &facets,
+            ),
+            (
+                doc(1, "b", "facets count the values of one fast field"),
+                &facets,
+            ),
+            (
+                doc(2, "b", "a bucket is a value and not a document"),
+                &facets,
+            ),
+            (
+                doc(0, "c", "the tokenizer keeps a hash whole and alone"),
+                &windows,
+            ),
+            (
+                doc(1, "c", "a window snaps to the prompt that opened it"),
+                &windows,
+            ),
+            (
+                doc(2, "c", "the cap keeps the head of a long turn"),
+                &windows,
+            ),
+        ];
+
+        let (schema, f) = crate::schema::build_schema();
+        let index = crate::tokenizer::create_in_ram(schema.clone());
+        let mut writer = index.writer_with_num_threads(1, 15_000_000).unwrap();
+        for (doc, session) in &corpus {
+            let json = crate::schema::doc_to_json(doc, Some(session), true).to_string();
+            writer
+                .add_document(TantivyDocument::parse_json(&schema, &json).unwrap())
+                .unwrap();
+        }
+        writer.commit().unwrap();
+
+        let r = search(&index, &f, &req("tokenizer")).unwrap();
+        let scored: Vec<(String, Score)> = r
+            .hits
+            .iter()
+            .map(|h| (h.doc.doc_id.clone(), h.score))
+            .collect();
+        assert_eq!(
+            r.total, 4,
+            "two bodies and one two-document header: {scored:?}"
+        );
+
+        let score_of = |id: &str| scored.iter().find(|(d, _)| d == id).unwrap().1;
+        let body_floor = score_of("b:-:0").min(score_of("c:-:0"));
+        let header_ceiling = score_of("a:-:0").max(score_of("a:-:1"));
+        assert!(
+            body_floor > header_ceiling,
+            "scaffolding must not outrank content: {scored:?}"
+        );
+        let ids: Vec<&str> = scored.iter().map(|(d, _)| d.as_str()).collect();
+        assert_eq!(&ids[..2], ["b:-:0", "c:-:0"], "{scored:?}");
     }
 }

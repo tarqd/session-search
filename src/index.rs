@@ -62,7 +62,15 @@ const SESSIONS_FILE: &str = "sessions.json";
 ///         blocks with `body`, `code`, `headings` and `code_lang` beside it, so a state file
 ///         written by an older version cannot be read back into one; and the schema gained
 ///         those fields with two new analyzers besides.
-const STATE_VERSION: u32 = 4;
+/// 4 -> 5: `turn_seq` on every document, `open_turn_seq` and `open_turn_prompt` in the carry,
+///         and the `context_text` header built on top of them. The schema gained two fields in
+///         the same change, so `open_or_create` already discards a version-4 index on sight;
+///         the bump is the other half of that — it covers a `state.json` that outlives its
+///         Tantivy directory, and `index::meta`, which reads the state file without opening
+///         the index at all. Without it a carry from the old layout would be read back with
+///         every turn open at `seq_base` and no prompt, and the next tail parse would stop
+///         agreeing with a whole-file one.
+const STATE_VERSION: u32 = 5;
 
 /// Tantivy refuses a per-thread arena below this (`MEMORY_BUDGET_NUM_BYTES_MIN`).
 const MIN_HEAP_BYTES: usize = 15_000_000;
@@ -504,24 +512,6 @@ fn consume(
         writer.delete_term(Term::from_field_text(fields.doc_id, &doc.doc_id));
         stats.docs_deleted += 1;
     }
-    for doc in out.docs.iter().chain(out.replacements.iter()) {
-        let json = doc_to_json(doc, opts.include_thinking).to_string();
-        match TantivyDocument::parse_json(schema, &json) {
-            Ok(td) => {
-                writer
-                    .add_document(td)
-                    .with_context(|| format!("indexing document {}", doc.doc_id))?;
-                stats.docs_added += 1;
-            }
-            // One unrepresentable document must not sink the run; `seq` still advances so the
-            // watermark stays consistent with what the parser numbered.
-            Err(err) => tracing::warn!(
-                doc_id = %doc.doc_id,
-                error = %err,
-                "document rejected by the schema; skipping"
-            ),
-        }
-    }
 
     let seq_base = match job.plan {
         Plan::Tail { seq_base, .. } => seq_base,
@@ -557,13 +547,41 @@ fn consume(
     // The first reset of a key this run replaces its entry outright — a full reparse already
     // recounted everything. Every other outcome merges.
     if is_reset && replaced.insert(key.clone()) {
-        sessions.insert(key, info);
+        sessions.insert(key.clone(), info);
     } else {
-        match sessions.entry(key) {
+        match sessions.entry(key.clone()) {
             Entry::Occupied(mut e) => merge_session(e.get_mut(), info),
             Entry::Vacant(e) => {
                 e.insert(info);
             }
+        }
+    }
+
+    // The documents are written *after* the merge, not before, because `context_text` is built
+    // from the merged row: a title or an opening prompt this very parse discovered would
+    // otherwise reach the header one run late, on a file that may never be appended to again.
+    // What the merge cannot fix is a `summary` record that arrives after the documents it
+    // titles were indexed — that title lands in `sessions.json`, which is the cheap JSON
+    // rewrite it was always meant to be, but not in their headers until the next `--full`.
+    // The opening prompt is in the header from the first parse, which is the half that
+    // matters.
+    let session = sessions.get(&key);
+    for doc in out.docs.iter().chain(out.replacements.iter()) {
+        let json = doc_to_json(doc, session, opts.include_thinking).to_string();
+        match TantivyDocument::parse_json(schema, &json) {
+            Ok(td) => {
+                writer
+                    .add_document(td)
+                    .with_context(|| format!("indexing document {}", doc.doc_id))?;
+                stats.docs_added += 1;
+            }
+            // One unrepresentable document must not sink the run; `seq` still advances so the
+            // watermark stays consistent with what the parser numbered.
+            Err(err) => tracing::warn!(
+                doc_id = %doc.doc_id,
+                error = %err,
+                "document rejected by the schema; skipping"
+            ),
         }
     }
     Ok(())
@@ -1935,6 +1953,167 @@ mod tests {
                 "  {key}: msgs={} tools={} title={:?} project={:?}",
                 info.messages, info.tool_calls, info.title, info.project
             );
+        }
+    }
+
+    // -- turns --------------------------------------------------------------
+
+    /// `(seq, turn_seq)` for every document in the index, read back through
+    /// [`crate::search::doc_from_stored`] — the one reader of the stored payload.
+    fn indexed_turns(index_dir: &Path) -> Vec<(u64, u64)> {
+        let (index, fields) = open_or_create(index_dir).unwrap();
+        let searcher = index.reader().unwrap().searcher();
+        let limit = (searcher.num_docs() as usize).max(1);
+        let found = searcher
+            .search(
+                &AllQuery,
+                &tantivy::collector::TopDocs::with_limit(limit).order_by_score(),
+            )
+            .unwrap();
+        let mut turns: Vec<(u64, u64)> = found
+            .into_iter()
+            .map(|(_, address)| {
+                let stored: TantivyDocument = searcher.doc(address).unwrap();
+                let doc = crate::search::doc_from_stored(&fields, &stored);
+                (doc.seq, doc.turn_seq)
+            })
+            .collect();
+        turns.sort_unstable();
+        turns
+    }
+
+    /// A turn straddles the boundary a live transcript is tailed at nearly every time, and the
+    /// carry is what keeps the tail numbering turns instead of restarting at its own
+    /// `seq_base`. Proved here end to end, through `state.json` and the index, rather than
+    /// only at the parser level.
+    #[test]
+    fn an_incremental_index_agrees_with_a_whole_file_parse_on_turn_seq() {
+        let head = [
+            user_line("u1", None, "build it"),
+            assistant_line("a1", "u1", "on it"),
+            tool_use_line("a2", "a1", "toolu_1", "cargo build"),
+        ]
+        .join("\n")
+            + "\n";
+        let fx = Fixture::with_body(&head);
+        fx.index();
+
+        // The boundary falls between the call and its result, and again between an answer and
+        // the prompt that follows it. Each run must be a *tail*: a reset would reparse the
+        // whole file and agree with it for the wrong reason.
+        for line in [
+            tool_result_line("u2", "a2", "toolu_1", "Finished"),
+            user_line("u3", Some("u2"), "now test it"),
+            assistant_line("a3", "u3", "running the suite"),
+        ] {
+            fx.append(&line);
+            let stats = fx.index();
+            assert_eq!(stats.files_updated, 1);
+            assert_eq!(stats.files_reset, 0, "an append is a tail, not a reset");
+        }
+
+        let whole = crate::parse::parse_whole(&fx.transcript, &ParseOptions::default()).unwrap();
+        let expected: Vec<(u64, u64)> = whole.docs.iter().map(|d| (d.seq, d.turn_seq)).collect();
+        assert_eq!(expected, [(0, 0), (1, 0), (2, 0), (3, 3), (4, 3)]);
+        assert_eq!(indexed_turns(&fx.index_dir), expected);
+    }
+
+    /// The field has to survive the schema, not just the parser: `doc_to_json` writes it,
+    /// `doc_from_stored` reads it, and a hit that reported `turn_seq = 0` for every document
+    /// would look exactly like a corpus with one turn in it.
+    #[test]
+    fn turn_seq_round_trips_through_the_index() {
+        let mut doc = crate::search::testkit::blank_doc(7);
+        doc.turn_seq = 5;
+        doc.text = vec!["the answer to the question five documents back".into()];
+        let (index, fields) = crate::search::testkit::index_docs(&[doc]);
+
+        let window =
+            crate::context::around(&index, &fields, "s1", None, Some("/tmp/s1.jsonl"), 7, 0, 0)
+                .unwrap();
+        assert_eq!(window.len(), 1);
+        assert_eq!(window[0].seq, 7);
+        assert_eq!(window[0].turn_seq, 5);
+    }
+
+    /// `STATE_VERSION` is the reindex switch: a watermark written before `turn_seq` existed
+    /// describes documents that carry none, and trusting it would leave the whole prefix of
+    /// every file reporting turn zero for ever. A mismatch throws the state away, which makes
+    /// every file a `Reset` — and a reset must not duplicate what is already indexed.
+    #[test]
+    fn a_state_file_from_an_older_version_is_discarded_and_the_file_reindexed() {
+        let fx = Fixture::new();
+        let expected = fx.index().docs_added;
+        assert_eq!(fx.state().version, STATE_VERSION);
+
+        let path = fx.index_dir.join(STATE_FILE);
+        let mut stored: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        stored["version"] = serde_json::json!(STATE_VERSION - 1);
+        std::fs::write(&path, serde_json::to_vec(&stored).unwrap()).unwrap();
+
+        let stats = fx.index();
+        assert_eq!(stats.docs_added, expected, "the file must be read again");
+        assert_eq!(fx.live(), expected, "and replaced, not duplicated");
+        assert_eq!(fx.state().version, STATE_VERSION);
+        assert_eq!(indexed_turns(&fx.index_dir).len() as u64, expected);
+    }
+
+    /// Contextual BM25, through a real `run()`: a `Bash cargo build` document says nothing at
+    /// all about what it was for, and is retrieved anyway by a word that appears only in the
+    /// session's title and in the prompt that opened its turn.
+    ///
+    /// This is also where the composition is proven to be in the right place. The title comes
+    /// from a `summary` record and the opening prompt from a `user` record — neither of which
+    /// a tail parse can see — so the header is built from the row `merge_session` produces,
+    /// after the merge and before the documents are written.
+    #[test]
+    fn a_tool_call_is_retrievable_by_the_context_of_its_session() {
+        let summary =
+            r#"{"type":"summary","summary":"Tuning the markdown tokenizer","leafUuid":"u2"}"#;
+        let body = [
+            summary.to_string(),
+            user_line("u1", None, "make retrieval find fragments by their context"),
+            assistant_line("a1", "u1", "on it"),
+            tool_use_line("a2", "a1", "toolu_1", "cargo build"),
+            tool_result_line("u2", "a2", "toolu_1", "Finished dev profile"),
+        ]
+        .join("\n")
+            + "\n";
+        let fx = Fixture::with_body(&body);
+        fx.index();
+        assert_eq!(
+            fx.sessions()
+                .values()
+                .next()
+                .and_then(|s| s.title.clone())
+                .as_deref(),
+            Some("Tuning the markdown tokenizer")
+        );
+
+        let (index, fields) = open_or_create(&fx.index_dir).unwrap();
+        let hit_for = |query: &str| -> Option<crate::search::Hit> {
+            let req = crate::search::SearchRequest {
+                query: Some(query.to_string()),
+                ..crate::search::SearchRequest::default()
+            };
+            crate::search::search(&index, &fields, &req)
+                .unwrap()
+                .hits
+                .into_iter()
+                .find(|h| h.doc.tool_name.as_deref() == Some("Bash"))
+        };
+
+        // `tokenizer` is in the title only; `retrieval` in the opening prompt only; `proj` is
+        // the project's basename. None of the three is anywhere in the document itself.
+        for query in ["tokenizer", "retrieval", "proj"] {
+            let hit =
+                hit_for(query).unwrap_or_else(|| panic!("{query:?} did not reach the Bash call"));
+            assert!(!hit.doc.body.contains(query), "{}", hit.doc.body);
+            // The scaffolding decided the retrieval and shows up in none of the output: it is
+            // not stored, so there is nothing for `doc_from_stored` to hand back.
+            assert!(hit.doc.turn_prompt.is_none());
+            assert!(!hit.snippet.contains(query), "{}", hit.snippet);
         }
     }
 }

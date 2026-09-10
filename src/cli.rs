@@ -27,6 +27,45 @@ const SEARCH_FACET_TOP: usize = 15;
 const SNIPPET_CHARS: usize = 240;
 /// Cap on the session scan that resolves `--around <UUID>` to a `seq`.
 const UUID_SCAN_LIMIT: usize = 50_000;
+/// Documents one `--context turn` window may show, per hit.
+///
+/// A turn is not a bounded thing: one prompt can spawn hundreds of tool calls over an hour, and
+/// a sidechain file is a single turn by rule 3 of the "Turns" section, so "the turn" there is a
+/// whole subagent transcript. `TopDocs` preallocates whatever it is handed, so an uncapped turn
+/// is a process abort rather than a long scroll — and twenty hits would each pay for it. What
+/// the cap leaves out is reported, never dropped silently. `show --around ... --turn` has
+/// `--limit` for the same job, and defers to whatever the caller set there.
+const TURN_WINDOW_LIMIT: usize = 200;
+
+/// What `search --context` asks for beside each hit.
+///
+/// A fixed `N` is the wrong shape for a hit inside a forty-call turn — it shows three
+/// neighbouring `Bash` calls and never the prompt that explains them — and the wrong shape for a
+/// short turn too, where it drags in turns that have nothing to do with the hit. `turn` snaps to
+/// the boundary the transcript already defines, so what comes back is the prompt, what was
+/// tried and what came back, and nothing else.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ContextWindow {
+    /// N documents either side of the hit, as `context::around` returns them.
+    Docs(usize),
+    /// The hit's whole enclosing turn, capped at `TURN_WINDOW_LIMIT`.
+    Turn,
+}
+
+impl std::str::FromStr for ContextWindow {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        let value = s.trim();
+        if value.eq_ignore_ascii_case("turn") {
+            return Ok(ContextWindow::Turn);
+        }
+        value
+            .parse::<usize>()
+            .map(ContextWindow::Docs)
+            .map_err(|_| format!("expected a document count or `turn`, got {value:?}"))
+    }
+}
 
 #[derive(Debug, Parser)]
 #[command(
@@ -84,9 +123,10 @@ pub enum Command {
         /// Comma-separated facet fields, e.g. `tool_name,code_lang,tool_input.file_path`.
         #[arg(long, value_delimiter = ',', value_name = "FIELD")]
         facets: Vec<String>,
-        /// Also show N turns either side of each hit.
-        #[arg(long, default_value_t = 0, value_name = "N")]
-        context: usize,
+        /// Also show N documents either side of each hit, or `turn` for the hit's whole
+        /// enclosing turn — the prompt that opened it, what was tried, and what came back.
+        #[arg(long, default_value = "0", value_name = "N|turn")]
+        context: ContextWindow,
         #[arg(long, default_value_t = 20, value_name = "N")]
         limit: usize,
         #[arg(long, default_value_t = 0, value_name = "N")]
@@ -134,6 +174,12 @@ pub enum Command {
         /// A doc uuid or a `seq` number; prints a window instead of the whole session.
         #[arg(long, value_name = "UUID|SEQ")]
         around: Option<String>,
+        /// Snap the `--around` window to the enclosing turn instead of counting documents with
+        /// `--before`/`--after`. Capped by `--limit`, and what the cap left out is reported.
+        // A turn is defined relative to a document, so there is nothing to snap to without
+        // `--around`; requiring it turns a silent no-op into a usage error.
+        #[arg(long, requires = "around")]
+        turn: bool,
         #[arg(long, default_value_t = 3, value_name = "N")]
         before: usize,
         #[arg(long, default_value_t = 3, value_name = "N")]
@@ -306,11 +352,13 @@ fn dispatch(
                 sort,
             };
             let response = search::search(&index, &fields, &request)?;
-            opts.context = window;
-            let around = if window > 0 {
-                context_windows(&index, &fields, &response, window)
-            } else {
-                Vec::new()
+            opts.context = match window {
+                ContextWindow::Docs(n) => n,
+                ContextWindow::Turn => 0,
+            };
+            let around = match window {
+                ContextWindow::Docs(0) => Vec::new(),
+                _ => context_windows(&index, &fields, &response, window),
             };
             format::search_results_ctx(out, &response, &around, &opts)
         }
@@ -341,6 +389,7 @@ fn dispatch(
             session_id,
             agent,
             around,
+            turn,
             before,
             after,
             limit,
@@ -373,21 +422,40 @@ fn dispatch(
             // both and silently drops the neighbours it was asked for.
             let source = source_path_for(&known, &session_id, agent);
             let source = source.as_deref();
-            let docs = match around {
+            let (docs, span) = match around {
                 Some(spec) => {
-                    let seq = resolve_seq(&index, &fields, &session_id, agent, source, &spec)?;
-                    context::around(
-                        &index,
-                        &fields,
-                        &session_id,
-                        agent,
-                        source,
-                        seq,
-                        before,
-                        after,
-                    )?
+                    let anchor = resolve_seq(&index, &fields, &session_id, agent, source, &spec)?;
+                    // A uuid names one record in one file. When the session id alone did not
+                    // narrow to a file, the file the uuid was found in is the only one the
+                    // window can honestly be scoped to.
+                    let source = anchor.source_path.as_deref().or(source);
+                    let seq = anchor.seq;
+                    if turn {
+                        let window =
+                            turn_at(&index, &fields, &session_id, agent, source, seq, limit)?;
+                        let span = format::TurnSpan {
+                            turn_seq: window.turn_seq,
+                            total: window.total,
+                        };
+                        (window.docs, Some(span))
+                    } else {
+                        let docs = context::around(
+                            &index,
+                            &fields,
+                            &session_id,
+                            agent,
+                            source,
+                            seq,
+                            before,
+                            after,
+                        )?;
+                        (docs, None)
+                    }
                 }
-                None => context::session(&index, &fields, &session_id, agent, source, limit)?,
+                None => (
+                    context::session(&index, &fields, &session_id, agent, source, limit)?,
+                    None,
+                ),
             };
             if docs.is_empty() {
                 tracing::warn!(
@@ -395,7 +463,10 @@ fn dispatch(
                     "no indexed documents; `session-search sessions` lists what is indexed"
                 );
             }
-            format::session_view(out, &docs, &opts)
+            match span {
+                Some(span) => format::turn_view(out, &docs, span, &opts),
+                None => format::session_view(out, &docs, &opts),
+            }
         }
 
         Command::Sessions {
@@ -522,31 +593,44 @@ fn resolve_roots(explicit: Vec<PathBuf>) -> Result<Vec<PathBuf>> {
     }
 }
 
-/// One `context::around` window per hit. A failure on a single hit degrades that hit to "no
-/// context" rather than losing the whole result set.
+/// One context window per hit. A failure on a single hit degrades that hit to "no context"
+/// rather than losing the whole result set.
 fn context_windows(
     index: &tantivy::Index,
     fields: &crate::schema::Fields,
     response: &search::SearchResponse,
-    window: usize,
-) -> Vec<Vec<crate::parse::Doc>> {
+    window: ContextWindow,
+) -> Vec<format::HitContext> {
     response
         .hits
         .iter()
         .map(|hit| {
-            context::around(
-                index,
-                fields,
-                &hit.doc.session_id,
-                hit.doc.agent_id.as_deref(),
-                Some(hit.doc.source_path.as_str()),
-                hit.doc.seq,
-                window,
-                window,
-            )
-            .unwrap_or_else(|err| {
+            let fetched = match window {
+                ContextWindow::Docs(n) => context::around(
+                    index,
+                    fields,
+                    &hit.doc.session_id,
+                    hit.doc.agent_id.as_deref(),
+                    Some(hit.doc.source_path.as_str()),
+                    hit.doc.seq,
+                    n,
+                    n,
+                )
+                .map(format::HitContext::around),
+                // `turn_seq` rides on the hit itself, so snapping to the turn costs one query,
+                // not a lookup of the doc first.
+                ContextWindow::Turn => context::turn_window(
+                    index,
+                    fields,
+                    &hit.doc.source_path,
+                    hit.doc.turn_seq,
+                    TURN_WINDOW_LIMIT,
+                )
+                .map(|w| format::HitContext::turn(w.docs, w.turn_seq, w.total)),
+            };
+            fetched.unwrap_or_else(|err| {
                 tracing::warn!(doc = %hit.doc.doc_id, error = %format!("{err:#}"), "context lookup failed");
-                Vec::new()
+                format::HitContext::default()
             })
         })
         .collect()
@@ -591,6 +675,17 @@ pub(crate) fn source_path_for(
     matching.next().is_none().then(|| first.source_path.clone())
 }
 
+/// What `--around` resolved to: a `seq`, and the file it belongs to when the spec said.
+///
+/// A bare number carries no file: `seq` is a per-file ordinal, and when a session id names two
+/// files (§9) the caller has nothing to pick one by. A uuid does — it was found by scanning
+/// the session, in exactly one document of exactly one file — and throwing that away would
+/// let the window that follows re-fetch "some document at that seq" from the *other* file.
+struct Anchor {
+    seq: u64,
+    source_path: Option<String>,
+}
+
 fn resolve_seq(
     index: &tantivy::Index,
     fields: &crate::schema::Fields,
@@ -598,9 +693,12 @@ fn resolve_seq(
     agent_id: Option<&str>,
     source_path: Option<&str>,
     spec: &str,
-) -> Result<u64> {
+) -> Result<Anchor> {
     if let Ok(seq) = spec.trim().parse::<u64>() {
-        return Ok(seq);
+        return Ok(Anchor {
+            seq,
+            source_path: None,
+        });
     }
     let docs = context::session(
         index,
@@ -616,8 +714,39 @@ fn resolve_seq(
                 || doc.doc_id == spec
                 || doc.tool_use_id.as_deref() == Some(spec)
         })
-        .map(|doc| doc.seq)
+        .map(|doc| Anchor {
+            seq: doc.seq,
+            source_path: Some(doc.source_path.clone()),
+        })
         .ok_or_else(|| anyhow!("no document with uuid {spec:?} in session {session_id}"))
+}
+
+/// The turn the document at `seq` belongs to, for `show --around ... --turn`.
+///
+/// Which turn that is, is recorded on the document and nowhere else, so the anchor is fetched
+/// first — a zero-width `around` window, which is the same term query the caller would make
+/// anyway. Its own `source_path` scopes the turn, because `turn_seq` is a per-file ordinal and
+/// the caller's `source` is `None` whenever a session id names two files (§9).
+fn turn_at(
+    index: &tantivy::Index,
+    fields: &crate::schema::Fields,
+    session_id: &str,
+    agent_id: Option<&str>,
+    source_path: Option<&str>,
+    seq: u64,
+    limit: usize,
+) -> Result<context::TurnWindow> {
+    let anchor = context::around(index, fields, session_id, agent_id, source_path, seq, 0, 0)?
+        .into_iter()
+        .next()
+        .ok_or_else(|| anyhow!("no document at seq {seq} in session {session_id}"))?;
+    context::turn_window(
+        index,
+        fields,
+        &anchor.source_path,
+        anchor.turn_seq,
+        limit.max(1),
+    )
 }
 
 /// Index statistics without opening (or creating) the Tantivy index: everything shown is
@@ -976,7 +1105,7 @@ mod tests {
         assert!(!filters.sidechains_only);
         // `--facets a,b` is one flag, two fields.
         assert_eq!(facets, ["tool_name", "code_lang"]);
-        assert_eq!((context, limit, offset), (2, 5, 10));
+        assert_eq!((context, limit, offset), (ContextWindow::Docs(2), 5, 10));
         assert!(json && no_refresh && include_thinking);
     }
 
@@ -998,7 +1127,7 @@ mod tests {
             panic!("expected search");
         };
         assert_eq!(query.as_deref(), Some("tantivy"));
-        assert_eq!((limit, offset, context), (20, 0, 0));
+        assert_eq!((limit, offset, context), (20, 0, ContextWindow::Docs(0)));
         assert!(facets.is_empty());
         assert!(!json && !no_refresh && !include_thinking);
         assert_eq!(sort, SortBy::Relevance);
@@ -1090,6 +1219,7 @@ mod tests {
             session_id,
             agent,
             around,
+            turn,
             before,
             after,
             limit,
@@ -1116,7 +1246,7 @@ mod tests {
         assert_eq!(agent.as_deref(), Some("a10845c5ff9c7d4ec"));
         assert_eq!(around.as_deref(), Some("41"));
         assert_eq!((before, after, limit), (2, 4, 200));
-        assert!(!json && !no_refresh);
+        assert!(!turn && !json && !no_refresh);
 
         let Command::Sessions { limit, filters, .. } = parse(&[
             "session-search",
@@ -1451,5 +1581,105 @@ mod tests {
         let err = one("bbbb").unwrap_err().to_string();
         assert!(err.contains("ambiguous session id"), "{err}");
         assert!(err.contains("bbbb-2222, bbbb-3333"), "{err}");
+    }
+
+    /// `--context` takes a document count or the word `turn`; anything else is a usage error
+    /// rather than a silently-zero window.
+    #[test]
+    fn the_context_flag_takes_a_count_or_a_turn() {
+        let window = |value: &str| {
+            let Command::Search { context, .. } =
+                parse(&["session-search", "search", "q", "--context", value]).command
+            else {
+                panic!("expected search");
+            };
+            context
+        };
+        assert_eq!(window("0"), ContextWindow::Docs(0));
+        assert_eq!(window("3"), ContextWindow::Docs(3));
+        assert_eq!(window("turn"), ContextWindow::Turn);
+        assert_eq!(window("TURN"), ContextWindow::Turn);
+
+        let err = Cli::try_parse_from(["session-search", "search", "q", "--context", "session"])
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("expected a document count or `turn`"), "{err}");
+        assert!(Cli::try_parse_from(["session-search", "search", "q", "--context", "-1"]).is_err());
+    }
+
+    /// A turn is defined relative to a document, so `--turn` without `--around` has nothing to
+    /// snap to; clap reports that instead of printing the whole session.
+    #[test]
+    fn show_turn_requires_an_anchor() {
+        let Command::Show { around, turn, .. } = parse(&[
+            "session-search",
+            "show",
+            "b20208d8",
+            "--around",
+            "41",
+            "--turn",
+        ])
+        .command
+        else {
+            panic!("expected show");
+        };
+        assert_eq!(around.as_deref(), Some("41"));
+        assert!(turn);
+
+        let err = Cli::try_parse_from(["session-search", "show", "b20208d8", "--turn"])
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("--around"), "{err}");
+    }
+
+    /// A session id can name two files (§9), and `seq` restarts in each. A uuid is found in
+    /// exactly one of them, and the window that follows has to be scoped to that one: fetched
+    /// by `seq` alone it can come back from the other file, and `--turn` would then print a
+    /// turn the uuid was never in.
+    #[test]
+    fn a_uuid_anchor_names_the_file_it_was_found_in() {
+        use crate::search::testkit::{blank_doc, index_docs};
+        let mut docs = Vec::new();
+        for seq in 0..4u64 {
+            let mut d = blank_doc(seq);
+            d.turn_seq = 0;
+            d.body = format!("original {seq}");
+            docs.push(d);
+        }
+        for seq in 0..4u64 {
+            let mut d = blank_doc(seq);
+            d.doc_id = format!("s1:-:relocated:{seq}");
+            d.uuid = Some(format!("r-{seq}"));
+            d.source_path = "/tmp/relocated/s1.jsonl".into();
+            d.turn_seq = 2 * (seq / 2);
+            d.body = format!("relocated {seq}");
+            docs.push(d);
+        }
+        let (index, fields) = index_docs(&docs);
+
+        let anchor = resolve_seq(&index, &fields, "s1", None, None, "r-3").unwrap();
+        assert_eq!(anchor.seq, 3);
+        assert_eq!(
+            anchor.source_path.as_deref(),
+            Some("/tmp/relocated/s1.jsonl")
+        );
+        let window = turn_at(
+            &index,
+            &fields,
+            "s1",
+            None,
+            anchor.source_path.as_deref(),
+            anchor.seq,
+            10,
+        )
+        .unwrap();
+        assert_eq!(window.turn_seq, 2);
+        let bodies: Vec<&str> = window.docs.iter().map(|d| d.body.as_str()).collect();
+        assert_eq!(bodies, ["relocated 2", "relocated 3"]);
+
+        // A bare number says nothing about the file, and the caller's own scoping stands.
+        let bare = resolve_seq(&index, &fields, "s1", None, None, "3").unwrap();
+        assert_eq!(bare.seq, 3);
+        assert!(bare.source_path.is_none());
     }
 }

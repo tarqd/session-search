@@ -264,6 +264,18 @@ The call and its result are separate fields, so you can ask about either one alo
 
 A bare query still spans the pair, so nothing that used to match stops matching.
 
+A bare query also spans one thing the transcript never said. Every document is indexed with a
+short **context header** beside its body — the session's title and opening prompt, the project,
+the branch, and the prompt that opened the document's own turn — so a message that reads "yes"
+and a `cargo build --release` that says nothing about what it was building are findable by what
+they were *for*. The header is scaffolding, not content: it is never stored, so it is never
+shown, never highlighted in a snippet, and never appears in `--json`. Under the default
+relevance order it is weighted well below the body, so a document that genuinely discusses your
+term outranks the ones that merely happened in the same session. The header does widen what
+*matches*, though: the total, the facet counts and a `--sort newest` page all cover every
+document of a turn or session about your term, not only the ones that mention it. Qualify the
+query (`text:tokenizer`) to ask about bodies alone.
+
 ### 5. Read the conversation around a hit
 
 `--context N` pulls the surrounding turns in next to each hit:
@@ -290,6 +302,61 @@ session-search search "expand_dots" --limit 1 --context 2
 
 The four indented `#NN` lines under the snippet are the surrounding turns — two before, two
 after — each collapsed to one line.
+
+`--context turn` asks for a different window: the hit's whole enclosing turn, from the prompt
+that opened it to the last thing that came back before the next one. A fixed `N` is the wrong
+shape twice over — on a hit inside a forty-call turn it shows three neighbouring `Bash` calls
+and never the prompt that explains them, and on a short turn it drags in the turns either side:
+
+```bash
+session-search search "transcript" --limit 1 --context turn --sidechains-only
+```
+
+```
+1 of 2 hits · 6 ms
+
+▌ b20208d8-fbdb-5918-ba69-d203de6ed6dc  wild-spinning-puppy  agent a10845c5ff9c7d4ec · Explore  (1 hit)
+▌ /home/user/session-search · claude/rust-mcp-session-indexing-67tza2 · 2026-09-09 19:09
+
+   1. 19:09:19  assistant  #6  2.51
+      I'll start by exploring the directory structure and the **transcript** store
+      turn #0 · 11 docs
+      #0     user                 Read-only investigation. Goal: exhaustively characterize the on-d…
+      #1     attachment           environment <system-reminder> # Environment You have been invoked…
+      #2     attachment           model <system-reminder> You are powered by the model named Opus 5…
+      #3     attachment           session_context <system-reminder> As you answer the user's questi…
+      #4     attachment           date <system-reminder> Today's date is 2026-09-09. </system-remin…
+      #5     attachment           remote_session_change <system-reminder> Attribution for git commi…
+      #7     assistant Bash       Bash ls -la /home/PLACEHOLDER/.claude/ 2>&1 | head -50; echo "===…
+      #8     assistant Bash       Bash ls -la /home/PLACEHOLDER/.claude/sessions/ /home/PLACEHOLDER…
+      #9     assistant Bash       Bash ls -la /usr/lib/node_modules/ /opt 2>&1 | head -40; echo "==…
+      #10    attachment           plan_mode <system-reminder> Plan mode is active. The user indicat…
+```
+
+`show` has the same window under `--turn`, which snaps `--around` to the turn instead of
+counting documents out with `--before`/`--after`:
+
+```bash
+session-search show b20208d8 --agent a10845 --around 7 --turn --limit 3
+```
+
+```
+▌ b20208d8-fbdb-5918-ba69-d203de6ed6dc  wild-spinning-puppy  agent a10845c5ff9c7d4ec · Explore
+▌ /home/user/session-search · claude/rust-mcp-session-indexing-67tza2 · 2026-09-09 19:09
+▌ turn #0 · 3 of 11 docs
+
+#0     19:09:19  user
+      Read-only investigation. Goal: exhaustively characterize the on-disk Claude Code session…
+…
+```
+
+**A turn is not a bounded thing, so the window is capped.** One prompt can spawn hundreds of
+tool calls over an hour, and a subagent transcript is a *single* turn — its `user` records are
+synthesised by the parent, so there is no human prompt inside it to end one. `search --context
+turn` stops at 200 documents per hit and `show --turn` at its own `--limit`, and both say so:
+`turn #0 · 3 of 11 docs` is three shown out of eleven. In `--json` the same fact rides on the
+hit as `context_turn` (`{turn_seq, shown, docs_in_turn, truncated}`), and on `show --turn` as
+`turn`.
 
 Or replay a whole session — an id prefix is enough, as long as it is unambiguous:
 
@@ -711,10 +778,11 @@ point: `tool_input` is for finding text, `bash_cmd` is for counting facts.
 
 ### One rebuild on upgrade
 
-`bash_cmd` changed the shape of a document, so `state.json`'s `version` went from 2 to 3. The
-first run of a build that has this field sees the mismatch, throws the watermarks away and
-reindexes every transcript from byte zero. Nothing is asked of you and `index --full` is not
-needed; it costs one full pass, 76 ms for the 193 documents on this machine.
+`bash_cmd` changed the shape of a document, so `state.json`'s `version` went from 2 to 3; the
+markdown split took it to 4, and `turn_seq` with the context header to 5. The first run of a
+build whose version differs sees the mismatch, throws the watermarks away and reindexes every
+transcript from byte zero. Nothing is asked of you and `index --full` is not needed; it costs
+one full pass, 76 ms for the 193 documents on this machine.
 
 ---
 
@@ -841,7 +909,9 @@ Options:
                           `tool_name,code_lang,tool_input.file_path`
       --index <DIR>       Index directory. Defaults to `$XDG_DATA_HOME/session-search` [env:
                           SESSION_SEARCH_INDEX=]
-      --context <N>       Also show N turns either side of each hit [default: 0]
+      --context <N|turn>  Also show N documents either side of each hit, or `turn` for the hit's
+                          whole enclosing turn — the prompt that opened it, what was tried, and what
+                          came back [default: 0]
   -v, --verbose...        Raise the log level on stderr; repeatable (`-v` info, `-vv` debug, `-vvv`
                           trace)
       --limit <N>         [default: 20]
@@ -973,9 +1043,12 @@ Options:
                            session
   -v, --verbose...         Raise the log level on stderr; repeatable (`-v` info, `-vv` debug, `-vvv`
                            trace)
-      --before <N>         [default: 3]
       --no-color           Never colourise. Also honoured: a non-empty `$NO_COLOR`, and a non-tty
                            stdout
+      --turn               Snap the `--around` window to the enclosing turn instead of counting
+                           documents with `--before`/`--after`. Capped by `--limit`, and what the
+                           cap left out is reported
+      --before <N>         [default: 3]
       --after <N>          [default: 3]
       --limit <N>          [default: 200]
       --json
@@ -1038,7 +1111,13 @@ session-search facets tool_input.file_path --top 3 --json
 ```
 
 A search hit carries the full document — every field, the parsed `tool_input` object, and the
-marked-up snippet (`raw`, the original JSONL line, is stored but withheld from the payload):
+marked-up snippet (`raw`, the original JSONL line, is stored but withheld from the payload).
+`seq` is the document's ordinal within its transcript file; `turn_seq` is the `seq` of the
+document that opened its conversational **turn** — the human prompt the whole exchange answers —
+so every message, tool call and result of one turn shares it, and the prompt itself is the
+document whose `seq == turn_seq`. The hit below comes from a subagent transcript, whose `user`
+records are written by the parent rather than typed by a person, so the whole file is one turn
+and `turn_seq` is 0:
 
 ```bash
 session-search search "aggregation" -t Bash --limit 1 --json --facets tool_name
@@ -1084,6 +1163,7 @@ session-search search "aggregation" -t Bash --limit 1 --json --facets tool_name
       "tool_name": "Bash",
       "tool_output": "192:pub mod aggregation;\n193:pub mod collector;…",
       "tool_use_id": "toolu_01QtnP3F5Y8o8sPGoePwD6Ug",
+      "turn_seq": 0,
       "uuid": "cfbf460d-4921-4c09-b9f2-ff341c7141d6",
       "version": "2.1.266"
     }
@@ -1410,6 +1490,12 @@ code and capped independently of the body. Every one of these fields is searched
 query, and `tool_output:"No such file"` asks about what a tool *returned* rather than what it
 was asked to do.
 
+One more field is indexed and stored nowhere: `context_text`, a capped header naming the
+session, the project, the branch and the turn a document belongs to. It exists because a
+document is a fragment of a conversation and a fragment does not carry its own subject — see
+"Contextual BM25" in `docs/DESIGN.md`. Because it is not stored it can never be read back, so
+`show`, `--context` and `--json` print exactly what the transcript held.
+
 The index for this project's own development history:
 
 ```bash
@@ -1430,7 +1516,7 @@ role  4 values · 978 of 978 matching docs have a value
 
 ```json
 {
-  "version": 3,
+  "version": 5,
   "files": {
     "/root/.claude/projects/-home-user-session-search/b20208d8-….jsonl": {
       "size": 1029179,
@@ -1486,6 +1572,11 @@ entirely from `~/.claude/projects/`.
 A session's title arrives in a `summary` sidecar record that can be appended long after the
 messages it titles. Keeping session metadata in `sessions.json` means a late title update is a
 cheap JSON rewrite instead of a document rebuild.
+
+The one thing that bargain costs: the context header above is built when a document is written,
+so a title that only arrives afterwards is in `sessions.json` immediately and in that document's
+header at the next `--full`. The session's opening prompt is in the header from the first parse,
+which is the half that does the work.
 
 ---
 
@@ -1578,8 +1669,14 @@ on the next run.
 already contains `**` (this tool's own Markdown output, for instance) you will see `****term****`.
 Colour output makes it unambiguous; `--no-color` does not.
 
-**Context windows assume dense `seq`.** `show --around` and `search --context` walk `seq` numbers
+**Context windows assume dense `seq`.** `show --around` and `search --context N` walk `seq` numbers
 within a file. If a re-index ever leaves a hole, the window comes back short rather than erroring.
+`turn_seq` inherits that assumption — a turn is a contiguous range of `seq` in one file, not a
+list of the documents in it — and it inherits one more: a transcript that opens mid-conversation
+after a `resetSessionFile()`, and a subagent transcript whose prompts were written by the parent,
+have no human prompt to bound a turn with, so their leading documents all share turn zero.
+A turn window (`--context turn`, `show --turn`) does not care: it asks for a `turn_seq` value
+rather than a range, so a hole costs it the one document and nothing else.
 
 **Spilled tool results are read from a path found in transcript text.** Oversized tool output is
 written to `tool-results/<id>.txt` and the transcript carries a `Full output saved to: <path>`

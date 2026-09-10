@@ -14,6 +14,12 @@
 //!   the splitting and `markdown.rs` decides what goes where. Beside them, `body` keeps the
 //!   body as it was written, stored and never indexed, because that is what gets rendered.
 //!   A tool call's *result* is none of those: it lives in `tool_output`, analyzed as code.
+//! * `context_text` is the one field that is indexed and **not stored**. It holds a header
+//!   describing what the document was *for* — the session's title and opening prompt, the
+//!   project, the branch, the prompt that opened the document's own turn — so a fragment like
+//!   `yes` or `Bash cargo build` is retrievable by the words a person would actually type.
+//!   It is scaffolding rather than content: not stored means it can never be read back, never
+//!   rendered as a snippet and never reach `--json`. See [`context_header`].
 
 use serde_json::{Map, Value, json};
 use tantivy::schema::{
@@ -21,7 +27,7 @@ use tantivy::schema::{
     TextFieldIndexing, TextOptions,
 };
 
-use crate::parse::{Doc, DocKind};
+use crate::parse::{Doc, DocKind, SessionInfo, truncate_words};
 use crate::tokenizer::{CODE_ANALYZER, PROSE_ANALYZER};
 
 /// One handle per schema field. Cheap to clone.
@@ -66,6 +72,11 @@ pub struct Fields {
     pub thinking_tokens: tantivy::schema::Field,
     pub timestamp: tantivy::schema::Field,
     pub seq: tantivy::schema::Field,
+    /// The `seq` of the doc that opened this doc's turn. Fast, so turn grouping and a
+    /// pre-filtered scan read it columnar rather than out of the stored payload.
+    pub turn_seq: tantivy::schema::Field,
+    /// Indexed, never stored: the context header of [`context_header`].
+    pub context_text: tantivy::schema::Field,
     pub is_error: tantivy::schema::Field,
     pub is_sidechain: tantivy::schema::Field,
     pub is_meta: tantivy::schema::Field,
@@ -81,6 +92,22 @@ pub struct Fields {
 /// `SnippetGenerator` needs positions on any field it highlights.
 fn full_text_options(analyzer: &str) -> TextOptions {
     TextOptions::default().set_stored().set_indexing_options(
+        TextFieldIndexing::default()
+            .set_tokenizer(analyzer)
+            .set_index_option(IndexRecordOption::WithFreqsAndPositions),
+    )
+}
+
+/// Options for a field that is indexed and **not stored**, with `analyzer` in place of
+/// `default`.
+///
+/// The missing `set_stored()` is the whole design of `context_text`: a header is retrieval
+/// scaffolding assembled at index time, not something the transcript said. Leaving it out of
+/// the stored payload is what makes it impossible to leak — `search::doc_from_stored` cannot
+/// read it back, no `SnippetGenerator` can highlight it, and `--json` cannot print it — rather
+/// than a rule three separate call sites have to remember.
+fn indexed_only_options(analyzer: &str) -> TextOptions {
+    TextOptions::default().set_indexing_options(
         TextFieldIndexing::default()
             .set_tokenizer(analyzer)
             .set_index_option(IndexRecordOption::WithFreqsAndPositions),
@@ -184,6 +211,13 @@ pub fn build_schema() -> (Schema, Fields) {
 
     let timestamp = sb.add_date_field("timestamp", INDEXED | STORED | FAST);
     let seq = sb.add_u64_field("seq", INDEXED | STORED | FAST);
+    // Mirrors `seq`: INDEXED so `context::turn` can term-query it, FAST so grouping by turn is
+    // a columnar read, STORED so `doc_from_stored` hands it back on every hit.
+    let turn_seq = sb.add_u64_field("turn_seq", INDEXED | STORED | FAST);
+    // The contextual-BM25 header. `prose`, because a header is English — a title, a prompt, a
+    // branch name — so it wants the stemmer, and the shared code base still splits the
+    // identifiers inside it. Indexed only: see [`indexed_only_options`].
+    let context_text = sb.add_text_field("context_text", indexed_only_options(PROSE_ANALYZER));
     // STORED as well as indexed: `search::doc_from_stored` reads these back out of the stored
     // payload, so without it every `Hit`, every `show` document and every `--json` response
     // would report `false` — contradicting the very filter that selected them.
@@ -226,6 +260,8 @@ pub fn build_schema() -> (Schema, Fields) {
         thinking_tokens,
         timestamp,
         seq,
+        turn_seq,
+        context_text,
         is_error,
         is_sidechain,
         is_meta,
@@ -263,9 +299,140 @@ fn rfc3339(ms: i64) -> Option<String> {
     chrono::DateTime::from_timestamp_millis(ms).map(|dt| dt.to_rfc3339())
 }
 
+/// Bytes of the header one prose piece — a title, an opening prompt — may spend.
+///
+/// The cap is the point of the whole field. A header rides on *every* document, including a
+/// one-line tool call, and BM25 divides a term's contribution by the document's length against
+/// the corpus average: an uncapped opening prompt would out-mass the body it was prepended to
+/// and turn a precise hit into a diluted one.
+const CONTEXT_PROSE_BYTES: usize = 100;
+
+/// Bytes for a header piece that is a name rather than a sentence — the project basename, the
+/// branch. Neither is prose and neither is long; the cap is only there so a pathological value
+/// cannot spend the whole budget.
+const CONTEXT_NAME_BYTES: usize = 40;
+
+/// Hard ceiling on the assembled header. The per-piece budgets above already sum below it
+/// (3 × 100 + 2 × 40 + four separators = 396), so this is a backstop rather than a knife: it
+/// exists so that adding a piece later cannot silently unbound the field, and so the
+/// most document-specific piece — the turn's own prompt, composed last — is never the one a
+/// long session title crowds out.
+const CONTEXT_HEADER_BYTES: usize = 400;
+
+/// What separates two header pieces. Not a term under either analyzer, so it costs the
+/// document nothing but keeps the pieces from running two words together.
+const CONTEXT_SEP: &str = " · ";
+
+/// The searchable word of a project path. `project` already holds the whole path as an
+/// exact-match field and `-p` matches it by prefix; what a header wants is the one word
+/// somebody would type, not the `/home/user/` above it.
+fn basename(path: &str) -> Option<&str> {
+    path.trim_end_matches('/')
+        .rsplit('/')
+        .next()
+        .filter(|s| !s.is_empty())
+}
+
+/// One header piece as it would be indexed: whitespace collapsed, then capped on a word
+/// boundary. Whitespace is not a term — a prompt wrapped over ten lines would otherwise spend
+/// most of its budget on the gaps between its words.
+fn piece_of(raw: &str, budget: usize) -> String {
+    let collapsed = raw.split_whitespace().collect::<Vec<_>>().join(" ");
+    truncate_words(&collapsed, budget)
+}
+
+/// `raw`, unless it would index as the same piece the document's own body does.
+fn unless_own<'a>(raw: Option<&'a str>, own_words: &str) -> Option<&'a str> {
+    raw.filter(|r| piece_of(r, CONTEXT_PROSE_BYTES) != own_words)
+}
+
+/// Append one header piece, collapsed, capped and deduplicated.
+fn push_piece(pieces: &mut Vec<String>, raw: Option<&str>, budget: usize) {
+    let Some(raw) = raw else { return };
+    let piece = piece_of(raw, budget);
+    // A session whose title *is* its opening prompt, or whose first turn is the one being
+    // indexed, would otherwise index the same sentence two and three times over and hand it a
+    // term frequency it did not earn.
+    if piece.is_empty() || pieces.contains(&piece) {
+        return;
+    }
+    pieces.push(piece);
+}
+
+/// The contextual-BM25 header for one document: what the fragment was *for*, in the words
+/// someone would search for it by.
+///
+/// Our documents are fragments torn out of a conversation. A tool call indexes a tool name and
+/// the strings of its input (`Bash cargo build --release`) with no trace of what it was in aid
+/// of; half of all user messages are `yes`, `do that`, `still broken`. Neither is retrievable
+/// by anything a person would type. Prepending the chunk's own context before indexing is the
+/// lexical half of contextual retrieval, and it needs no embeddings — it is an index-time text
+/// change to the inverted index we already have.
+///
+/// Composed cheapest first, and from two different places by necessity:
+///
+/// * the session's title and opening prompt come from `session`, the row `index.rs` merges into
+///   `sessions.json`. A tail parse cannot know either — the `summary` record and the first
+///   prompt are behind its byte offset — so the indexer supplies them from the merged row;
+/// * `project` and `git_branch` are on the document already;
+/// * the turn's opening prompt rides on the document as [`Doc::turn_prompt`], because only the
+///   parser can know it and only [`crate::parse::ParseCarry`] can carry it across a boundary.
+///
+/// A prompt piece that is this document's own text is not context and is left out: the
+/// document that *is* its turn's opening prompt, or the session's, would otherwise index its
+/// own words a second time, inflating their frequency in the one document where they need no
+/// help. The turn's opener is recognised by `seq == turn_seq`; the session's is recognised by
+/// its text, because it is not reliably the first document of its file — a compaction summary
+/// or a `system` record can precede it, and a tail parse numbers from `seq_base` — and in a
+/// subagent file it never passed `is_human_turn()` at all.
+pub fn context_header(doc: &Doc, session: Option<&SessionInfo>) -> Option<String> {
+    let own_words = piece_of(&doc.body, CONTEXT_PROSE_BYTES);
+    let not_own = |raw| unless_own(raw, &own_words);
+
+    let mut pieces: Vec<String> = Vec::new();
+    push_piece(
+        &mut pieces,
+        session.and_then(|s| s.title.as_deref()),
+        CONTEXT_PROSE_BYTES,
+    );
+    push_piece(
+        &mut pieces,
+        not_own(session.and_then(|s| s.first_prompt.as_deref())),
+        CONTEXT_PROSE_BYTES,
+    );
+    push_piece(
+        &mut pieces,
+        doc.project.as_deref().and_then(basename),
+        CONTEXT_NAME_BYTES,
+    );
+    push_piece(&mut pieces, doc.git_branch.as_deref(), CONTEXT_NAME_BYTES);
+    // The opener is known by number as well as by text: `seq == turn_seq` is exact for the
+    // document a human prompt was emitted as, and the text check covers the session's opening
+    // prompt and a prompt whose record emitted something else first.
+    if doc.seq != doc.turn_seq {
+        push_piece(
+            &mut pieces,
+            not_own(doc.turn_prompt.as_deref()),
+            CONTEXT_PROSE_BYTES,
+        );
+    }
+    if pieces.is_empty() {
+        return None;
+    }
+    Some(truncate_words(
+        &pieces.join(CONTEXT_SEP),
+        CONTEXT_HEADER_BYTES,
+    ))
+}
+
 /// Encode a [`Doc`] for `TantivyDocument::parse_json`. Absent values are omitted rather than
 /// written as `null` — Tantivy would reject a null for a typed field.
-pub fn doc_to_json(doc: &Doc, include_thinking: bool) -> Value {
+///
+/// `session` is the merged `sessions.json` row for this document's transcript, and is what the
+/// `context_text` header's session half is built from; `None` composes the header from the
+/// document alone. It is a parameter rather than something read off the `Doc` because a tail
+/// parse never sees the title or the opening prompt, and the indexer's merged row does.
+pub fn doc_to_json(doc: &Doc, session: Option<&SessionInfo>, include_thinking: bool) -> Value {
     let mut o = Map::new();
     let put_str = |o: &mut Map<String, Value>, key: &str, v: Option<&str>| {
         if let Some(v) = v.filter(|s| !s.is_empty()) {
@@ -292,6 +459,13 @@ pub fn doc_to_json(doc: &Doc, include_thinking: bool) -> Value {
     put_str(&mut o, "version", doc.version.as_deref());
     put_str(&mut o, "slug", doc.slug.as_deref());
     put_str(&mut o, "body", Some(&doc.body));
+    // Indexed, never stored: the schema entry has no `set_stored()`, so this reaches the
+    // inverted index and nothing else.
+    put_str(
+        &mut o,
+        "context_text",
+        context_header(doc, session).as_deref(),
+    );
     put_str(&mut o, "tool_output", doc.tool_output.as_deref());
     put_str(&mut o, "raw", Some(&doc.raw));
 
@@ -337,6 +511,7 @@ pub fn doc_to_json(doc: &Doc, include_thinking: bool) -> Value {
         o.insert("timestamp".to_string(), json!(ts));
     }
     o.insert("seq".to_string(), json!(doc.seq));
+    o.insert("turn_seq".to_string(), json!(doc.turn_seq));
     o.insert("is_error".to_string(), json!(u64::from(doc.is_error)));
     o.insert(
         "is_sidechain".to_string(),
@@ -360,6 +535,8 @@ mod tests {
             kind: DocKind::ToolCall,
             source_path: "/tmp/sess.jsonl".into(),
             seq: 7,
+            turn_seq: 5,
+            turn_prompt: Some("fix the tokenizer".into()),
             session_id: "sess".into(),
             agent_id: None,
             agent_type: None,
@@ -427,6 +604,8 @@ mod tests {
             "thinking",
             "timestamp",
             "seq",
+            "turn_seq",
+            "context_text",
             "is_error",
             "is_sidechain",
             "is_meta",
@@ -469,7 +648,7 @@ mod tests {
     #[test]
     fn doc_json_round_trips_through_parse_json() {
         let (schema, f) = build_schema();
-        let value = doc_to_json(&sample(), true);
+        let value = doc_to_json(&sample(), None, true);
         let doc = TantivyDocument::parse_json(&schema, &value.to_string())
             .expect("tantivy must accept our json");
 
@@ -478,6 +657,7 @@ mod tests {
         assert_eq!(first(f.kind), "tool_call");
         assert_eq!(first(f.tool_name), "Bash");
         assert_eq!(doc.get_first(f.seq).unwrap().as_u64(), Some(7));
+        assert_eq!(doc.get_first(f.turn_seq).unwrap().as_u64(), Some(5));
         assert_eq!(doc.get_first(f.is_error).unwrap().as_u64(), Some(1));
         assert!(doc.get_first(f.timestamp).unwrap().as_datetime().is_some());
         assert!(doc.get_first(f.project_facet).unwrap().as_facet().is_some());
@@ -507,7 +687,7 @@ mod tests {
         d.code = vec!["let a = 1;".into(), "let b = 2;".into(), "  ".into()];
         d.headings = vec!["First".into(), "Second".into()];
         d.code_langs = vec!["rust".into(), "bash".into()];
-        let value = doc_to_json(&d, false);
+        let value = doc_to_json(&d, None, false);
         let doc = TantivyDocument::parse_json(&schema, &value.to_string()).unwrap();
 
         // A blank entry is dropped rather than stored as an empty value.
@@ -528,7 +708,7 @@ mod tests {
         d.code.clear();
         d.headings.clear();
         d.code_langs.clear();
-        let value = doc_to_json(&d, false);
+        let value = doc_to_json(&d, None, false);
         assert!(value.get("text").is_none());
         assert!(value.get("code").is_none());
         assert!(value.get("headings").is_none());
@@ -539,7 +719,7 @@ mod tests {
     #[test]
     fn thinking_is_omitted_unless_opted_in() {
         let (schema, f) = build_schema();
-        let value = doc_to_json(&sample(), false);
+        let value = doc_to_json(&sample(), None, false);
         assert!(value.get("thinking").is_none());
         let doc = TantivyDocument::parse_json(&schema, &value.to_string()).unwrap();
         assert!(doc.get_first(f.thinking).is_none());
@@ -554,7 +734,7 @@ mod tests {
         d.tool_input = None;
         d.bash_cmd = None;
         d.model = None;
-        let value = doc_to_json(&d, true);
+        let value = doc_to_json(&d, None, true);
         assert!(value.get("timestamp").is_none());
         assert!(value.get("project_facet").is_none());
         assert!(value.get("tool_input").is_none());
@@ -567,7 +747,7 @@ mod tests {
         let (schema, _) = build_schema();
         let mut d = sample();
         d.tool_input = Some(json!("a bare string"));
-        let value = doc_to_json(&d, false);
+        let value = doc_to_json(&d, None, false);
         assert_eq!(value["tool_input"]["value"], json!("a bare string"));
         TantivyDocument::parse_json(&schema, &value.to_string()).unwrap();
     }
@@ -591,7 +771,7 @@ mod tests {
         let index = crate::tokenizer::create_in_ram(schema.clone());
         let mut writer = index.writer_with_num_threads(1, 15_000_000).unwrap();
         for doc in &out.docs {
-            let json = doc_to_json(doc, false).to_string();
+            let json = doc_to_json(doc, None, false).to_string();
             writer
                 .add_document(TantivyDocument::parse_json(&schema, &json).unwrap())
                 .unwrap();
@@ -662,7 +842,7 @@ mod tests {
             doc.tool_input = Some(json!({ "command": command }));
             doc.bash_cmd = crate::bash::extract(command).map(|c| c.to_json());
             assert!(doc.bash_cmd.is_some(), "{command:?} should parse");
-            let json = doc_to_json(&doc, false).to_string();
+            let json = doc_to_json(&doc, None, false).to_string();
             writer
                 .add_document(TantivyDocument::parse_json(&schema, &json).unwrap())
                 .unwrap();
@@ -747,5 +927,233 @@ mod tests {
         assert_eq!(facet_path("/a/b/").as_deref(), Some("/a/b"));
         assert!(facet_path("/").is_none());
         assert!(facet_path("").is_none());
+    }
+
+    fn session() -> SessionInfo {
+        SessionInfo {
+            session_id: "sess".into(),
+            title: Some("Tuning the markdown tokenizer".into()),
+            first_prompt: Some("make search find things by what they were for".into()),
+            source_path: "/tmp/sess.jsonl".into(),
+            ..SessionInfo::default()
+        }
+    }
+
+    /// The two halves of the `context_text` decision, in one assertion each: it is analyzed as
+    /// English prose, and it is **not stored**. Not stored is what makes "never rendered, never
+    /// returned, never in `--json`" a property of the schema rather than a rule three call
+    /// sites have to keep remembering.
+    #[test]
+    fn context_text_is_prose_analyzed_and_never_stored() {
+        let (schema, f) = build_schema();
+        let entry = schema.get_field_entry(f.context_text);
+        assert_eq!(entry.name(), "context_text");
+        assert!(
+            !entry.is_stored(),
+            "a header is retrieval scaffolding, not something the transcript said"
+        );
+        let tantivy::schema::FieldType::Str(opts) = entry.field_type() else {
+            panic!("context_text must be a text field");
+        };
+        let indexing = opts
+            .get_indexing_options()
+            .expect("context_text must be indexed");
+        assert_eq!(indexing.tokenizer(), PROSE_ANALYZER);
+        assert_eq!(
+            indexing.index_option(),
+            IndexRecordOption::WithFreqsAndPositions,
+            "the prose analyzer emits an identifier's parts at one position, so phrases need them"
+        );
+    }
+
+    /// What the header is made of, and where each piece comes from: the session row supplies
+    /// the title and the opening prompt a tail parse cannot see, the document supplies the
+    /// project, the branch and its own turn's prompt.
+    #[test]
+    fn the_header_says_what_the_fragment_was_for() {
+        let mut d = sample();
+        d.seq = 7;
+        d.turn_seq = 5;
+        let header = context_header(&d, Some(&session())).expect("a header");
+        for word in [
+            "Tuning the markdown tokenizer",
+            "make search find things",
+            "session-search",
+            "main",
+            "fix the tokenizer",
+        ] {
+            assert!(header.contains(word), "{word:?} missing from {header:?}");
+        }
+        // The project's *basename*: the whole path is already an exact-match field, and the
+        // directories above it are not words anybody searches by.
+        assert!(!header.contains("/home/user"), "{header}");
+
+        // With no session row there is still a header — the document knows where it was and
+        // what its turn asked.
+        let alone = context_header(&d, None).expect("a header from the doc alone");
+        assert!(alone.contains("session-search") && alone.contains("fix the tokenizer"));
+        assert!(!alone.contains("Tuning"));
+    }
+
+    /// The document that *is* its turn's opening prompt would otherwise index its own words a
+    /// second time, doubling their frequency in the one document that needs no help finding
+    /// them.
+    #[test]
+    fn the_opening_prompt_of_a_turn_is_not_repeated_in_its_own_header() {
+        let mut d = sample();
+        d.seq = 5;
+        d.turn_seq = 5;
+        let header = context_header(&d, None).expect("a header");
+        assert!(!header.contains("fix the tokenizer"), "{header}");
+        assert!(header.contains("session-search"), "{header}");
+    }
+
+    /// A piece repeated across pieces is dropped rather than indexed twice: a session whose
+    /// title *is* its opening prompt would otherwise hand those words a term frequency they
+    /// did not earn in every document of the session.
+    #[test]
+    fn a_header_never_repeats_the_same_piece() {
+        let mut d = sample();
+        d.turn_prompt = Some("one and only prompt".into());
+        let info = SessionInfo {
+            title: Some("one and only prompt".into()),
+            first_prompt: Some("one and only prompt".into()),
+            ..SessionInfo::default()
+        };
+        let header = context_header(&d, Some(&info)).expect("a header");
+        assert_eq!(header.matches("one and only prompt").count(), 1, "{header}");
+    }
+
+    /// The cap is the point of the field. A header rides on *every* document, and BM25 divides
+    /// a term's contribution by the document's length: an uncapped opening prompt prepended to
+    /// a one-line tool call would out-mass the body it was meant to describe.
+    #[test]
+    fn the_header_is_capped_and_cut_on_a_word_boundary() {
+        // Five oversized pieces, each with its own leading word so that none of them is
+        // deduplicated away and every one really is cut by its own budget.
+        let long = "tokenizer ".repeat(200);
+        let mut d = sample();
+        d.seq = 7;
+        d.turn_seq = 5;
+        d.turn_prompt = Some(format!("turnprompt {long}"));
+        d.git_branch = Some(format!("branch-{long}"));
+        let info = SessionInfo {
+            title: Some(format!("title {long}")),
+            first_prompt: Some(format!("first {long}")),
+            ..SessionInfo::default()
+        };
+        let header = context_header(&d, Some(&info)).expect("a header");
+        assert!(
+            header.len() <= CONTEXT_HEADER_BYTES,
+            "{} bytes: {header}",
+            header.len()
+        );
+        // Word boundaries, so no piece ends in a fragment like `tokeni` that matches nothing
+        // anybody would type — and each piece spent its whole budget short of one word, so the
+        // per-piece caps really were what stood between these inputs and an unbounded field.
+        let pieces: Vec<&str> = header.split(CONTEXT_SEP).collect();
+        assert_eq!(pieces.len(), 5, "{header}");
+        let word = "tokenizer ".len();
+        for (i, piece) in pieces.iter().enumerate() {
+            let budget = match i {
+                2 => "session-search".len(),
+                3 => CONTEXT_NAME_BYTES,
+                _ => CONTEXT_PROSE_BYTES,
+            };
+            assert!(
+                piece.ends_with("tokenizer") || piece.ends_with("session-search"),
+                "cut mid-word: {piece:?}"
+            );
+            assert!(
+                piece.len() <= budget && piece.len() + word > budget,
+                "piece {i} is {} bytes against a budget of {budget}: {piece:?}",
+                piece.len()
+            );
+        }
+        assert!(pieces[0].starts_with("title "));
+        assert!(pieces[1].starts_with("first "));
+        assert!(pieces[3].starts_with("branch-"));
+        // The per-piece budgets are what keep the total under the ceiling, so the last piece —
+        // the document's own turn prompt, the most specific thing in the header — survives a
+        // session whose every other piece is oversized.
+        assert!(pieces[4].starts_with("turnprompt "), "{header}");
+    }
+
+    /// The session's opening prompt is not context for the document that *is* that prompt,
+    /// wherever it sits in the file: a compaction summary or a `system` record can precede it,
+    /// so `seq == 0` says nothing, and in a subagent file it never opened a turn at all.
+    #[test]
+    fn the_session_opening_prompt_is_not_repeated_in_its_own_header() {
+        let mut d = sample();
+        d.kind = DocKind::Message;
+        d.role = "user".into();
+        d.seq = 3;
+        d.turn_seq = 3;
+        d.body = "Please characterize   the transcript\nformat".into();
+        d.turn_prompt = None;
+        let info = SessionInfo {
+            title: Some("Transcript format study".into()),
+            first_prompt: Some("Please characterize the transcript format".into()),
+            ..SessionInfo::default()
+        };
+        let header = context_header(&d, Some(&info)).expect("a header");
+        assert!(!header.contains("characterize"), "{header}");
+        assert!(header.contains("Transcript format study"), "{header}");
+
+        // The same prompt is context for every other document of the session.
+        let mut other = sample();
+        other.seq = 4;
+        other.turn_seq = 3;
+        let header = context_header(&other, Some(&info)).expect("a header");
+        assert!(header.contains("characterize the transcript"), "{header}");
+    }
+
+    /// Multi-byte text is cut where the chars allow, at every budget: a header is assembled
+    /// from whatever the transcript held, and a slice through a char would panic.
+    #[test]
+    fn a_header_never_splits_a_utf8_char() {
+        let mut d = sample();
+        d.git_branch = Some("ünicode-brânch-ünicode-brânch-ünicode-brânch-ünicode".into());
+        d.turn_prompt = Some("héllo wörld ".repeat(40));
+        let info = SessionInfo {
+            title: Some("é".repeat(400)),
+            ..SessionInfo::default()
+        };
+        let header = context_header(&d, Some(&info)).expect("a header");
+        assert!(header.len() <= CONTEXT_HEADER_BYTES);
+        assert!(header.is_char_boundary(header.len()));
+    }
+
+    /// Indexed and nowhere else. The encoder emits it; the JSON the CLI prints does not.
+    #[test]
+    fn the_header_is_indexed_and_absent_from_the_json_output() {
+        let mut d = sample();
+        d.seq = 7;
+        d.turn_seq = 5;
+        let value = doc_to_json(&d, Some(&session()), false);
+        assert!(
+            value["context_text"]
+                .as_str()
+                .is_some_and(|h| h.contains("tokenizer")),
+            "{value:?}"
+        );
+        let (schema, _) = build_schema();
+        TantivyDocument::parse_json(&schema, &value.to_string()).unwrap();
+        assert!(
+            crate::format::doc_json(&d).get("context_text").is_none(),
+            "scaffolding must not reach --json"
+        );
+    }
+
+    /// A document with nothing to say about itself gets no header at all, rather than an empty
+    /// value: an absent field is one fewer term position and one fewer thing to explain.
+    #[test]
+    fn a_document_with_no_context_gets_no_header() {
+        let mut d = sample();
+        d.project = None;
+        d.git_branch = None;
+        d.turn_prompt = None;
+        assert!(context_header(&d, None).is_none());
+        assert!(doc_to_json(&d, None, false).get("context_text").is_none());
     }
 }

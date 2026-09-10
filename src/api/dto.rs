@@ -1231,6 +1231,8 @@ mod tests {
             kind: DocKind::ToolCall,
             source_path: "/home/u/.claude/projects/p/9f2c.jsonl".into(),
             seq: 118,
+            turn_seq: 110,
+            turn_prompt: Some("make the build faster".into()),
             session_id: "9f2c".into(),
             agent_id: None,
             agent_type: None,
