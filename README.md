@@ -1720,8 +1720,11 @@ cargo test --all-features
 ```
 
 ```
-running 373 tests
-test result: ok. 369 passed; 0 failed; 4 ignored; 0 measured; 0 filtered out; finished in 4.11s
+running 415 tests                                            # unittests src/lib.rs
+test result: ok. 411 passed; 0 failed; 4 ignored; 0 measured; 0 filtered out; finished in 4.31s
+
+running 5 tests                                              # tests/eval — the retrieval eval
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.52s
 ```
 
 The compiler is pinned: [`rust-toolchain.toml`](rust-toolchain.toml) names the version and the
@@ -1740,6 +1743,42 @@ on real data:
 ```bash
 cargo test --release -- --ignored --nocapture
 ```
+
+### The retrieval eval harness
+
+`tests/eval/` scores search against a checked-in corpus and a graded query fixture, so a change to
+the analyzers, the schema or the query builder can be argued with a number instead of an anecdote.
+It runs as part of `cargo test`; on its own:
+
+```bash
+cargo test --test eval                    # assert: floors, invariants, committed baseline
+cargo test --test eval -- --nocapture     # ...and print the tables
+```
+
+Either way it writes four artifacts under `target/eval/` (gitignored):
+
+| file | what it is |
+| --- | --- |
+| `report.md` | the per-class table and per-query appendix — the thing a pull request pastes |
+| `ablation.md` | the same fixture scored with and without the `context_text` header |
+| `hits.md` | every query's ranked hits with the grade each one was given |
+| `corpus.md` | every document in the corpus, its reference and an excerpt |
+
+The committed baseline is an `insta` snapshot at
+`tests/eval/snapshots/eval__baseline_metrics_match_the_committed_table.snap`, so the snapshot diff
+*is* the before/after table: change something, run the tests, and read what moved. Re-baseline
+with `cargo insta review` (or `INSTA_UPDATE=always cargo test --test eval`) once you believe the
+new numbers — and quote them in the pull request, because the snapshot is the record of what the
+project thinks retrieval does.
+
+Adding a query means adding a row to `tests/fixtures/eval_queries.json`: a class, the query
+string, any filters, and graded relevance keyed by document reference
+(`"{session_id}:{agent_id|-}:{seq}"` — read `target/eval/corpus.md` for the current ones). The
+harness refuses to run if a reference does not resolve, because a stale reference scores as a
+retrieval miss and the two are indistinguishable in a results table.
+
+Design and limitations — including what a 65-document synthetic corpus cannot tell you — are in
+[`docs/DESIGN.md`](docs/DESIGN.md) under **Retrieval evaluation**.
 
 ### Continuous integration
 

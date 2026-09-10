@@ -280,7 +280,11 @@ src/
 web/             the browser UI; no build step, no CDN            [feature web-ui]
   index.html  styles.css  dom.js  markdown.js  tools.js  app.js
 tests/
-  fixtures/*.jsonl
+  fixtures/*.jsonl        redacted real slices + hand-written record shapes
+  fixtures/eval/          the retrieval eval corpus: six synthetic transcripts
+  fixtures/eval_queries.json   the graded query fixture
+  eval/                   the retrieval eval harness [test target `eval`]
+    main.rs  corpus.rs  fixture.rs  metrics.rs  report.rs
 docs/
   TRANSCRIPT-FORMAT.md   DESIGN.md   WEB-UI.md
 ```
@@ -843,9 +847,11 @@ of a word invents a term nobody types and still charges the document for it.
   (`text:tokenizer`) still asks about bodies only.
 
 - *Fieldnorms.* A near-constant prefix on every document shifts `avgdl` and so changes BM25
-  length normalisation corpus-wide. Capping the header is what bounds the shift; the eval
-  harness that would quantify it does not exist yet, so there are no before/after numbers here
-  and none are claimed.
+  length normalisation corpus-wide. Capping the header is what bounds the shift. The eval
+  harness below now measures the header's effect on retrieval (see **Retrieval evaluation**) and
+  finds no class worse off for it, but its corpus is 65 documents: that is enough to show what
+  the header retrieves and far too small to say anything about a corpus-wide `avgdl` shift. No
+  claim about fieldnorms is made from those numbers.
 - *IDF collapse.* Every document in a session shares a header, driving those terms toward 100%
   document frequency *within* the session. `context_text` therefore carries
   `set_field_boost(0.3)` — well below 1.0, because the header is a claim about what a document
@@ -896,6 +902,146 @@ the split is for retrieval and cannot be undone, so rendering from `text` + `cod
 every inline span twice and move a fenced block to the end of the message. The one reordering is
 the rule above — a failed call previews its error first. `doc_json` carries `body`, `text`,
 `code`, `headings`, `code_lang` and `tool_output`.
+
+### Retrieval evaluation
+
+`tests/eval/` is a test target, not a module of `src/`: an eval harness is not production code,
+and everything it needs — `build_schema`, `tokenizer::register`, `parse_whole`, `doc_to_json`,
+`search`, `facets` — is already public. Run it with `cargo test --test eval`; add `-- --nocapture`
+to see the tables. Every run also writes `target/eval/report.md`, `target/eval/ablation.md`,
+`target/eval/hits.md` and `target/eval/corpus.md`, which are the artifacts a pull request pastes.
+
+**What it is for.** Ranking changes here are argued from first principles — an analyzer that
+splits identifiers, a heading boost, a discounted context header — and until this existed there
+was no way to tell an improvement from a regression except by trying a query and liking the
+answer. The harness turns "this should help" into a number per query class, and, more
+importantly, turns "this quietly stopped working" into a failing build.
+
+**The five classes**, which are the issue's and not this file's invention:
+
+| class | what it asks | example |
+| --- | --- | --- |
+| identifier | half a name, a path, a flag, a hash | `snippet` → `SnippetGenerator`, `iserror` → `is_error` |
+| boundary | a word that is prose in one place and code in another | `tokenizer` in a sentence and in a ```rust fence |
+| paraphrase | the words a person uses, not the ones the transcript used | `build fails` against a session whose bodies never say either word |
+| filtered | a query plus `--project` / `--lang` / `--program` / `--since` / `--sidechains-only` | `release` with `--program cargo` |
+| aggregation | a question whose answer is a distribution | "what errors did we see" |
+
+The aggregation class is **recorded and never scored**. "What errors did we see" has a facet
+table for an answer and no defensible top-k, so scoring one as a ranking would book a modelling
+mistake as a retrieval miss and push whoever reads the table toward tuning the ranker to fix it.
+Those rows are checked against `search::facets` instead — the expected buckets must come back
+non-empty — and the class table prints em dashes for them rather than `0.000`, because a zero and
+"deliberately not measured" are different claims that look identical in a column of numbers.
+
+**The corpus is synthetic and checked in**: six transcripts under `tests/fixtures/eval/`, 65
+documents, three projects, one of them a real subagent file at `subagents/agent-<id>.jsonl`. They
+go through `parse_whole` and the real schema rather than being hand-built `Doc` values, because
+the boundary class only exists if `markdown::split` is the thing that decided where a word landed
+— and the same argument covers `code_langs` (which `--lang` filters on), `bash_cmd` (`--program`),
+`turn_seq` / `turn_prompt`, and `SessionInfo::title` / `first_prompt`, which is what makes the
+`context_text` header real rather than staged. Timestamps are frozen constants and every date
+filter in the fixture is absolute: `date_range()` resolves `7d` against `chrono::Utc::now()`, so a
+relative filter over a frozen corpus silently matches a shrinking set every day until the row
+means nothing. A test that starts failing in a week is not deterministic, and neither is one that
+starts passing vacuously.
+
+**A document is referenced as `"{session_id}:{agent_id|-}:{seq}"`** — `Doc::doc_id` minus its
+`file_tag`. `file_tag` is `fnv1a` of the *absolute* source path, so a fixture naming raw
+`doc_id`s would pass on the machine that wrote it and fail in CI and in every other checkout. All
+three components of the reference are STORED, so the run closure derives it straight off a `Hit`
+with no side map.
+
+**The fixture** is `tests/fixtures/eval_queries.json`: 39 queries, at least six per class, each
+with an id, a class, a shape, the query string, a `filters` object that deserializes directly into
+`search::Filters` (so a row is exactly as expressive as the CLI and cannot drift from it), graded
+relevance 0-3, a provenance and a note. Provenance is honest and mandatory: every row here says
+`synthesised`, because the corpus is. Nothing in this repository was drawn from a real query log,
+and a row written against one of the redacted real slices in `tests/fixtures/` would say `real`.
+
+`Fixture::validate` refuses to run at all unless every graded reference resolves to a document in
+the corpus. That is the failure mode the whole harness is written around: renumber the corpus and,
+without the check, every reference goes stale, every query scores zero, and the result is a tidy
+table of `0.000` that reads exactly like a ranking regression. The floors are the other half —
+every scored query must retrieve at least one relevant document, and each class must clear a
+per-class recall / MRR / nDCG floor set comfortably below where main sits today.
+
+**Metrics: recall@10, MRR and nDCG@10, per class.** Recall is the number the floors are written
+against, because it is the one a ranking change cannot flatter. nDCG uses gain `2^g - 1` and
+discount `log2(i + 2)` against the ideal ordering of that query's graded set. The core takes a
+closure — `&dyn Fn(&EvalQuery) -> anyhow::Result<Vec<String>>`, query in, ranked references out —
+and that is load-bearing rather than stylistic: the harness already scores three configurations
+against the same corpus, the same fixture and the same arithmetic, and issue #26's
+`MoreLikeThis` will be a fourth. A metric implementation that called `search()` itself could
+measure exactly one configuration forever.
+
+**Comparing two configurations** is `Report::diff(&before, &after)`, which asserts the two were
+evaluated from the same fixture at the same cutoff and then prints class / metric / before /
+after / Δ. Tables are built to be diffed and not admired: classes in a fixed order, queries in
+fixture order, three decimals, fixed column widths, and never a timing — `SearchResponse::elapsed_ms`
+is wall-clock and would make a committed snapshot fail on a slow runner.
+
+**The `context_text` ablation.** `Corpus::index` takes a `Variant`, and the off-switch is one
+line: `doc_to_json` returns a `serde_json::Value` and `context_text` is one top-level key of it,
+so the ablated arm removes that key before `TantivyDocument::parse_json`. The two indexes are then
+byte-identical in every other field — same schema, same analyzers, same single segment, same
+`project`, `git_branch` and timestamps — so the filtered class stays comparable across arms and
+only the `context_text` posting lists differ. Two alternatives look equivalent and are not, and
+are named here so nobody re-tries them:
+
+- `doc_to_json(doc, None, ..)` drops the title and the first prompt but still composes a header
+  from the project basename, the branch and the turn prompt. That measures the `sessions.json`
+  half of the feature, not the feature. It is kept as a deliberate third arm, labelled as such.
+- clearing `doc.project` / `doc.git_branch` / `doc.turn_prompt` on a cloned `Doc` empties the
+  `project` and `git_branch` *schema* fields too, which breaks `--project` and `--branch` on the
+  ablated arm and stops the two arms being comparable at all.
+
+**The numbers on main today**, at k = 10 over 33 scored queries (`target/eval/report.md`):
+
+| class | queries | recall@10 | MRR | nDCG@10 |
+| --- | --- | --- | --- | --- |
+| identifier | 8 | 1.000 | 1.000 | 0.928 |
+| boundary | 8 | 0.913 | 1.000 | 0.774 |
+| paraphrase | 7 | 0.844 | 1.000 | 0.782 |
+| filtered | 10 | 1.000 | 1.000 | 0.981 |
+| aggregation | 6 | — | — | — |
+| overall | 39 | 0.946 | 1.000 | 0.876 |
+
+and the header ablation, which is issue #23's outstanding acceptance box:
+
+| class | recall@10 off | recall@10 on | Δ | nDCG@10 off | nDCG@10 on | Δ |
+| --- | --- | --- | --- | --- | --- | --- |
+| identifier | 1.000 | 1.000 | 0.000 | 0.928 | 0.928 | 0.000 |
+| boundary | 0.875 | 0.913 | +0.039 | 0.767 | 0.774 | +0.007 |
+| paraphrase | 0.206 | 0.844 | **+0.638** | 0.255 | 0.782 | **+0.526** |
+| filtered | 1.000 | 1.000 | 0.000 | 0.977 | 0.981 | +0.004 |
+| overall | 0.801 | 0.946 | +0.145 | 0.761 | 0.876 | +0.114 |
+
+The third arm — header without the session row — lands at paraphrase recall 0.388, so on this
+corpus roughly two thirds of the header's benefit comes from `sessions.json`'s title and first
+prompt and one third from the per-document pieces the parser already had. No class regresses,
+which is what the harness asserts rather than merely printing.
+
+**What a 65-document synthetic corpus cannot tell you**, stated plainly because the numbers above
+will be quoted:
+
+- **Nothing about corpus-wide fieldnorm effects.** BM25 length normalisation is relative to
+  `avgdl` over the whole index; at this size `avgdl` is dominated by whichever six transcripts are
+  checked in. The header's effect on scoring *across a real corpus of thousands of sessions* is
+  not measured here and cannot be.
+- **Nothing about IDF at scale.** A term's document frequency in 65 documents is not its document
+  frequency in 65,000, and the `CONTEXT_BOOST = 0.3` discount was chosen against the former.
+- **Little about ranking, as opposed to matching.** MRR is 1.000 in every class, which is not a
+  triumph: with a corpus this small and queries this specific, the top hit is almost always
+  relevant. MRR is kept because it will stop being 1.000 the moment something breaks, not because
+  its current value says anything.
+- **Nothing about precision.** Only graded documents count, and a query that returns ten answers
+  where three are graded is scored the same as one that returns three. The identifier row for
+  `src/index.rs` notes exactly such a case: a path is three ANDed terms rather than a phrase, so
+  `src/lib.rs` beside the word `index` also matches.
+- **Only what was planted.** Every mechanism the corpus exercises is one someone deliberately put
+  there. A retrieval failure mode nobody thought of is not in it, which is the standing argument
+  for adding rows written against real slices as they are redacted.
 
 ### Optional features: `http-api` and `web-ui`
 

@@ -1,0 +1,23 @@
+---
+source: tests/eval/main.rs
+expression: "Report::diff(&without, &with)"
+---
+## context_text off → context_text on
+
+| class       | metric    |    before |     after |     delta |
+| ----------- | --------- | --------- | --------- | --------- |
+| identifier  | recall    |     1.000 |     1.000 |     0.000 |
+| identifier  | MRR       |     1.000 |     1.000 |     0.000 |
+| identifier  | nDCG      |     0.928 |     0.928 |     0.000 |
+| boundary    | recall    |     0.875 |     0.913 |    +0.039 |
+| boundary    | MRR       |     1.000 |     1.000 |     0.000 |
+| boundary    | nDCG      |     0.767 |     0.774 |    +0.007 |
+| paraphrase  | recall    |     0.206 |     0.844 |    +0.638 |
+| paraphrase  | MRR       |     0.857 |     1.000 |    +0.143 |
+| paraphrase  | nDCG      |     0.255 |     0.782 |    +0.526 |
+| filtered    | recall    |     1.000 |     1.000 |     0.000 |
+| filtered    | MRR       |     1.000 |     1.000 |     0.000 |
+| filtered    | nDCG      |     0.977 |     0.981 |    +0.004 |
+| overall     | recall    |     0.801 |     0.946 |    +0.145 |
+| overall     | MRR       |     0.970 |     1.000 |    +0.030 |
+| overall     | nDCG      |     0.761 |     0.876 |    +0.114 |
