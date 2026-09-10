@@ -179,7 +179,11 @@ impl Job {
 ///
 /// If an index exists whose schema differs from the current one it cannot be read, so it is
 /// discarded and rebuilt — together with `state.json` and `sessions.json`, which would
-/// otherwise claim documents that no longer exist.
+/// otherwise claim documents that no longer exist. A field's tokenizer *name* is part of its
+/// schema, so changing the `code` analyzer's name — or moving a field onto it — triggers that
+/// rebuild by itself.
+///
+/// The returned index always has the `code` analyzer registered.
 pub fn open_or_create(index_dir: &Path) -> Result<(Index, Fields)> {
     let dir = index_dir.join(TANTIVY_SUBDIR);
     std::fs::create_dir_all(&dir)
@@ -211,6 +215,8 @@ pub fn open_or_create(index_dir: &Path) -> Result<(Index, Fields)> {
                 .with_context(|| format!("opening tantivy index at {}", dir.display()));
         }
     };
+    // Before any writer or `QueryParser` exists: both look the `code` analyzer up by name.
+    crate::tokenizer::register(&index);
     Ok((index, fields))
 }
 
@@ -1145,6 +1151,78 @@ mod tests {
         assert_eq!(stats.files_scanned, 0);
         assert_eq!(stats.docs_added, 0);
         assert_eq!(stats.sessions, 0);
+    }
+
+    /// The exact schema the previous build pinned: identical to today's but for the tokenizer
+    /// name on the three full-text fields. Round-tripping through JSON keeps the two in step,
+    /// so this test proves the *tokenizer* is what makes the old index unreadable and not some
+    /// unrelated drift.
+    fn schema_with_the_previous_tokenizer() -> tantivy::schema::Schema {
+        let (schema, _) = build_schema();
+        let mut json = serde_json::to_value(&schema).unwrap();
+        for field in json.as_array_mut().unwrap() {
+            if let Some(tokenizer) = field.pointer_mut("/options/indexing/tokenizer")
+                && *tokenizer == crate::tokenizer::CODE_ANALYZER
+            {
+                *tokenizer = serde_json::json!("default");
+            }
+        }
+        serde_json::from_value(json).unwrap()
+    }
+
+    /// A field's tokenizer name is part of the schema, so moving `text`, `thinking` and
+    /// `tool_input` onto the `code` analyzer makes every index an older build wrote
+    /// unreadable. The recovery has to be automatic — nobody is going to be told to delete a
+    /// directory — so `open_or_create` must notice, discard it, and hand back a clean index
+    /// that the next `run` refills.
+    #[test]
+    fn an_index_built_with_the_previous_tokenizer_is_discarded_and_reindexed() {
+        let fx = Fixture::new();
+        let expected = fx.expected();
+        let old = schema_with_the_previous_tokenizer();
+        assert_ne!(old, build_schema().0, "the old schema must actually differ");
+
+        // Plant exactly what the previous build left on disk: an index, its watermarks, and
+        // the session titles that describe documents about to disappear.
+        let dir = fx.index_dir.join(TANTIVY_SUBDIR);
+        std::fs::create_dir_all(&dir).unwrap();
+        let stale = Index::create_in_dir(&dir, old.clone()).unwrap();
+        let mut writer = stale.writer_with_num_threads(1, 15_000_000).unwrap();
+        let json = r#"{"doc_id":"stale","source_path":"/gone.jsonl","session_id":"gone","role":"user","kind":"message","text":"open_or_create","seq":0}"#;
+        writer
+            .add_document(tantivy::TantivyDocument::parse_json(&old, json).unwrap())
+            .unwrap();
+        writer.commit().unwrap();
+        drop(writer);
+        drop(stale);
+        std::fs::write(fx.index_dir.join(STATE_FILE), "{}").unwrap();
+        std::fs::write(fx.index_dir.join(SESSIONS_FILE), "{}").unwrap();
+
+        // Opening is not an error, and what comes back is today's schema with nothing in it.
+        let (index, _) = open_or_create(&fx.index_dir).unwrap();
+        assert_eq!(index.schema(), build_schema().0);
+        assert_eq!(
+            index.reader().unwrap().searcher().num_docs(),
+            0,
+            "the documents indexed under the old tokenizer are gone"
+        );
+        assert!(
+            index
+                .tokenizers()
+                .get(crate::tokenizer::CODE_ANALYZER)
+                .is_some()
+        );
+        assert!(
+            !fx.index_dir.join(STATE_FILE).exists(),
+            "stale watermarks would suppress the reindex"
+        );
+        assert!(!fx.index_dir.join(SESSIONS_FILE).exists());
+        drop(index);
+
+        // And the next ordinary run reindexes the transcripts from scratch, then settles.
+        assert_eq!(fx.index().docs_added, expected);
+        assert_eq!(fx.live(), expected);
+        assert_eq!(fx.index().docs_added, 0);
     }
 
     #[test]

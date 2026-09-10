@@ -12,6 +12,7 @@ pub mod model;
 pub mod parse;
 pub mod schema;
 pub mod search;
+pub mod tokenizer;
 
 pub use discovery::{AgentMeta, TranscriptFile, default_root, discover};
 pub use index::{IndexOptions, IndexStats};
@@ -21,3 +22,4 @@ pub use parse::{
 };
 pub use schema::{Fields, build_schema, doc_to_json};
 pub use search::{FacetCount, Filters, Hit, SearchRequest, SearchResponse};
+pub use tokenizer::{CODE_ANALYZER, code_analyzer};

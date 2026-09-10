@@ -154,7 +154,10 @@ minutes earlier, indexed out of the session that is writing this README. The cor
 session you are sitting in.
 
 The query is a real query language, not a substring match: `"quoted phrases"`, `AND`/`OR`/`NOT`
-and `field:value` all work. There is no fuzzy operator — Tantivy 0.26 reads `~` as phrase slop,
+and `field:value` all work. Text is indexed by a code-aware analyzer, so an identifier is
+findable by any of its parts and by any of its spellings: `create`, `openOrCreate` and
+`OpenOrCreate` all find `open_or_create`, and `"open_or_create"` in quotes is still an exact
+phrase. There is no fuzzy operator — Tantivy 0.26 reads `~` as phrase slop,
 not edit distance, so `widget~1` is not a near-miss search. A query that fails to parse is
 retried leniently and the discarded parts are reported on stderr, so a typo'd field name does
 not look like an empty corpus.
@@ -899,7 +902,8 @@ index transcripts from elsewhere.
 
 **Everything is local and single-user.** No daemon, no watch mode, no incremental commit while a
 session is in flight; the index is refreshed at query time. There is no ranking tuning, no
-stemming beyond Tantivy's default tokenizer, and no cross-machine sync.
+stemming, and no cross-machine sync. The one piece of language handling is the `code` analyzer
+described above, which splits identifiers; it does not know English.
 
 ---
 

@@ -924,7 +924,7 @@ pub(crate) mod testkit {
     /// A RAM index built straight from hand-made [`Doc`]s — no dependency on the indexer.
     pub fn index_docs(docs: &[Doc]) -> (Index, Fields) {
         let (schema, fields) = build_schema();
-        let index = Index::create_in_ram(schema.clone());
+        let index = crate::tokenizer::create_in_ram(schema.clone());
         let mut writer = index.writer_with_num_threads(1, 15_000_000).unwrap();
         for doc in docs {
             let json = doc_to_json(doc, true).to_string();
@@ -1026,6 +1026,108 @@ mod tests {
             query: (!query.is_empty()).then(|| query.to_string()),
             ..SearchRequest::default()
         }
+    }
+
+    /// The `code` analyzer's whole point: a part of an identifier finds the identifier, and
+    /// the snake/camel/pascal spellings of one name are interchangeable.
+    ///
+    /// The corpus is deliberately minimal — each doc's text *is* the identifier — so a hit
+    /// can only come from the analyzer and not from some other word in the sentence.
+    fn identifier_docs() -> Vec<Doc> {
+        let names = [
+            "open_or_create",
+            "OpenOrCreate",
+            "SnippetGenerator",
+            "parseTs2Ms",
+            HEX64,
+        ];
+        names
+            .iter()
+            .enumerate()
+            .map(|(i, name)| {
+                let mut d = blank_doc(i as u64);
+                d.text = (*name).to_string();
+                d
+            })
+            .collect()
+    }
+
+    /// A sha256, the shape of every commit and content hash in a real transcript.
+    const HEX64: &str = "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08";
+
+    #[test]
+    fn a_part_of_an_identifier_finds_the_whole_identifier() {
+        let (index, f) = index_docs(&identifier_docs());
+
+        // The doc's text is *only* `open_or_create`; the `default` tokenizer would index it as
+        // three words, but nothing would connect `create` to the identifier as a unit.
+        assert_eq!(texts(&search(&index, &f, &req("create")).unwrap()).len(), 2);
+        assert!(
+            texts(&search(&index, &f, &req("create")).unwrap())
+                .contains(&"open_or_create".to_string())
+        );
+        assert_eq!(
+            texts(&search(&index, &f, &req("generator")).unwrap()),
+            vec!["SnippetGenerator"]
+        );
+        assert_eq!(
+            texts(&search(&index, &f, &req("parse")).unwrap()),
+            vec!["parseTs2Ms"]
+        );
+    }
+
+    #[test]
+    fn the_spellings_of_one_name_find_each_other() {
+        let (index, f) = index_docs(&identifier_docs());
+        for query in ["OpenOrCreate", "open_or_create", "openOrCreate"] {
+            let hits = texts(&search(&index, &f, &req(query)).unwrap());
+            assert!(
+                hits.contains(&"open_or_create".to_string())
+                    && hits.contains(&"OpenOrCreate".to_string()),
+                "{query:?} found {hits:?}"
+            );
+        }
+        // The whole, run together, is a term of its own.
+        assert_eq!(
+            texts(&search(&index, &f, &req("snippetgenerator")).unwrap()),
+            vec!["SnippetGenerator"]
+        );
+    }
+
+    /// The parts share the whole's position, so a phrase over an identifier is still a phrase.
+    #[test]
+    fn a_phrase_still_matches_across_and_inside_identifiers() {
+        let mut docs = identifier_docs();
+        let mut d = blank_doc(90);
+        d.text = "pub fn open_or_create(index_dir: &Path)".into();
+        docs.push(d);
+        let mut d = blank_doc(91);
+        // The same words, in the wrong order: a phrase must not match this.
+        d.text = "create or open".into();
+        docs.push(d);
+        let (index, f) = index_docs(&docs);
+
+        let hits = texts(&search(&index, &f, &req(r#""open_or_create""#)).unwrap());
+        assert!(hits.contains(&"open_or_create".to_string()), "{hits:?}");
+        assert!(
+            hits.contains(&"pub fn open_or_create(index_dir: &Path)".to_string()),
+            "{hits:?}"
+        );
+        assert!(!hits.contains(&"create or open".to_string()), "{hits:?}");
+
+        // A phrase spanning an identifier and the words around it.
+        let hits = texts(&search(&index, &f, &req(r#""fn open_or_create""#)).unwrap());
+        assert_eq!(hits, vec!["pub fn open_or_create(index_dir: &Path)"]);
+    }
+
+    /// `RemoveLongFilter`'s stock 40-byte limit silently dropped every hash. At 255 they index,
+    /// and pasting one back finds exactly the document it came from.
+    #[test]
+    fn a_sha256_is_findable_by_pasting_it_back() {
+        let (index, f) = index_docs(&identifier_docs());
+        let r = search(&index, &f, &req(HEX64)).unwrap();
+        assert_eq!(texts(&r), vec![HEX64]);
+        assert_eq!(r.total, 1);
     }
 
     /// The bug this guards: the facet total used to be the sum of the returned buckets, so a
@@ -1484,6 +1586,21 @@ mod tests {
         r0.snippet_chars = 20;
         let r = search(&index, &f, &r0).unwrap();
         assert_eq!(r.hits[0].snippet, "pub fn open_or_creat…");
+
+        // The `code` analyzer highlights through an identifier too: a query for one part
+        // marks that part, and a query for the whole name marks the whole name, because the
+        // offsets the analyzer hands back point into the *stored* text. (A fragment ends at
+        // its last token, which is why the closing paren is not in either of these.)
+        let r = search(&index, &f, &req("create")).unwrap();
+        assert_eq!(
+            r.hits[0].snippet,
+            "pub fn open_or_**create**(index_dir: &Path"
+        );
+        let r = search(&index, &f, &req("OpenOrCreate")).unwrap();
+        assert_eq!(
+            r.hits[0].snippet,
+            "pub fn **open_or_create**(index_dir: &Path"
+        );
     }
 
     #[test]

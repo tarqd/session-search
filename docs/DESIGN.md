@@ -37,7 +37,7 @@ let json_opts = JsonObjectOptions::default()
     .set_stored()
     .set_indexing_options(
         TextFieldIndexing::default()
-            .set_tokenizer("default")
+            .set_tokenizer("code")    // <- the analyzer below, not tantivy's `default`
             .set_index_option(IndexRecordOption::WithFreqsAndPositions),
     )
     .set_fast(Some("raw"))        // <- required for aggregations
@@ -76,6 +76,53 @@ intended: facets show whole commands/paths, search matches words inside them.
   ```
 - `tantivy` needs no extra cargo features for aggregations — they are built in.
 
+## The `code` analyzer (`tokenizer.rs`)
+
+`text`, `thinking` and `tool_input` are all indexed with one registered analyzer named `code`.
+Transcripts are mostly identifiers, paths and shell, and the stock `default` analyzer answers
+badly for them: `create` misses `open_or_create`, `snippet` misses `SnippetGenerator`, and every
+sha256 is discarded by the 40-byte `RemoveLongFilter`.
+
+```
+RegexTokenizer(r"\w+")  ->  SplitIdentifiers  ->  LowerCaser  ->  RemoveLongFilter::limit(255)
+```
+
+`SplitIdentifiers` emits, for each token, **the whole identifier and each of its parts at the
+same position** — a synonym expansion, so the parts consume no position and phrases still work:
+
+```
+open_or_create   -> openorcreate, open, or, create        (all at position p)
+SnippetGenerator -> snippetgenerator, snippet, generator  (all at position p)
+parseTs2Ms       -> parsets2ms, parse, ts, 2, ms          (all at position p)
+cargo            -> cargo                                 (a plain word emits once)
+```
+
+Parts break on `_`, on a case boundary (`parseTs`, and `HTTPServer` -> `HTTP`, `Server`), and on
+a letter/digit boundary. Three consequences are load-bearing:
+
+- **The whole form is the separator-free lowercasing, not the verbatim one.** `QueryParser` turns
+  a query word that yields several tokens into a `PhraseQuery` over `(position, term)` pairs, so
+  terms sharing a position must *all* be present at that position in the document. A query
+  therefore matches an identifier only when both sides produce the same set of terms. Collapsing
+  `open_or_create` and `OpenOrCreate` to the same `openorcreate` + parts is exactly what makes
+  each spelling find the other; keeping the verbatim form would break that in one direction.
+- **The base tokenizer is a `\w+` `RegexTokenizer`, not `SimpleTokenizer`.** `SimpleTokenizer`
+  splits on `_` before any filter can see it, which would leave an underscore-aware filter dead
+  and make `OpenOrCreate` unable to find `open_or_create`. `\w+` is otherwise the same rule, so
+  `src/index.rs` still yields `src`, `index`, `rs`.
+- **The 255-byte length limit is deliberate.** The stock 40 silently drops every hash and long
+  generated identifier; at 255 a pasted sha256 finds the document it came from.
+
+A field's tokenizer *name* is part of the schema, so **changing this analyzer forces a full
+reindex**: `index::open_or_create` sees `SchemaError`, discards the index together with
+`state.json` and `sessions.json`, and the next run refills it. Changing the analyzer's *behaviour*
+without changing its name does **not** trip that check — bump the registered name too, or the
+old terms stay on disk.
+
+`tokenizer::register(&index)` must run on every path that opens or creates an `Index`, before any
+document is added and before any query is parsed: the writer and `QueryParser` both look the
+analyzer up by name, and a missing registration fails there rather than at open time.
+
 ## Layout
 
 ```
@@ -84,6 +131,7 @@ src/
   model.rs       raw serde types for transcript records          [Foundation]
   discovery.rs   locate roots, enumerate transcripts + sidechains [Foundation]
   parse.rs       records -> Vec<Doc>                              [Foundation]
+  tokenizer.rs   the `code` analyzer + its registration           [Foundation]
   schema.rs      Tantivy schema + Fields handle                   [Foundation]
   index.rs       incremental indexer, watermarks, sessions.json   [Build A]
   search.rs      SearchRequest -> SearchResponse, facets          [Build B]
@@ -284,9 +332,9 @@ Field names and options:
 | `doc_id`, `source_path`, `uuid`, `parent_uuid`, `tool_use_id` | `STRING \| STORED` |
 | `session_id`, `agent_id`, `agent_type`, `project`, `git_branch`, `role`, `kind`, `model`, `tool_name`, `entrypoint`, `permission_mode`, `version`, `slug` | `STRING \| STORED \| FAST` |
 | `project_facet` | `FacetOptions` — hierarchical, `/home/user/session-search` |
-| `tool_input` | JSON, indexed + `set_fast(Some("raw"))` + `set_expand_dots_enabled()` + stored |
-| `text` | `TEXT \| STORED` |
-| `thinking` | `TEXT \| STORED` (only populated when `include_thinking`) |
+| `tool_input` | JSON, indexed with the `code` tokenizer + `set_fast(Some("raw"))` + `set_expand_dots_enabled()` + stored |
+| `text` | stored, indexed with the `code` tokenizer, `WithFreqsAndPositions` (`TEXT \| STORED` but for the tokenizer) |
+| `thinking` | same as `text` (only populated when `include_thinking`) |
 | `timestamp` | date field, `INDEXED \| STORED \| FAST` (tantivy 0.26 has no `DATE` flag const; `add_date_field` takes the numeric flags) |
 | `seq` | `U64 \| STORED \| FAST \| INDEXED` |
 | `is_error`, `is_sidechain`, `is_meta` | `U64 \| FAST \| INDEXED \| STORED` (0/1) — STORED because `search::doc_from_stored` reads them back out of the stored payload |
@@ -381,8 +429,10 @@ pub fn facets(index: &tantivy::Index, f: &Fields, field: &str, req: &SearchReque
 ```
 
 Query semantics: the free-text query goes through `QueryParser` over `text` (+ `thinking` when
-opted in, + `tool_input`), so phrases, booleans and `field:value` all work. **There is no fuzzy
-operator**: `~` is phrase slop in Tantivy 0.26 and `set_field_fuzzy` is deliberately not wired
+opted in, + `tool_input`), so phrases, booleans and `field:value` all work. All three fields use
+the `code` analyzer, so a query word is matched against identifier parts as well as whole words,
+and a word that expands into several terms becomes a positional query — which is why those fields
+are indexed `WithFreqsAndPositions`. **There is no fuzzy operator**: `~` is phrase slop in Tantivy 0.26 and `set_field_fuzzy` is deliberately not wired
 up, so do not advertise `term~1`. A query that fails to parse falls back to
 `parse_query_lenient`, and the discarded errors are logged at WARN — a typo'd field name must
 not look like an empty corpus. Filters are ANDed on top as term/range queries. `--tool-input

@@ -8,10 +8,11 @@
 use serde_json::{Map, Value, json};
 use tantivy::schema::{
     FAST, INDEXED, IndexRecordOption, JsonObjectOptions, STORED, STRING, Schema, SchemaBuilder,
-    TEXT, TextFieldIndexing,
+    TextFieldIndexing, TextOptions,
 };
 
 use crate::parse::{Doc, DocKind};
+use crate::tokenizer::CODE_ANALYZER;
 
 /// One handle per schema field. Cheap to clone.
 #[derive(Debug, Clone, Copy)]
@@ -48,6 +49,21 @@ pub struct Fields {
     pub raw: tantivy::schema::Field,
 }
 
+/// Options for the full-text fields. `TEXT | STORED` spelled out, with one change: the
+/// tokenizer is the `code` analyzer from [`crate::tokenizer`] rather than `default`, so
+/// `create` finds `open_or_create` and `snippet` finds `SnippetGenerator`.
+///
+/// `WithFreqsAndPositions` is not optional here: the analyzer emits an identifier's parts at
+/// the *same* position as the whole, which is what keeps phrases working — and what makes a
+/// query word that expands into several terms a positional query.
+fn full_text_options() -> TextOptions {
+    TextOptions::default().set_stored().set_indexing_options(
+        TextFieldIndexing::default()
+            .set_tokenizer(CODE_ANALYZER)
+            .set_index_option(IndexRecordOption::WithFreqsAndPositions),
+    )
+}
+
 /// Options for the `tool_input` JSON field — copied verbatim from the verified-facts section
 /// of `docs/DESIGN.md`. `set_fast(Some("raw"))` is required for aggregations;
 /// `set_expand_dots_enabled()` is what makes `tool_input.command:x` parse.
@@ -56,7 +72,7 @@ fn tool_input_options() -> JsonObjectOptions {
         .set_stored()
         .set_indexing_options(
             TextFieldIndexing::default()
-                .set_tokenizer("default")
+                .set_tokenizer(CODE_ANALYZER)
                 .set_index_option(IndexRecordOption::WithFreqsAndPositions),
         )
         .set_fast(Some("raw"))
@@ -92,8 +108,8 @@ pub fn build_schema() -> (Schema, Fields) {
     let project_facet = sb.add_facet_field("project_facet", STORED);
     let tool_input = sb.add_json_field("tool_input", tool_input_options());
 
-    let text = sb.add_text_field("text", TEXT | STORED);
-    let thinking = sb.add_text_field("thinking", TEXT | STORED);
+    let text = sb.add_text_field("text", full_text_options());
+    let thinking = sb.add_text_field("thinking", full_text_options());
 
     let timestamp = sb.add_date_field("timestamp", INDEXED | STORED | FAST);
     let seq = sb.add_u64_field("seq", INDEXED | STORED | FAST);
@@ -375,7 +391,6 @@ mod tests {
     /// never declared in the schema.
     #[test]
     fn tool_input_supports_subpath_queries_and_aggregations() {
-        use tantivy::Index;
         use tantivy::aggregation::AggregationCollector;
         use tantivy::aggregation::agg_req::Aggregations;
         use tantivy::collector::TopDocs;
@@ -387,7 +402,7 @@ mod tests {
             crate::parse::parse_whole(&fixture, &crate::parse::ParseOptions::default()).unwrap();
 
         let (schema, f) = build_schema();
-        let index = Index::create_in_ram(schema.clone());
+        let index = crate::tokenizer::create_in_ram(schema.clone());
         let mut writer = index.writer_with_num_threads(1, 15_000_000).unwrap();
         for doc in &out.docs {
             let json = doc_to_json(doc, false).to_string();
