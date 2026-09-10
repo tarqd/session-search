@@ -401,15 +401,27 @@ fn human_search(
     // "no matches" is reserved for a query that matched nothing. Zero *rendered* hits with a
     // non-zero total is `--limit 0` (documented as "totals and facets, no hits") or a page past
     // the end — in both cases the total is the only thing the caller asked for.
+    // The refused set rides on the summary line rather than being left for the reader to
+    // discover by not finding something. "no matches" with three hundred hidden is a different
+    // situation from "no matches" with none, and it is the one where the next thing to try is a
+    // flag rather than a different query.
+    let hidden = if r.hidden == 0 {
+        String::new()
+    } else {
+        format!(
+            " · {} hidden (attachments, system records, meta turns — `--all-records`)",
+            r.hidden
+        )
+    };
     if r.total == 0 {
-        writeln!(w, "{}", ink.paint("no matches", dim()))?;
+        writeln!(w, "{}", ink.paint(&format!("no matches{hidden}"), dim()))?;
     } else {
         let shown = r.hits.len();
         // Grouped, the two numbers count different things — turns shown, documents matched —
         // and "3 of 4211 hits" would invite the reader to divide one by the other.
         let summary = if r.grouped {
             format!(
-                "{shown} turn{} · {} matching doc{} · {} ms",
+                "{shown} turn{} · {} matching doc{} · {} ms{hidden}",
                 if shown == 1 { "" } else { "s" },
                 r.total,
                 if r.total == 1 { "" } else { "s" },
@@ -417,7 +429,7 @@ fn human_search(
             )
         } else {
             format!(
-                "{shown} of {} hit{} · {} ms",
+                "{shown} of {} hit{} · {} ms{hidden}",
                 r.total,
                 if r.total == 1 { "" } else { "s" },
                 r.elapsed_ms
@@ -1562,6 +1574,7 @@ mod tests {
         SearchResponse {
             total: hits.len(),
             hits,
+            hidden: 0,
             facets: BTreeMap::new(),
             elapsed_ms: 7,
             grouped: false,

@@ -11,6 +11,7 @@
 //! errors that name what *was* accepted. Only what costs the caller nothing (an unknown key in
 //! the Search UI envelope, which that library adds to over time) degrades to `info.warnings`.
 
+use std::collections::HashMap;
 use std::ops::Range;
 
 use serde_json::{Map, Value, json};
@@ -132,6 +133,7 @@ pub const SEARCH_PARAMS: &[&str] = &[
     "facet_top",
     "snippet_chars",
     "include_thinking",
+    "group_by_turn",
     "project",
     "tool",
     "tool_input",
@@ -147,6 +149,9 @@ pub const SEARCH_PARAMS: &[&str] = &[
     "agent_type",
     "since",
     "until",
+    "all_records",
+    "turn_of",
+    "turn_seq",
     "errors_only",
     "no_sidechains",
     "sidechains_only",
@@ -200,6 +205,20 @@ pub struct SearchBody {
     pub include_thinking: Option<bool>,
     pub snippet_chars: Option<usize>,
     pub facet_top: Option<usize>,
+    /// One result per **turn** instead of per document.
+    ///
+    /// This envelope withheld it for a long time, for a reason specific to Search UI:
+    /// grouping makes `limit`/`offset` count turns while `SearchResponse::total` keeps
+    /// counting documents, and every page control in the response divides one by the other. A
+    /// facade that paged in turns and reported a document total would be wrong in the one
+    /// place a user can see it.
+    ///
+    /// It carries it now because that failure is avoidable rather than inherent: with
+    /// grouping on, `totalResults` reports **turns** — the number the pager is actually
+    /// dividing — and the document total moves to `info.totalDocuments`, named so it cannot be
+    /// mistaken for the other. The cost is `search::count_turns`, one extra pass, paid only
+    /// when grouping is on.
+    pub group_by_turn: Option<bool>,
     #[serde(flatten)]
     pub extra: Map<String, Value>,
 }
@@ -236,6 +255,9 @@ impl SearchBody {
             agent_type: text(p, "agent_type"),
             since: text(p, "since"),
             until: text(p, "until"),
+            all_records: p.flag("all_records")?,
+            turn_of: text(p, "turn_of"),
+            turn_seq: p.number::<u64>("turn_seq")?,
             errors_only: p.flag("errors_only")?,
             no_sidechains: p.flag("no_sidechains")?,
             sidechains_only: p.flag("sidechains_only")?,
@@ -285,6 +307,7 @@ impl SearchBody {
             include_thinking: p.flag("include_thinking")?.then_some(true),
             snippet_chars: p.number::<usize>("snippet_chars")?,
             facet_top: p.number::<usize>("facet_top")?,
+            group_by_turn: Some(p.flag("group_by_turn")?),
             extra: Map::new(),
         })
     }
@@ -298,6 +321,17 @@ impl SearchBody {
         let filters = decode_filters(self.filters)?;
         // `clap` refuses this pair on the command line; the same request over HTTP asks for
         // "only sidechains, and no sidechains", which has exactly one honest answer.
+        // `clap` enforces this pair with `requires`; over HTTP nothing does, and half of it is
+        // not a narrower search but a wider one — a `turn_seq` with no path matches that
+        // ordinal in every transcript. Refused rather than warned: unlike a contradiction,
+        // there is no reading of it that the caller could have meant.
+        if filters.turn_of.is_some() != filters.turn_seq.is_some() {
+            return Err(
+                "turn_of and turn_seq go together: turn_seq is a per-file ordinal, so without \
+                 the path it matches that turn in every transcript"
+                    .into(),
+            );
+        }
         if filters.no_sidechains && filters.sidechains_only {
             return Err(
                 "no_sidechains and sidechains_only contradict each other; set at most one".into(),
@@ -375,10 +409,10 @@ impl SearchBody {
             sort,
             // Spelled out rather than left to `..defaults`, so that adding a field to
             // `SearchRequest` is a compile error here and somebody has to decide, once, whether
-            // the HTTP envelope carries it. These two deliberately do not — see
-            // `similar_to_is_not_a_search_parameter` and `group_by_turn_is_not_a_search_parameter`.
+            // the HTTP envelope carries it. `similar_to` deliberately does not — see
+            // `similar_to_is_not_a_search_parameter`.
             similar_to: None,
-            group_by_turn: false,
+            group_by_turn: self.group_by_turn.unwrap_or(false),
         };
 
         Ok(PreparedSearch {
@@ -426,6 +460,9 @@ const NATIVE_FILTER_KEYS: &[&str] = &[
     "agent_type",
     "since",
     "until",
+    "all_records",
+    "turn_of",
+    "turn_seq",
     "errors_only",
     "no_sidechains",
     "sidechains_only",
@@ -462,6 +499,21 @@ fn native_filters(map: Map<String, Value>) -> Result<Filters, String> {
         // A repeatable filter given one bare value is what everybody writes by hand, and
         // `serde` would answer it with "invalid type: string, expected a sequence".
         let value = match (key.as_str(), value) {
+            // A query string has no numbers in it, and a UI that round-trips its state through
+            // the URL hands back what it read there. `serde` would answer a `"3"` for a `u64`
+            // with "invalid type: string, expected u64", which is a 400 about a control the
+            // reader cannot see.
+            ("min_thinking" | "turn_seq", Value::String(v)) => match v.trim() {
+                "" => Value::Null,
+                digits => Value::Number(
+                    digits
+                        .parse::<u64>()
+                        .map_err(|_| {
+                            format!("filter {key:?} needs a whole non-negative number, got {v:?}")
+                        })?
+                        .into(),
+                ),
+            },
             ("tool" | "tool_input" | "tool_output" | "lang" | "program", v @ Value::String(_)) => {
                 Value::Array(vec![v])
             }
@@ -620,6 +672,24 @@ fn ui_filters(list: &[Value]) -> Result<Filters, String> {
             }
             // This index can select errors but has no "everything that did not fail" filter, so
             // `[false]` is refused instead of being read as "no filter at all".
+            // The default scope, as a Search UI field. `[true]` widens to the whole index;
+            // `[false]` is the default and is accepted as a no-op, because a UI that
+            // round-trips a checkbox will send it either way.
+            "all_records" => {
+                check_type(field, kind, &["any", "all"])?;
+                f.all_records = as_bool(field, one_value(field, values)?)?;
+            }
+            "turn_of" => {
+                check_type(field, kind, &["any"])?;
+                f.turn_of = Some(as_text(field, one_value(field, values)?)?);
+            }
+            "turn_seq" => {
+                check_type(field, kind, &["any"])?;
+                let raw = as_text(field, one_value(field, values)?)?;
+                f.turn_seq = Some(raw.parse::<u64>().map_err(|_| {
+                    format!("filter field {field:?} needs a whole non-negative number, got {raw:?}")
+                })?);
+            }
             "is_error" => {
                 check_type(field, kind, &["any", "all"])?;
                 if !as_bool(field, one_value(field, values)?)? {
@@ -934,16 +1004,30 @@ fn decode_facets(
 // ---------------------------------------------------------------------------
 
 /// The full `ResponseState` envelope, ready to serialize.
-pub fn search_ui_response(prepared: &PreparedSearch, resp: &SearchResponse) -> Value {
+pub fn search_ui_response(
+    prepared: &PreparedSearch,
+    resp: &SearchResponse,
+    turns: usize,
+    openers: &HashMap<(String, u64), Value>,
+) -> Value {
     let req = &prepared.request;
-    let results: Vec<Value> = resp.hits.iter().map(result_json).collect();
+    let results: Vec<Value> = resp
+        .hits
+        .iter()
+        .map(|hit| result_json(hit, openers))
+        .collect();
 
     // Ceiling division: 21 results at 20 per page is two pages, and a `totalPages` of 1 would
     // hide the last one behind a pager that thinks it is at the end.
+    // Grouping makes the page a page of *turns*, so this is what the pager must divide.
+    // Reporting `resp.total` here — documents — while `limit`/`offset` counted turns is the
+    // exact failure this envelope withheld grouping over; the fix is to report the number
+    // being paged and name the other one.
+    let paged_total = if resp.grouped { turns } else { resp.total };
     let total_pages = if prepared.size == 0 {
         0
     } else {
-        resp.total.div_ceil(prepared.size)
+        paged_total.div_ceil(prepared.size)
     };
     // 1-based and inclusive, and 0/0 rather than 1/0 when there is nothing to number — a
     // "showing 1-0 of 0" is the shape of a bug, not of an empty result.
@@ -960,7 +1044,7 @@ pub fn search_ui_response(prepared: &PreparedSearch, resp: &SearchResponse) -> V
 
     json!({
         "results": results,
-        "totalResults": resp.total,
+        "totalResults": paged_total,
         "totalPages": total_pages,
         "pagingStart": paging_start,
         "pagingEnd": paging_end,
@@ -979,6 +1063,16 @@ pub fn search_ui_response(prepared: &PreparedSearch, resp: &SearchResponse) -> V
             },
             "limit": req.limit,
             "offset": req.offset,
+            // True when a result is a turn rather than a document, so a consumer never has to
+            // infer the unit from the shape of the numbers.
+            "grouped": resp.grouped,
+            // The other total. `totalResults` is whatever the page is a page of; this is
+            // always documents, and both are named so neither can be read as the other.
+            "totalDocuments": resp.total,
+            // Documents this query matched that the default scope refused — attachments,
+            // `system` records, meta turns. A caller has to be able to tell "found nothing"
+            // from "was not allowed to look".
+            "hidden": resp.hidden,
             "warnings": prepared.warnings,
         },
     })
@@ -986,7 +1080,7 @@ pub fn search_ui_response(prepared: &PreparedSearch, resp: &SearchResponse) -> V
 
 /// One hit as Search UI reads it: every stored field flattened to `{ "raw": … }`, the snippet on
 /// the body it was cut from, and everything this UI actually renders under `_meta`.
-fn result_json(hit: &Hit) -> Value {
+fn result_json(hit: &Hit, openers: &HashMap<(String, u64), Value>) -> Value {
     let doc = api_doc(&hit.doc, false);
     let mut fields = Map::new();
     // Search UI addresses a result by an `id` field; `doc_id` is that identity, and it is
@@ -1022,6 +1116,16 @@ fn result_json(hit: &Hit) -> Value {
             // 12.399999618530273), which reads as precision this score does not have.
             "score": (f64::from(hit.score) * 1e4).round() / 1e4,
             "snippetField": snippet_field,
+            // Other documents of this hit's turn that matched and were folded into it. `0`
+            // whenever grouping is off, so a consumer can render it unconditionally.
+            "collapsed": hit.collapsed,
+            // The human prompt this hit happened under, resolved once for the whole page. Null
+            // when the hit *is* that prompt (`seq == turn_seq`) and when the turn has no
+            // opener at all — a file that begins mid-conversation gets a synthetic one.
+            "turnOpener": openers
+                .get(&(hit.doc.source_path.clone(), hit.doc.turn_seq))
+                .cloned()
+                .unwrap_or(Value::Null),
             "doc": doc,
         }),
     );
@@ -1348,25 +1452,122 @@ mod tests {
         assert!(err.contains("\"similar_to\""), "{err}");
     }
 
-    /// Nor does it carry `--group-by-turn`, for a reason that is specific to this envelope:
-    /// grouping makes `limit`/`offset` count turns while `total` keeps counting documents, and
-    /// every page control in a Search UI response — `current`, `resultsPerPage`, the pager the
-    /// bundled UI draws from them — divides one by the other. A facade that paged in turns and
-    /// reported a document total would be wrong in the one place a user can see it. The CLI is
-    /// free of that: it prints a page and says what the page is.
+    /// This envelope withheld `--group-by-turn` for a reason specific to Search UI: grouping
+    /// makes `limit`/`offset` count turns while `SearchResponse::total` keeps counting
+    /// documents, and every page control in the response — `current`, `resultsPerPage`, the
+    /// pager the bundled UI draws from them — divides one by the other. A facade that paged in
+    /// turns and reported a document total would be wrong in the one place a user can see it.
+    ///
+    /// It carries grouping now, and this is the test that the failure does not come with it:
+    /// with grouping on, `totalResults` and `totalPages` are **turns** — the unit being paged
+    /// — and the document total is `info.totalDocuments`, named rather than implied. Off, both
+    /// are documents and nothing moved.
     #[test]
-    fn group_by_turn_is_not_a_search_parameter() {
-        let err = params("q=x&group_by_turn=1")
-            .reject_unknown(SEARCH_PARAMS)
-            .unwrap_err();
-        assert!(err.contains("\"group_by_turn\""), "{err}");
-        assert!(
-            !SearchBody::default()
-                .prepare()
-                .unwrap()
-                .request
-                .group_by_turn
+    fn grouping_pages_in_turns_and_names_the_document_total_separately() {
+        let ungrouped = SearchBody::default().prepare().unwrap();
+        assert!(!ungrouped.request.group_by_turn, "off unless asked");
+
+        let mut body = SearchBody {
+            group_by_turn: Some(true),
+            results_per_page: Some(10),
+            ..SearchBody::default()
+        };
+        let prepared = body.clone().prepare().unwrap();
+        assert!(prepared.request.group_by_turn);
+
+        // 32 documents clustering into 5 turns: one page of turns, and the pager must not
+        // divide 32 by 10 and draw four.
+        let resp = SearchResponse {
+            hits: Vec::new(),
+            total: 32,
+            facets: Default::default(),
+            elapsed_ms: 1,
+            grouped: true,
+            hidden: 0,
+        };
+        let value = search_ui_response(&prepared, &resp, 5, &HashMap::new());
+        assert_eq!(value["totalResults"], json!(5), "turns, not documents");
+        assert_eq!(value["totalPages"], json!(1));
+        assert_eq!(value["info"]["totalDocuments"], json!(32));
+        assert_eq!(value["info"]["grouped"], json!(true));
+
+        // With grouping off the same response pages by documents, as it always has.
+        body.group_by_turn = Some(false);
+        let plain = body.prepare().unwrap();
+        let resp = SearchResponse {
+            grouped: false,
+            ..resp
+        };
+        let value = search_ui_response(&plain, &resp, 0, &HashMap::new());
+        assert_eq!(value["totalResults"], json!(32));
+        assert_eq!(value["totalPages"], json!(4));
+        assert_eq!(value["info"]["grouped"], json!(false));
+    }
+
+    /// Half of a turn key is not a narrower search but a wider one — `turn_seq` is a per-file
+    /// ordinal, so without the path it matches that turn in every transcript. `clap` enforces
+    /// the pair with `requires`; nothing enforces it over HTTP but this.
+    #[test]
+    fn half_a_turn_key_is_refused_rather_than_answered() {
+        for half in [json!({ "turn_seq": 3 }), json!({ "turn_of": "/a.jsonl" })] {
+            let body: SearchBody =
+                serde_json::from_value(json!({ "filters": half.clone() })).unwrap();
+            let err = body.prepare().expect_err("half of the pair is refused");
+            assert!(err.contains("turn_of") && err.contains("turn_seq"), "{err}");
+        }
+
+        let both: SearchBody =
+            serde_json::from_value(json!({ "filters": { "turn_of": "/a.jsonl", "turn_seq": 3 } }))
+                .unwrap();
+        let prepared = both.prepare().expect("both halves are accepted");
+        assert_eq!(
+            prepared.request.filters.turn_of.as_deref(),
+            Some("/a.jsonl")
         );
+        assert_eq!(prepared.request.filters.turn_seq, Some(3));
+
+        // And a `turn_seq` that came back off a URL, where every value is a string.
+        let from_url: SearchBody = serde_json::from_value(
+            json!({ "filters": { "turn_of": "/a.jsonl", "turn_seq": "3" } }),
+        )
+        .unwrap();
+        assert_eq!(
+            from_url.prepare().unwrap().request.filters.turn_seq,
+            Some(3)
+        );
+    }
+
+    /// The default scope has to be reachable from every spelling a caller might use, because a
+    /// caller who cannot turn it off will read "no matches" as "not in the corpus".
+    #[test]
+    fn all_records_is_accepted_in_both_filter_forms_and_from_a_query_string() {
+        let native: SearchBody =
+            serde_json::from_value(json!({ "filters": { "all_records": true } })).unwrap();
+        assert!(native.prepare().unwrap().request.filters.all_records);
+
+        let ui: SearchBody = serde_json::from_value(json!({
+            "filters": [{ "field": "all_records", "values": [true], "type": "any" }]
+        }))
+        .unwrap();
+        assert!(ui.prepare().unwrap().request.filters.all_records);
+
+        let from_url = SearchBody::from_params(&params("q=x&all_records=1")).unwrap();
+        assert!(from_url.prepare().unwrap().request.filters.all_records);
+
+        // A checkbox that is off round-trips as `false`, which is the default and not an error.
+        let off: SearchBody =
+            serde_json::from_value(json!({ "filters": { "all_records": false } })).unwrap();
+        assert!(!off.prepare().unwrap().request.filters.all_records);
+    }
+
+    /// And it is reachable from a query string too, so `curl` can ask for the same thing the
+    /// browser UI does.
+    #[test]
+    fn group_by_turn_round_trips_through_a_query_string() {
+        let body = SearchBody::from_params(&params("q=x&group_by_turn=1")).unwrap();
+        assert!(body.prepare().unwrap().request.group_by_turn);
+        let off = SearchBody::from_params(&params("q=x")).unwrap();
+        assert!(!off.prepare().unwrap().request.group_by_turn);
     }
 
     // --- GET -> body -------------------------------------------------------
@@ -1734,6 +1935,7 @@ mod tests {
     #[test]
     fn paging_is_right_on_the_last_short_page_and_on_an_empty_result() {
         let hits = |n: usize| SearchResponse {
+            hidden: 0,
             hits: (0..n)
                 .map(|i| Hit {
                     doc: Doc {
@@ -1754,7 +1956,7 @@ mod tests {
         };
 
         let prep = prepared(json!({ "current": 22, "resultsPerPage": 20 })).unwrap();
-        let out = search_ui_response(&prep, &hits(11));
+        let out = search_ui_response(&prep, &hits(11), 0, &HashMap::new());
         assert_eq!(out["totalPages"], json!(22), "ceiling division, not 21");
         assert_eq!(out["pagingStart"], json!(421));
         assert_eq!(out["pagingEnd"], json!(431), "the short page ends early");
@@ -1764,7 +1966,7 @@ mod tests {
         let mut empty = hits(0);
         empty.total = 0;
         let prep = prepared(json!({ "current": 1, "resultsPerPage": 20 })).unwrap();
-        let out = search_ui_response(&prep, &empty);
+        let out = search_ui_response(&prep, &empty, 0, &HashMap::new());
         assert_eq!(out["totalPages"], json!(0));
         assert_eq!(
             (&out["pagingStart"], &out["pagingEnd"]),
@@ -1827,13 +2029,14 @@ mod tests {
         };
         let resp = SearchResponse {
             hits: vec![hit],
+            hidden: 0,
             total: 1,
             facets: Default::default(),
             elapsed_ms: 7,
             grouped: false,
         };
         let prep = prepared(json!({ "searchTerm": "memmap" })).unwrap();
-        let out = search_ui_response(&prep, &resp);
+        let out = search_ui_response(&prep, &resp, 0, &HashMap::new());
         let result = &out["results"][0];
 
         assert_eq!(result["id"]["raw"], json!("9f2c:-:a41b:118"));
@@ -1914,12 +2117,13 @@ mod tests {
         });
         let resp = SearchResponse {
             hits: Vec::new(),
+            hidden: 0,
             total: 431,
             facets,
             elapsed_ms: 1,
             grouped: false,
         };
-        let out = search_ui_response(&prepared(json!({})).unwrap(), &resp);
+        let out = search_ui_response(&prepared(json!({})).unwrap(), &resp, 0, &HashMap::new());
         let facet = &out["facets"]["tool_name"][0];
         assert_eq!(facet["type"], json!("value"));
         assert_eq!(facet["data"][0], json!({ "value": "Bash", "count": 212 }));

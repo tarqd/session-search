@@ -54,6 +54,58 @@ export function toolMeta(doc) {
   }
 }
 
+/**
+ * The one line that stands for a whole call when the call is collapsed.
+ *
+ * A chat transcript reads as a column of activity rows — `Bash  cargo test --locked` — and
+ * the row is only worth having if that second half is the thing the reader would have looked
+ * for. So this is per tool rather than "the first key of `tool_input`": a `Read` is its path,
+ * a `Grep` is its pattern, a `Task` is what the subagent was asked to do. Falling back to the
+ * generic order (`KEY_PARAMS`) keeps an unknown or MCP tool from rendering a blank row.
+ *
+ * Never throws, and returns `""` when there is genuinely nothing to say — the row then shows
+ * the tool name alone, which is still the truth.
+ */
+export function toolSummary(doc) {
+  try {
+    const d = asDoc(doc);
+    const o = obj(d.tool_input);
+    if (!o) return typeof d.tool_input === "string" ? oneLine(d.tool_input) : "";
+    const name = toolName(d);
+
+    if (name === "TodoWrite" && Array.isArray(o.todos)) {
+      const done = o.todos.filter((t) => obj(t) && str(obj(t).status) === "completed").length;
+      return done + " of " + o.todos.length + " done";
+    }
+    if (name === "MultiEdit" && Array.isArray(o.edits)) {
+      const path = firstStr(o, "file_path", "path");
+      return (path === null ? "" : basename(path) + " · ") + o.edits.length + " edits";
+    }
+    if (name === "Task" || name === "Agent") {
+      return oneLine(firstStr(o, "description", "subagent_type", "prompt") ?? "");
+    }
+    // A path is shown as its basename: the row is one line and the directory is the half that
+    // is the same for every row in the session. The full path is in the expanded card.
+    const path = firstStr(o, "file_path", "path", "notebook_path");
+    if (path !== null) return basename(path) || path;
+    const key = firstStr(o, "command", "pattern", "query", "url", "prompt", "description");
+    if (key !== null) return oneLine(key);
+    for (const k of orderedKeys(o)) {
+      const v = str(o[k]);
+      if (v !== null && v.trim()) return oneLine(v);
+    }
+    return "";
+  } catch (_) {
+    return "";
+  }
+}
+
+/** The first non-empty line, clamped: a heredoc's opening line stands for the heredoc. */
+function oneLine(text) {
+  const line = String(text).split("\n").find((l) => l.trim()) || "";
+  return clampText(line.trim(), 96);
+}
+
 /** The call side of a tool document: what it was asked to do. Never throws. */
 export function renderToolCall(doc) {
   const d = asDoc(doc);

@@ -155,7 +155,10 @@ pub fn build_schema() -> (Schema, Fields) {
 
     // Identity / join keys: exact-match only.
     let doc_id = sb.add_text_field("doc_id", STRING | STORED);
-    let source_path = sb.add_text_field("source_path", STRING | STORED);
+    // `FAST` as well as stored: `search::count_turns` groups by `(source_path, turn_seq)` and
+    // reads the path per matching document. It is dictionary-encoded and there is one distinct
+    // value per transcript file, so the column is a few ordinals wide however long the paths.
+    let source_path = sb.add_text_field("source_path", STRING | STORED | FAST);
     let uuid = sb.add_text_field("uuid", STRING | STORED);
     let parent_uuid = sb.add_text_field("parent_uuid", STRING | STORED);
     let tool_use_id = sb.add_text_field("tool_use_id", STRING | STORED);

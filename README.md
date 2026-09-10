@@ -1585,11 +1585,33 @@ usable at 400px wide.
   many values are not shown — so fifteen visible rows never read as the whole story. (At 400px the
   rail becomes a band above the results rather than a column beside them; nothing is hidden.)
 - **Order by relevance, newest or oldest**, the same three the CLI has, for the same reason.
+- **A hit is drawn as what it was: a moment in a conversation.** Your turns are bubbles, the
+  model's are prose, and a tool call is one collapsed line saying what ran — `Bash  cargo test
+  --locked`, `Read  parse.rs` — which opens onto the full parameters and the output. That row is
+  what makes a six-hundred-turn session something you can scroll. Thinking sits behind a
+  disclosure and stays shut unless the words you searched for are in it.
+- **A hit is shown under the turn that caused it.** Each card leads with the human prompt the hit
+  happened under, then a gap saying exactly how many turns it hides, then the hit, then a gap for
+  what came next. It is most of what makes a result readable: a `cargo test` that failed means one
+  thing under "ship the release" and another under "reproduce the flake". The gap below widens
+  until it hits a boundary and then says which — the next turn, or the end of the transcript.
+- **One result per turn, or per document.** The **show** control switches the unit. Grouped, a
+  card carries "N more matches in this turn" and one press scopes to it; the count above the list
+  counts turns and the document total is named beside it, so nothing divides one by the other.
+- **The apparatus stays out of the way.** Attachments, `system` records and meta turns are not in
+  the results unless you ask; a line above them says how many that hid and offers to include them.
+  They are still indexed — this is a scope, not a deletion.
+- **The words stay marked wherever you read.** The server highlights the one excerpt it cut; the
+  page marks the same words in every turn it draws afterwards, and a collapsed tool row says how
+  many are inside it before you open it. The matching is a port of the index's own tokenizer, so
+  `openOrCreate` lights up `open_or_create` and `isError` finds `is_error`. Nothing is marked for
+  a negated clause, or on a filter-only browse where there is no query to mark.
 - **Expand a hit into the conversation.** Every result opens in place into the turns around it —
   three either side to start, ten more per press — so you can read the prompt that led to a command
   and the output that came back without losing your result list.
 - **Open the whole session.** "open session" on any card slides in a drawer holding that whole
-  transcript in `seq` order, subagent sidechains included.
+  transcript in `seq` order, subagent sidechains included, with a match count and `n`/`N` to step
+  between them.
 - **Per-tool rendering.** `Bash` is a terminal block, `Read` is numbered source, `Edit` is a
   red/green diff, `TodoWrite` is a checklist, `Task` links to the sidechain it spawned, an
   `mcp__server__tool` splits into a server chip and a tool chip. A tool this build has never heard

@@ -121,6 +121,56 @@ pub fn turn_window(
     })
 }
 
+/// The opening prompt of each of several turns, in one query.
+///
+/// [`crate::parse::Doc::turn_prompt`] is indexed into `context_text` and never stored, so a
+/// document read back out of the index does not carry it — deliberately, because storing it
+/// would put a copy of the prompt on every document of its turn. But a result card leads with
+/// what was being asked, and twenty cards each fetching their own opener is twenty round trips
+/// for one page.
+///
+/// The opener of a turn is the document where `seq == turn_seq`, which is a term *pair* per
+/// turn — the path is half the key here for the same reason it is in [`turn_query`]. ORed
+/// together they are one search for the whole page.
+pub fn turn_openers(
+    index: &tantivy::Index,
+    f: &Fields,
+    wanted: &[(String, u64)],
+) -> anyhow::Result<Vec<Doc>> {
+    if wanted.is_empty() {
+        return Ok(Vec::new());
+    }
+    let clauses: Vec<(Occur, Box<dyn Query>)> = wanted
+        .iter()
+        .map(|(path, turn_seq)| {
+            let pair = BooleanQuery::new(vec![
+                (
+                    Occur::Must,
+                    Box::new(TermQuery::new(
+                        Term::from_field_text(f.source_path, path),
+                        IndexRecordOption::Basic,
+                    )) as Box<dyn Query>,
+                ),
+                // `seq`, not `turn_seq`: the opener is the document whose own ordinal is the
+                // turn's.
+                (
+                    Occur::Must,
+                    Box::new(TermQuery::new(
+                        Term::from_field_u64(f.seq, *turn_seq),
+                        IndexRecordOption::Basic,
+                    )) as Box<dyn Query>,
+                ),
+            ]);
+            (Occur::Should, Box::new(pair) as Box<dyn Query>)
+        })
+        .collect();
+
+    let searcher = index.reader()?.searcher();
+    // One document per pair at most, and a turn that opens mid-file (§9's synthetic turn) has
+    // no opener at all — the caller sees a shorter list, never a wrong one.
+    docs_by_seq(&searcher, f, &BooleanQuery::new(clauses), wanted.len())
+}
+
 /// The one turn of one file: a term on `source_path` ANDed with a term on the `turn_seq` field.
 ///
 /// Also used, negated, by `search::build_query`: a `--similar-to` search excludes the turn it was

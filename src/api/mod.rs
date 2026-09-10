@@ -705,7 +705,37 @@ async fn run_search(state: Arc<AppState>, body: dto::SearchBody) -> Result<Json<
     }
     blocking(move || {
         let response = search::search(&state.index, &state.fields, &prepared.request)?;
-        Ok(Json(dto::search_ui_response(&prepared, &response)))
+        // Only when grouping is on: the pager divides `totalResults` by the page size, and
+        // with turns as the unit that number has to be turns. An ungrouped response pages by
+        // documents and never pays for it.
+        let turns = if prepared.request.group_by_turn {
+            search::count_turns(&state.index, &state.fields, &prepared.request)?
+        } else {
+            0
+        };
+        // What was being asked, for every turn on the page, in one query. `turn_prompt` is
+        // never stored, and a card that had to fetch its own opener would be twenty round
+        // trips for one page.
+        let wanted: Vec<(String, u64)> = response
+            .hits
+            .iter()
+            .filter(|hit| hit.doc.seq != hit.doc.turn_seq && !hit.doc.source_path.is_empty())
+            .map(|hit| (hit.doc.source_path.clone(), hit.doc.turn_seq))
+            .collect::<std::collections::BTreeSet<_>>()
+            .into_iter()
+            .collect();
+        let openers = context::turn_openers(&state.index, &state.fields, &wanted)?
+            .into_iter()
+            .map(|doc| {
+                (
+                    (doc.source_path.clone(), doc.seq),
+                    dto::api_doc(&doc, false),
+                )
+            })
+            .collect();
+        Ok(Json(dto::search_ui_response(
+            &prepared, &response, turns, &openers,
+        )))
     })
     .await
 }

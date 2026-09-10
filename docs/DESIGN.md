@@ -702,8 +702,26 @@ pub struct Filters {
     pub branch: Option<String>, pub model: Option<String>, pub role: Option<String>,
     pub kind: Option<String>, pub session: Option<String>, pub agent_type: Option<String>,
     pub since: Option<String>, pub until: Option<String>,   // RFC3339 or YYYY-MM-DD or "7d"
+    pub all_records: bool,       // search the whole index, not just the conversation
+    pub turn_of: Option<String>, // one turn, by the file it is in...
+    pub turn_seq: Option<u64>,   // ...and its ordinal in that file. Both halves or neither
     pub errors_only: bool, pub no_sidechains: bool, pub sidechains_only: bool,
 }
+/// **The default scope is the conversation.** Attachments (system reminders, environment
+/// blocks, pasted file contents), `system` records and meta turns are excluded from every
+/// search unless `all_records` — or an explicit `role` filter, which would otherwise
+/// contradict itself — asks for them. Measured on this repo's own history they are a fifth of
+/// the documents and a twentieth of the text, and they are dense with the vocabulary every
+/// search uses, so a plain query returns page after page of the same boilerplate reminder.
+///
+/// It is a *search* default, never an index-time one: everything stays indexed, so "which
+/// session had that env var in its reminder" is still answerable. `SearchResponse::hidden`
+/// counts what the scope refused, in a second `Count` over the exact complement.
+///
+/// One Tantivy edge it has to survive: a boolean query made only of `MustNot` matches nothing,
+/// because there is no positive set for the negatives to subtract from. A filter-only browse
+/// under the default scope is exactly that shape, so `build_scoped_query` appends an
+/// `AllQuery` to exclude out of.
 pub struct SearchRequest {
     pub query: Option<String>, pub filters: Filters,
     pub limit: usize, pub offset: usize,
@@ -1479,6 +1497,21 @@ pub enum SortBy { Relevance /* default */, Newest, Oldest }
 /// `Text` also covers the no-highlight fallback's `body`, which is the same claim.
 pub enum SnippetSource { Text, Code, ToolOutput, Thinking }
 
+/// **The default scope is the conversation.** Attachments (system reminders, environment
+/// blocks, pasted file contents), `system` records and meta turns are excluded from every
+/// search unless `all_records` — or an explicit `role` filter, which would otherwise
+/// contradict itself — asks for them. Measured on this repo's own history they are a fifth of
+/// the documents and a twentieth of the text, and they are dense with the vocabulary every
+/// search uses, so a plain query returns page after page of the same boilerplate reminder.
+///
+/// It is a *search* default, never an index-time one: everything stays indexed, so "which
+/// session had that env var in its reminder" is still answerable. `SearchResponse::hidden`
+/// counts what the scope refused, in a second `Count` over the exact complement.
+///
+/// One Tantivy edge it has to survive: a boolean query made only of `MustNot` matches nothing,
+/// because there is no positive set for the negatives to subtract from. A filter-only browse
+/// under the default scope is exactly that shape, so `build_scoped_query` appends an
+/// `AllQuery` to exclude out of.
 pub struct SearchRequest { /* … as above … */ pub sort: SortBy }
 pub struct Hit { pub doc: Doc, pub score: f32, pub snippet: String,
                  pub snippet_field: SnippetSource,
