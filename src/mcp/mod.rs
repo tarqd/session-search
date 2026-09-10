@@ -192,8 +192,12 @@ impl Server {
     /// `(source_path, turn_seq)` that addresses its turn, and a count of the other documents in that
     /// turn that also matched. Tool output is not here; that is the point.
     ///
-    /// Then drill: `get_turn` on the one turn worth reading in full, `get_output` on the one call
-    /// whose output you need. Not this tool when the answer is a distribution rather than a passage
+    /// Then drill, in that order: `get_turn` on the one turn worth reading in full, then
+    /// `get_output` on the one call whose output you need. The middle step is not optional — a
+    /// skeleton line names a call but carries no id, and a result's own `doc_id` addresses the
+    /// turn's opening document, usually the prompt, so `get_output` on it is an error rather than
+    /// a shortcut. `get_turn` is what hands you a call's `doc_id` and `tool_use_id`.
+    /// Not this tool when the answer is a distribution rather than a passage
     /// (`aggregate`), when the answer is which sessions rather than which moments
     /// (`search_sessions`), or when you already hold a turn reference (`get_turn` — searching for a
     /// turn you can already address wastes a call and may not return it).
@@ -276,17 +280,23 @@ impl Server {
 
     /// Indexed sessions, most recent first, with the metadata that identifies them.
     ///
-    /// The tool for "what was I working on last week", "which sessions touched this repo", "when did
-    /// I last look at this". Each row is a session, not a passage: id, subagent id and type, title,
-    /// opening prompt, project, git branch, first and last timestamp, message count and tool-call
-    /// count. Answering that question with `search_turns` gives you twenty documents from three
-    /// sessions and makes you infer the list; this gives you the list.
+    /// The tool for "what was I working on last week" and "which sessions touched this repo": a
+    /// time window and a scope, answered as a list. Each row is a session, not a passage: id,
+    /// subagent id and type, title, opening prompt, project, git branch, first and last timestamp,
+    /// message count and tool-call count. Answering that question with `search_turns` gives you
+    /// twenty documents from three sessions and makes you infer the list; this gives you the list.
+    ///
+    /// Despite the name it does not search. There is no `query` parameter and nothing here reads
+    /// the text of a session, so "when did I last work on X" is two calls rather than one: find
+    /// the sessions X is in with `search_turns`, or with `aggregate` on `session_id`, then come
+    /// back here — or filter `search_turns` by the `session` you found. The `session` filter
+    /// narrows to an id you already hold; it is not a way to look a topic up.
     ///
     /// Reads session metadata, not the document index, so the per-message filters do not apply and
     /// are ignored with a warning rather than silently narrowing anything: `tool`, `tool_input`,
-    /// `tool_output`, `program`, `lang`, `model`, `role`, `kind`, `errors_only`. What does apply is
-    /// what a session has: `project`, `session`, `branch`, `agent_type`, `since`, `until`, and the
-    /// sidechain flags.
+    /// `tool_output`, `program`, `lang`, `model`, `role`, `kind`, `errors_only`, `min_thinking`.
+    /// What does apply is what a session has: `project`, `session`, `branch`, `agent_type`,
+    /// `since`, `until`, and the sidechain flags.
     ///
     /// Not this tool when you need the content of what was said — take the session id from here and
     /// pass it to `search_turns` as the `session` filter, or `get_turn` for a specific turn. Not this
@@ -314,13 +324,19 @@ impl Server {
     ///
     /// Returns the buckets, plus the four counts needed to read them honestly: `matching_docs`,
     /// `docs_with_value`, `other_docs` and `distinct`. Read those before reporting a total. The
-    /// buckets do not sum to anything you can quote.
+    /// buckets do not sum to anything you can quote — `matching_docs` is the only total here, and
+    /// the gap is real in both directions: a document with no value for this field is counted in
+    /// `matching_docs` and appears in no bucket and in no `other_docs`, and on a multi-valued
+    /// field one document lands in several buckets, so the buckets can also overshoot. When the
+    /// question was "how many", the number was `matching_docs` or `docs_with_value`, never a sum.
     ///
     /// Not this tool when you need to read what was said — a bucket is a value and a number, never a
     /// passage, so follow up with `search_turns` filtered to the value you found. Not this tool when
-    /// the field's values barely repeat: a response flagged as search-shaped (near-unique values,
+    /// the field's values barely repeat: a response flagged `search_shaped` (near-unique values,
     /// such as whole shell commands) is a sample of a long tail, not a distribution, and the field
-    /// wants full-text search instead.
+    /// wants full-text search instead. That flag needs twenty documents carrying a value before it
+    /// will fire at all, so on a small corpus it stays false and the judgement is yours: `distinct`
+    /// approaching `docs_with_value` is the same finding by hand.
     #[tool(
         name = "aggregate",
         annotations(read_only_hint = true, open_world_hint = false)
@@ -498,9 +514,11 @@ Index: {index_dir} · {sessions} sessions · {docs} documents · newest transcri
 Route by the shape of the answer, not by the words in the question.
 
 - The answer is a list of SESSIONS — "what was I working on last week", "which sessions
-  touched this repo", "when did I last work on X" — use `search_sessions`. It reads session
-  metadata (title, opening prompt, project, branch, first and last timestamp, message and tool
-  counts), so one call answers what twenty passage hits only imply.
+  touched this repo" — use `search_sessions`. It reads session metadata (title, opening prompt,
+  project, branch, first and last timestamp, message and tool counts), so one call answers what
+  twenty passage hits only imply. It takes a window and a scope, not a query: it cannot search
+  for a topic, so "when did I last work on X" starts at `search_turns` or at `aggregate` on
+  `session_id`, and comes back here with the id.
 - The answer is a MOMENT you have to read — "why did the build fail", "have I hit this error
   before", "what was the command that actually worked" — use `search_turns`, then drill in with
   `get_turn` and `get_output`.
@@ -515,8 +533,13 @@ and how it ended — with tool output omitted entirely, except the first line of
 Tool output is most of the bytes in a transcript and almost none of the intent; a turn's full
 context averages 5,651 bytes and its skeleton 555. Read twenty skeletons, decide which single
 turn answers the question, and pay full price only there: `get_turn` for that turn's documents in
-full, `get_output` for one call's output, sliced by head, tail or grep so a 200 KB log costs a few
-hundred bytes. Do not ask for turns in full to find out which one you want.
+full, then `get_output` for one call's output, sliced by head, tail or grep so a 200 KB log costs
+a few hundred bytes. Do not ask for turns in full to find out which one you want.
+
+The three steps run in that order because each one hands you the address the next needs. A
+skeleton line shows a call's signature but no id of its own, and a search result's `doc_id`
+names the turn's opening document rather than any call in it — so `get_turn` is what turns a
+turn you have chosen into the `doc_id` and `tool_use_id` that `get_output` accepts.
 
 A turn is addressed by the pair (source_path, turn_seq), never by turn_seq alone: turn_seq is an
 ordinal within one file, and two transcripts can legitimately carry the same session id. Pass the
@@ -526,8 +549,12 @@ Filters are ANDed, and every one is matched exactly unless its description says 
 value outside a field's vocabulary matches nothing rather than erroring, so "0 results" is as
 often a misspelled filter as it is an empty corpus — read a field's description before guessing
 its value. A zero-hit response tells you the filters that were actually applied, the resolved
-absolute time range, and which single filter to drop first; take that suggestion before rewriting
-the query.
+absolute time range, and which single filter to change first. Read its `message`: that is where
+the diagnosis is, and the prepared `retry` beside it is one mechanical reading of that diagnosis
+rather than the whole of it. Where the two differ the message is right — it will tell you to fix
+a value the retry merely drops, and when two filters contradict each other it names the pair
+while the retry can only remove one of them. An empty answer with no zero-hit block at all is
+not a miss: nothing matched at the `offset` you asked for.
 
 Two things no tool will give you: assistant thinking never appears in a skeleton at any budget,
 and nothing here returns the raw transcript line."#,

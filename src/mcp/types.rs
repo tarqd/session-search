@@ -222,7 +222,12 @@ pub struct SearchTurnsRequest {
     /// How many turns to return. Turns, not documents — hits sharing a turn are collapsed into
     /// one. Twenty skeletons is roughly eleven kilobytes; that is the budget to think in.
     pub limit: usize,
-    /// How many turns to skip, for paging. Turns, not documents.
+    /// How many turns to skip, for paging. Turns, not documents — and the response counts
+    /// documents, so `total_documents` is not the bound to page against: hits collapse into
+    /// turns and there are always fewer turns than that. The end of the results is `returned`
+    /// coming back smaller than `limit`. Page past the end and you get an ordinary empty
+    /// answer with no zero-hit explanation attached, because nothing about the query was
+    /// wrong — check `offset` before rewriting anything.
     pub offset: usize,
     /// Hit order. `relevance` is the default and the only one that means anything with a query;
     /// `newest` and `oldest` are for browsing a filter on its own, where every document scores
@@ -388,8 +393,16 @@ pub struct TurnDocuments {
 pub struct GetOutputRequest {
     /// The call to read, as a `doc_id` from a `get_turn` document, a record uuid, or a
     /// `SESSION:SEQ` reference — any by unambiguous prefix. Give this or `tool_use_id`.
+    /// It must address a tool call, and a `search_turns` result does not: the `doc_id` on a
+    /// result addresses the turn's opening document, usually the prompt, and the skeleton
+    /// lines beneath it carry no id of their own. So the route from a search hit is
+    /// `get_turn` first — the documents it returns are the ones with a `tool_use_id` — and
+    /// this tool second. Addressing a message rather than a call is an error naming the
+    /// document you actually hit, not an empty output.
     pub doc_id: Option<String>,
-    /// The call to read, by the `tool_use_id` the transcript gave it. Give this or `doc_id`.
+    /// The call to read, by the `tool_use_id` the transcript gave it — the field of that name
+    /// on a `get_turn` document, spelled as the host wrote it (`toolu_…`), not a name you can
+    /// derive from a session id. Give this or `doc_id`.
     pub tool_use_id: Option<String>,
     /// Number of lines to take from the start of the output. Applied before `max_bytes`.
     #[schemars(description = "\
@@ -560,7 +573,9 @@ pub struct AggregateRequest {
     /// Field to count. A declared fast field, or any JSON path such as `tool_input.file_path` or
     /// `bash_cmd.program`.
     #[schemars(description = "\
-The field whose values are counted. Two kinds are accepted.
+The field whose values are counted. Required — there is no default worth having, and omitting \
+it is rejected as `unknown field \"\"` rather than counting something arbitrary. Two kinds are \
+accepted.
 
 Declared fast fields — the ones the schema names:
   `tool_name`   which tools were used
@@ -574,7 +589,9 @@ Declared fast fields — the ones the schema names:
   `code_lang`   which languages were quoted in fences
 Also aggregatable, and useful: `session_id` (which sessions did X — a set-membership question a \
 ranked list answers only by accident), `agent_id`, `slug`, `version`, `permission_mode`, and the \
-numeric fields `is_error`, `is_sidechain`, `seq`, `turn_seq`, `thinking_tokens`.
+numeric fields `is_error`, `is_sidechain`, `is_meta`, `seq`, `turn_seq`, `thinking_tokens`. A \
+numeric field buckets as its decimal spelling, so a boolean one comes back as the values `\"0\"` \
+and `\"1\"`, never `false` and `true`.
 
 JSON paths — anything under `tool_input`, plus `bash_cmd.program` and `bash_cmd.args`. \
 Subpaths are DYNAMIC: `tool_input.file_path` works without being declared anywhere, and so does \
@@ -589,15 +606,20 @@ those, a single document lands in several buckets, so the bucket counts total VA
 documents, and can exceed `matching_docs`. Read `docs_with_value` for the document count.
 
 An unknown field name, or a JSON subpath under a field that is not JSON, is a hard error rather \
-than an empty result.")]
+than an empty result, and the error lists the whole countable vocabulary — one wrong guess buys \
+you the right answer.")]
     pub field: String,
     /// Restrict the counted set to documents matching this free-text query. Same grammar as
     /// `search_turns`. Omit it to count across everything the filters keep.
     pub query: Option<String>,
     #[serde(flatten)]
     pub filters: Filters,
-    /// How many buckets to return. Whatever falls outside them is counted in `other_docs`, so
-    /// a small `top` is honest rather than lossy.
+    /// How many buckets to return. What falls outside them is still counted: `other_docs` for
+    /// the documents behind the truncated values, `hidden_values` for roughly how many distinct
+    /// values you were not shown — so a small `top` is honest rather than lossy. Read
+    /// `other_docs: 0` narrowly: it means no value was truncated away, NOT that every matching
+    /// document is in a bucket. Documents carrying no value for this field at all are in
+    /// neither, and `matching_docs` minus `docs_with_value` is how many.
     pub top: usize,
     /// Also search assistant thinking blocks when applying `query`.
     pub include_thinking: bool,

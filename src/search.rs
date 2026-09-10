@@ -122,9 +122,11 @@ free-text query instead when you want 'this string appeared somewhere in the cal
 An exact phrase the tool's OUTPUT must contain — what came back, not what the tool was asked to \
 do. Repeatable and ANDed. This is a phrase query over the code analyzer: the words must appear \
 adjacent and in order, and nothing is stemmed, so `compiling` does not find `compile` here. One \
-extra or missing word ends the match set. Use it for the literal text of an error you have \
-already seen (`error[E0433]`, `No such file or directory`); use the free-text query when you only \
-half-remember the wording, since a bare query already searches tool output.")
+extra or missing word ends the match set. Case, unlike the words, does not matter: the analyzer \
+folds it, so `ENOENT` and `enoent` are the same phrase — this is the one filter here that is not \
+case-sensitive, where `tool`, `program` and `branch` all are. Use it for the literal text of an \
+error you have already seen (`error[E0433]`, `No such file or directory`); use the free-text \
+query when you only half-remember the wording, since a bare query already searches tool output.")
     )]
     pub tool_output: Vec<String>,
     /// Fenced-code language, as written in the info string (`rust`, `bash`); repeatable, OR.
