@@ -1,0 +1,1004 @@
+//! The one implementation of the zero-hit contract: filter echo, resolved time range, and the
+//! ranked retry suggestion.
+//!
+//! Issue #28 names the failure this exists to prevent: *"a model that receives `{hits: []}` will
+//! tell the user nothing happened last week."* The documented failure mode of LLM-driven
+//! structured querying is that reliability holds for simple queries and degrades sharply as
+//! complexity rises, and every degradation here looks identical from the outside — a misspelled
+//! `kind`, a case-wrong `program`, a branch name spelled short, and a genuinely empty corpus all
+//! return the same zero. So a zero must never travel alone.
+//!
+//! Four tools would otherwise each write their own version of this, and the four would disagree
+//! about which filter is narrowest — which is the same class of bug `sessions.rs` was extracted
+//! to end. One module, four callers, one ranking.
+//!
+//! # The ranking
+//!
+//! Nothing in the codebase ranks filters, and the order cannot be read off the request: it
+//! follows from *how* each filter is matched, which the caller cannot see. Four mechanisms, most
+//! to least selective:
+//!
+//! 1. phrase over analyzed text (`tool_input`, `tool_output`) — adjacent, in order, unstemmed;
+//! 2. exact term over an **open** vocabulary (`program`, `branch`, `model`, `tool`,
+//!    `agent_type`, `lang`) — byte equality against a value reproduced from memory, so a silent
+//!    zero whenever it was misremembered;
+//! 3. prefix / range (`session`, `project`, `min_thinking`, `since`/`until`) — width is the
+//!    caller's choice, not the field's;
+//! 4. exact term over a **closed** vocabulary, and flags (`kind`, `role`, `errors_only`, the
+//!    sidechain flags) — wide when right, total when wrong.
+//!
+//! Two overrides on plain narrowness:
+//!
+//! * **silent-zero traps are promoted.** `kind` and `role` have statically known legal sets, so
+//!   an illegal value is *provably* the cause: it is dropped first and the retry names the legal
+//!   set. `program` gets the same promotion one rung down — raw byte equality — but can only be
+//!   probed, not proved;
+//! * **scope filters are held back.** `project` and the time window drop last, because dropping
+//!   them does not widen the question, it answers a different one. A hit from another repository
+//!   or another month is not a better answer than zero; it is a wrong answer that reads as a
+//!   right one.
+
+use serde_json::{Value, json};
+
+use crate::mcp::types::{AppliedFilter, Corpus, Envelope, NoResults, RetryAction, TimeRange};
+use crate::search::{Edge, Filters, when_ms};
+use crate::sessions::FilterError;
+
+/// Legal values of `kind`. Statically known, which is what makes an illegal one provable.
+pub const KIND_VALUES: &[&str] = &["message", "tool_call"];
+/// Legal values of `role`.
+pub const ROLE_VALUES: &[&str] = &["user", "assistant", "system", "attachment"];
+
+// ---------------------------------------------------------------------------
+// time
+// ---------------------------------------------------------------------------
+
+/// Resolve `since`/`until` to absolute instants, against one `now` for both ends.
+///
+/// Called in the tool layer *before* the index is touched. Two things depend on that placement:
+/// an unreadable date becomes `invalid_params` naming the field, rather than an `anyhow` chain
+/// surfacing from inside `search()` where the caller cannot tell a bad date from an empty
+/// corpus; and the echo is impossible unless somebody resolved it. One `now` for both ends
+/// because a window measured against two different clocks is not a window.
+pub fn resolve_time_range(f: &Filters) -> Result<TimeRange, FilterError> {
+    resolve_time_range_at(f, chrono::Utc::now())
+}
+
+/// [`resolve_time_range`] against a fixed clock, for tests.
+pub fn resolve_time_range_at(
+    f: &Filters,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Result<TimeRange, FilterError> {
+    let at = |raw: &Option<String>, field: &'static str, edge: Edge| {
+        raw.as_deref()
+            .filter(|s| !s.trim().is_empty())
+            .map(|s| when_ms(s, now, edge))
+            .transpose()
+            .map_err(|source| FilterError { field, source })
+    };
+    let since_ms = at(&f.since, "since", Edge::Lower)?;
+    let until_ms = at(&f.until, "until", Edge::Upper)?;
+    Ok(TimeRange {
+        since: since_ms.and_then(rfc3339),
+        since_ms,
+        until: until_ms.and_then(rfc3339),
+        until_ms,
+    })
+}
+
+fn rfc3339(ms: i64) -> Option<String> {
+    chrono::DateTime::from_timestamp_millis(ms)
+        .map(|dt| dt.to_rfc3339_opts(chrono::SecondsFormat::Secs, true))
+}
+
+// ---------------------------------------------------------------------------
+// the filter echo
+// ---------------------------------------------------------------------------
+
+/// Every filter the request set, in [`Filters`] declaration order.
+///
+/// Declaration order rather than narrowness order: this is a report of what was applied, and a
+/// caller comparing it against what they sent should not have to re-sort it. The ranking is a
+/// separate question, answered by [`narrowest`].
+pub fn applied_filters(f: &Filters, range: &TimeRange) -> Vec<AppliedFilter> {
+    let mut out = Vec::new();
+    let mut push = |name: &str, value: Value| {
+        out.push(AppliedFilter {
+            name: name.to_string(),
+            value,
+            resolved: None,
+        });
+    };
+    if let Some(v) = opt(&f.project) {
+        push("project", json!(v));
+    }
+    if !f.tool.is_empty() {
+        push("tool", json!(f.tool));
+    }
+    if !f.tool_input.is_empty() {
+        push("tool_input", json!(f.tool_input));
+    }
+    if !f.tool_output.is_empty() {
+        push("tool_output", json!(f.tool_output));
+    }
+    if !f.lang.is_empty() {
+        push("lang", json!(f.lang));
+    }
+    if let Some(n) = f.min_thinking {
+        push("min_thinking", json!(n));
+    }
+    if !f.program.is_empty() {
+        push("program", json!(f.program));
+    }
+    if let Some(v) = opt(&f.branch) {
+        push("branch", json!(v));
+    }
+    if let Some(v) = opt(&f.model) {
+        push("model", json!(v));
+    }
+    if let Some(v) = opt(&f.role) {
+        push("role", json!(v));
+    }
+    if let Some(v) = opt(&f.kind) {
+        push("kind", json!(v));
+    }
+    if let Some(v) = opt(&f.session) {
+        push("session", json!(v));
+    }
+    if let Some(v) = opt(&f.agent_type) {
+        push("agent_type", json!(v));
+    }
+    if let Some(v) = opt(&f.since) {
+        out.push(AppliedFilter {
+            name: "since".into(),
+            value: json!(v),
+            resolved: range.since.clone(),
+        });
+    }
+    if let Some(v) = opt(&f.until) {
+        out.push(AppliedFilter {
+            name: "until".into(),
+            value: json!(v),
+            resolved: range.until.clone(),
+        });
+    }
+    if f.errors_only {
+        out.push(AppliedFilter {
+            name: "errors_only".into(),
+            value: json!(true),
+            resolved: None,
+        });
+    }
+    if f.no_sidechains {
+        out.push(AppliedFilter {
+            name: "no_sidechains".into(),
+            value: json!(true),
+            resolved: None,
+        });
+    }
+    if f.sidechains_only {
+        out.push(AppliedFilter {
+            name: "sidechains_only".into(),
+            value: json!(true),
+            resolved: None,
+        });
+    }
+    out
+}
+
+fn opt(v: &Option<String>) -> Option<&str> {
+    v.as_deref().map(str::trim).filter(|s| !s.is_empty())
+}
+
+/// `project=/home/u/code, program=cargo, since=7d` — the `{applied}` slot of the retry sentence.
+fn render_applied(applied: &[AppliedFilter]) -> String {
+    applied
+        .iter()
+        .map(|a| format!("{}={}", a.name, render_value(&a.value)))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+fn render_value(v: &Value) -> String {
+    match v {
+        Value::String(s) => s.clone(),
+        Value::Array(items) => items.iter().map(render_value).collect::<Vec<_>>().join(","),
+        other => other.to_string(),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// the ranking
+// ---------------------------------------------------------------------------
+
+/// The filter a retry should act on first, and why.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Ranked {
+    /// The filter's name, as a request spells it.
+    pub filter: &'static str,
+    /// Its value, as it arrived.
+    pub value: Value,
+    /// The mechanism that makes it the narrowest, in one sentence a model can act on.
+    pub why: String,
+    /// Drop it, or correct it.
+    pub action: RetryAction,
+    /// The closed vocabulary, when the action is [`RetryAction::Fix`].
+    pub legal: &'static [&'static str],
+    /// The value the retry substitutes, when the action is [`RetryAction::Fix`].
+    pub fix_to: Option<String>,
+}
+
+/// The narrowest filter the request actually set, per the drop order above. `None` when no
+/// filter is set at all — the query itself is then the only thing that can have failed.
+///
+/// The order is exhaustive over [`Filters`] and stops at the first filter present, so it is a
+/// total function of the request and never depends on the corpus. That matters: a ranking that
+/// probed the index would take a second pass over the same query for every zero-hit answer, and
+/// would still be a guess.
+pub fn narrowest(f: &Filters) -> Option<Ranked> {
+    // 1. `kind` / `role` with a value outside its legal set — statically provable.
+    if let Some(v) = opt(&f.kind)
+        && !KIND_VALUES.contains(&v)
+    {
+        return Some(Ranked {
+            filter: "kind",
+            value: json!(v),
+            why: format!(
+                "`kind` accepts only `message` or `tool_call`; `{v}` matches nothing and is not \
+                 an error"
+            ),
+            action: RetryAction::Fix,
+            legal: KIND_VALUES,
+            fix_to: Some(nearest(v, KIND_VALUES).to_string()),
+        });
+    }
+    if let Some(v) = opt(&f.role)
+        && !ROLE_VALUES.contains(&v)
+    {
+        return Some(Ranked {
+            filter: "role",
+            value: json!(v),
+            why: format!(
+                "`role` accepts only `user`, `assistant`, `system` or `attachment`; `{v}` matches \
+                 nothing and is not an error. Note that a tool call's role is `assistant` — use \
+                 `kind` to isolate tool calls"
+            ),
+            action: RetryAction::Fix,
+            legal: ROLE_VALUES,
+            fix_to: Some(nearest(v, ROLE_VALUES).to_string()),
+        });
+    }
+
+    // 2..14. Narrowness, most to least selective.
+    let drop = |filter: &'static str, value: Value, why: &str| {
+        Some(Ranked {
+            filter,
+            value,
+            why: why.to_string(),
+            action: RetryAction::Drop,
+            legal: &[],
+            fix_to: None,
+        })
+    };
+
+    if !f.tool_input.is_empty() {
+        return drop(
+            "tool_input",
+            json!(f.tool_input),
+            "`tool_input` is an exact match on one named parameter of one tool, and it has two \
+             independent ways to be wrong: the key may never appear on any tool, and the value \
+             may not be spelled the way it was recorded. Both are silent zeroes. `aggregate` on \
+             `tool_input.<key>` returns the vocabulary",
+        );
+    }
+    if !f.tool_output.is_empty() {
+        return drop(
+            "tool_output",
+            json!(f.tool_output),
+            "`tool_output` is a phrase query: the words must appear adjacent and in order, and \
+             nothing is stemmed, so one extra or missing word ends the match set. The free-text \
+             query already searches tool output and is the forgiving version",
+        );
+    }
+    if !f.program.is_empty() {
+        return drop(
+            "program",
+            json!(f.program),
+            "`program` is an exact, case-sensitive match on the program name as it was typed, so \
+             `Cargo` and `cargo build` match nothing where `cargo` matches. It also exists only \
+             where the shell grammar parsed the command",
+        );
+    }
+    if let Some(n) = f.min_thinking {
+        return drop(
+            "min_thinking",
+            json!(n),
+            "`min_thinking` is nominally a range and in practice a presence filter: the count is \
+             attached to exactly one document per API message, so even `1` cuts the corpus to a \
+             small minority",
+        );
+    }
+    if !f.lang.is_empty() {
+        return drop(
+            "lang",
+            json!(f.lang),
+            "`lang` matches the info string of a markdown code fence, so it excludes every tool \
+             call and every unfenced message before it compares anything",
+        );
+    }
+    if let Some(v) = opt(&f.agent_type) {
+        return drop(
+            "agent_type",
+            json!(v),
+            "`agent_type` is an exact term that only sidechain documents carry, so it silently \
+             implies subagent transcripts and contradicts `no_sidechains` outright",
+        );
+    }
+    if let Some(v) = opt(&f.model) {
+        return drop(
+            "model",
+            json!(v),
+            "`model` is an exact term on the full recorded id, so a family name such as `opus` \
+             or `claude-opus` is a guaranteed zero. It also excludes every non-assistant record",
+        );
+    }
+    if let Some(v) = opt(&f.branch) {
+        return drop(
+            "branch",
+            json!(v),
+            "`branch` is an exact term on the whole recorded name, never a prefix: `claude/` does \
+             not match `claude/some-branch`, and a name spelled short is a silent zero",
+        );
+    }
+    if !f.tool.is_empty() {
+        return drop(
+            "tool",
+            json!(f.tool),
+            "`tool` is exact and case-sensitive against the capitalised vocabulary the transcript \
+             writes — `Bash`, not `bash`",
+        );
+    }
+    if let Some(v) = opt(&f.session) {
+        return drop(
+            "session",
+            json!(v),
+            "`session` is a prefix match, but it scopes the answer to one conversation, so \
+             anything the question is really about that happened elsewhere is excluded",
+        );
+    }
+    if f.sidechains_only {
+        return drop(
+            "sidechains_only",
+            json!(true),
+            "`sidechains_only` keeps only subagent transcripts, which are a minority of files",
+        );
+    }
+    if f.errors_only {
+        return drop(
+            "errors_only",
+            json!(true),
+            "`errors_only` keeps only calls the transcript itself flagged as failed, which are a \
+             small minority of the corpus",
+        );
+    }
+    if f.no_sidechains {
+        return drop(
+            "no_sidechains",
+            json!(true),
+            "`no_sidechains` removes a minority of documents, so it rarely explains a zero on its \
+             own — but it is the last non-scope filter set here",
+        );
+    }
+
+    // 15. `kind`, then `role`, with legal values — the widest term filters.
+    if let Some(v) = opt(&f.kind) {
+        return drop(
+            "kind",
+            json!(v),
+            "`kind` splits the corpus roughly in half, so it is wide when right — but it is the \
+             widest filter still set, and `message` versus `tool_call` is the single most common \
+             way to look in the wrong half",
+        );
+    }
+    if let Some(v) = opt(&f.role) {
+        return drop(
+            "role",
+            json!(v),
+            "`role` is a legal value here, so it cannot be provably wrong — but a tool call's \
+             role is `assistant`, which is the standard way a `role` filter excludes the exact \
+             documents the question was about",
+        );
+    }
+
+    // 16. The time window. `since` before `until`, and it is not arbitrary: a lower bound
+    //     excludes everything before it, which on a transcript corpus is nearly all of it,
+    //     while an upper bound usually sits at or near `now` and excludes nothing.
+    if let Some(v) = opt(&f.since) {
+        return drop(
+            "since",
+            json!(v),
+            "only the time window and the project scope are left. Dropping `since` widens the \
+             search to older work — the retry covers a different period than the one you asked \
+             about, so say so when you report the result",
+        );
+    }
+    if let Some(v) = opt(&f.until) {
+        return drop(
+            "until",
+            json!(v),
+            "only the time window and the project scope are left. Dropping `until` widens the \
+             search to more recent work — the retry covers a different period than the one you \
+             asked about, so say so when you report the result",
+        );
+    }
+
+    // 17. `project`, always last.
+    if let Some(v) = opt(&f.project) {
+        return drop(
+            "project",
+            json!(v),
+            "this is the last filter. Dropping it does not widen this question, it answers a \
+             different one — results will come from other repositories on this machine",
+        );
+    }
+    None
+}
+
+/// The legal value closest to what the caller wrote, for the `fix` retry.
+///
+/// Deliberately crude: strip everything but alphanumerics and compare, which catches the whole
+/// observed family — `toolcall`, `tool-call`, `ToolCall`, `Tool_Call`. Anything else falls back
+/// to the first legal value, so the retry is always sendable.
+fn nearest(value: &str, legal: &'static [&'static str]) -> &'static str {
+    let squash = |s: &str| {
+        s.chars()
+            .filter(|c| c.is_alphanumeric())
+            .flat_map(char::to_lowercase)
+            .collect::<String>()
+    };
+    let want = squash(value);
+    legal
+        .iter()
+        .copied()
+        .find(|l| squash(l) == want)
+        .unwrap_or(legal[0])
+}
+
+// ---------------------------------------------------------------------------
+// building the envelope
+// ---------------------------------------------------------------------------
+
+/// Everything the envelope needs that is not the result count.
+pub struct Context<'a> {
+    /// The tool being answered, as the model calls it. Only used in prose.
+    pub tool: &'a str,
+    /// The free-text query, when the tool takes one.
+    pub query: Option<&'a str>,
+    pub filters: &'a Filters,
+    /// Already resolved, by [`resolve_time_range`], before the index was touched.
+    pub time_range: TimeRange,
+    /// Tool-specific arguments the retry must carry through — `("field", json!("tool_name"))`
+    /// for `aggregate`, whose retry is meaningless without it. Emitted after the filters, in
+    /// the order given.
+    pub extra: Vec<(&'static str, Value)>,
+    pub corpus: &'a Corpus,
+}
+
+/// The envelope for one answer. `total` is what the tool is about to return.
+///
+/// `no_results` is `Some` **exactly** when `total == 0`, and never otherwise: an envelope that
+/// suggested a retry beside a page of hits would train a caller to ignore it.
+pub fn build(ctx: &Context<'_>, total: usize, warnings: Vec<String>) -> Envelope {
+    let applied = applied_filters(ctx.filters, &ctx.time_range);
+    let no_results = (total == 0).then(|| no_results(ctx, &applied));
+    Envelope {
+        applied_filters: applied,
+        time_range: ctx.time_range.clone(),
+        warnings,
+        no_results,
+    }
+}
+
+fn no_results(ctx: &Context<'_>, applied: &[AppliedFilter]) -> NoResults {
+    let Some(ranked) = narrowest(ctx.filters) else {
+        return no_filters_at_all(ctx);
+    };
+    let retry = retry_body(ctx, Some(&ranked));
+    let head = format!(
+        "0 results. Filters applied: {}.{}",
+        render_applied(applied),
+        time_sentence(&ctx.time_range)
+    );
+    let body = match ranked.action {
+        RetryAction::Fix => {
+            let fix = ranked.fix_to.clone().unwrap_or_default();
+            format!(
+                "{}.\n\nRetry with {}={fix}: {}",
+                ranked.why,
+                ranked.filter,
+                compact(&retry)
+            )
+        }
+        _ if ranked.filter == "project" => format!(
+            "The last filter is project={}. Dropping it does not widen this question, it answers \
+             a different one — results will come from other repositories on this machine.\n\n\
+             Retry across all projects: {}",
+            render_value(&ranked.value),
+            compact(&retry)
+        ),
+        _ => format!(
+            "The narrowest of these is {}={}, and it is the likeliest cause: {}.\n\nRetry \
+             without it: {}",
+            ranked.filter,
+            render_value(&ranked.value),
+            ranked.why,
+            compact(&retry)
+        ),
+    };
+    NoResults {
+        message: format!("{head}\n\n{body}"),
+        narrowest_filter: Some(ranked.filter.to_string()),
+        narrowest_value: Some(ranked.value.clone()),
+        why: Some(ranked.why.clone()),
+        action: ranked.action,
+        legal_values: ranked.legal.iter().map(|s| (*s).to_string()).collect(),
+        retry,
+    }
+}
+
+/// `" Time range resolved to A .. B."`, or nothing when neither bound was set.
+///
+/// Omitted rather than rendered as `unbounded .. unbounded`: a sentence reporting a window
+/// nobody asked for is one more thing to read past, and its absence is unambiguous.
+fn time_sentence(range: &TimeRange) -> String {
+    if range.since.is_none() && range.until.is_none() {
+        return String::new();
+    }
+    let lo = range.since.as_deref().unwrap_or("unbounded");
+    let hi = range.until.as_deref().unwrap_or("unbounded");
+    format!(" Time range resolved to {lo} .. {hi}.")
+}
+
+/// The zero that has no filter to blame.
+fn no_filters_at_all(ctx: &Context<'_>) -> NoResults {
+    let query = ctx.query.map(str::trim).filter(|q| !q.is_empty());
+    let retry = retry_body(ctx, None);
+    let Some(query) = query else {
+        // No query, no filters, and still nothing: the index itself is the answer.
+        return NoResults {
+            message: format!(
+                "0 results across {} documents in {} indexed sessions, with no query and no \
+                 filters applied. Nothing narrowed this and nothing matched, which means this \
+                 index is empty or holds nothing this tool can return. Run `session-search \
+                 index` to build it; `search_sessions` with no arguments shows what it holds.",
+                ctx.corpus.docs, ctx.corpus.sessions
+            ),
+            narrowest_filter: None,
+            narrowest_value: None,
+            why: None,
+            action: RetryAction::Rephrase,
+            legal_values: Vec::new(),
+            retry,
+        };
+    };
+    let terms: Vec<&str> = query.split_whitespace().collect();
+    let rarest = rarest_term(&terms);
+    let retry = retry_with_query(ctx, rarest);
+    let message = format!(
+        "0 results for {query} across {} documents in {} indexed sessions, no filters applied.\n\
+         The query itself matched nothing. Three things that commonly cause this:\n\
+         \x20 - Words are ANDed by default. {query} requires every one of {n} terms in the same \
+         document;\n\x20   retry with the rarest term alone.\n\
+         \x20 - A leading `-` is negation. `cargo build --release` asks for documents that do NOT \
+         contain\n\x20   `release`; quote anything with a flag in it: \"cargo build --release\".\n\
+         \x20 - This index covers only Claude Code session transcripts on this machine. If the \
+         work happened\n\x20   elsewhere, it is not here, and no query will find it.\n\
+         Retry with the single most distinctive term: {}",
+        ctx.corpus.docs,
+        ctx.corpus.sessions,
+        compact(&retry),
+        n = terms.len(),
+    );
+    NoResults {
+        message,
+        narrowest_filter: None,
+        narrowest_value: None,
+        why: None,
+        action: RetryAction::Rephrase,
+        legal_values: Vec::new(),
+        retry,
+    }
+}
+
+/// The most distinctive term of a query, as a proxy for the rarest.
+///
+/// Longest wins, ties broken by first occurrence. Term frequency would be the real answer and
+/// costs a dictionary lookup per term against a query that already returned nothing; length is
+/// the standard cheap proxy and is deterministic, which is what makes the suggestion testable.
+fn rarest_term<'a>(terms: &[&'a str]) -> &'a str {
+    terms
+        .iter()
+        .copied()
+        .max_by_key(|t| t.trim_matches(|c: char| !c.is_alphanumeric()).len())
+        .unwrap_or("")
+}
+
+/// A ready-to-send arguments object for the same tool.
+///
+/// Built from the request's parts rather than by serializing the request and deleting a key:
+/// `Filters` carries `#[serde(default)]`, not `skip_serializing_if`, so a round-trip emits all
+/// eighteen fields as nulls and empty arrays — a "ready-to-send retry" nobody would send.
+pub fn retry_body(ctx: &Context<'_>, ranked: Option<&Ranked>) -> Value {
+    let drop = ranked
+        .filter(|r| r.action != RetryAction::Fix)
+        .map(|r| r.filter);
+    let fix = ranked
+        .filter(|r| r.action == RetryAction::Fix)
+        .and_then(|r| r.fix_to.as_deref().map(|to| (r.filter, to)));
+    let mut map = serde_json::Map::new();
+    if let Some(q) = ctx.query.map(str::trim).filter(|q| !q.is_empty()) {
+        map.insert("query".into(), json!(q));
+    }
+    for applied in applied_filters(ctx.filters, &ctx.time_range) {
+        if Some(applied.name.as_str()) == drop {
+            continue;
+        }
+        let value = match fix {
+            Some((name, to)) if name == applied.name => json!(to),
+            _ => applied.value,
+        };
+        map.insert(applied.name, value);
+    }
+    for (key, value) in &ctx.extra {
+        map.insert((*key).to_string(), value.clone());
+    }
+    Value::Object(map)
+}
+
+fn retry_with_query(ctx: &Context<'_>, query: &str) -> Value {
+    let mut body = retry_body(ctx, None);
+    if let Some(map) = body.as_object_mut() {
+        map.insert("query".into(), json!(query));
+    }
+    body
+}
+
+fn compact(v: &Value) -> String {
+    serde_json::to_string(v).unwrap_or_else(|_| "{}".into())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn filters(mutate: impl FnOnce(&mut Filters)) -> Filters {
+        let mut f = Filters::default();
+        mutate(&mut f);
+        f
+    }
+
+    fn corpus() -> Corpus {
+        Corpus {
+            sessions: 412,
+            docs: 190_233,
+            newest_ts: Some("2026-09-10T11:20:14Z".into()),
+        }
+    }
+
+    fn ctx<'a>(query: Option<&'a str>, f: &'a Filters, corpus: &'a Corpus) -> Context<'a> {
+        Context {
+            tool: "search_turns",
+            query,
+            filters: f,
+            time_range: resolve_time_range_at(f, fixed_now()).expect("dates parse"),
+            extra: Vec::new(),
+            corpus,
+        }
+    }
+
+    /// 2026-09-10T11:20:14Z, the instant the worked examples in the retry policy use.
+    fn fixed_now() -> chrono::DateTime<chrono::Utc> {
+        chrono::DateTime::from_timestamp_millis(1_789_039_214_000).expect("representable")
+    }
+
+    #[test]
+    fn a_bad_date_names_the_field_before_the_index_is_touched() {
+        let f = filters(|f| f.since = Some("yesterday-ish".into()));
+        let err = resolve_time_range_at(&f, fixed_now()).expect_err("must not resolve");
+        assert_eq!(err.field, "since");
+        // The plain field name, never a flag: this serves a tool call, not a shell.
+        assert!(!format!("{err:#}").contains("--since"));
+    }
+
+    #[test]
+    fn a_bare_day_resolves_inclusive_at_both_ends() {
+        let f = filters(|f| {
+            f.since = Some("2026-09-03".into());
+            f.until = Some("2026-09-05".into());
+        });
+        let range = resolve_time_range_at(&f, fixed_now()).expect("dates parse");
+        assert_eq!(range.since.as_deref(), Some("2026-09-03T00:00:00Z"));
+        // The last instant of the 5th, not its midnight — the whole reason `Edge` exists.
+        assert_eq!(range.until.as_deref(), Some("2026-09-05T23:59:59Z"));
+    }
+
+    #[test]
+    fn a_relative_span_is_echoed_as_the_absolute_window_it_resolved_to() {
+        let f = filters(|f| f.since = Some("7d".into()));
+        let range = resolve_time_range_at(&f, fixed_now()).expect("parses");
+        assert_eq!(range.since.as_deref(), Some("2026-09-03T11:20:14Z"));
+        let applied = applied_filters(&f, &range);
+        // Both: the span as sent, and what it meant on this call.
+        assert_eq!(render_value(&applied[0].value), "7d");
+        assert_eq!(applied[0].resolved.as_deref(), Some("2026-09-03T11:20:14Z"));
+    }
+
+    #[test]
+    fn an_illegal_kind_is_dropped_first_and_the_retry_corrects_it() {
+        // The statically provable case: `kind` outranks even `tool_input`, because an illegal
+        // value cannot have matched and nothing else needs to be considered.
+        let f = filters(|f| {
+            f.kind = Some("toolcall".into());
+            f.tool_input = vec!["command=cargo".into()];
+            f.since = Some("7d".into());
+        });
+        let ranked = narrowest(&f).expect("a filter is set");
+        assert_eq!(ranked.filter, "kind");
+        assert_eq!(ranked.action, RetryAction::Fix);
+        assert_eq!(ranked.fix_to.as_deref(), Some("tool_call"));
+
+        let corpus = corpus();
+        let c = ctx(Some("cargo"), &f, &corpus);
+        let envelope = build(&c, 0, Vec::new());
+        let none = envelope.no_results.expect("zero carries a suggestion");
+        assert!(
+            none.message
+                .contains("`kind` accepts only `message` or `tool_call`")
+        );
+        assert!(none.message.contains("Retry with kind=tool_call"));
+        assert_eq!(none.legal_values, vec!["message", "tool_call"]);
+        // The retry keeps every other filter and corrects the one that was provably wrong.
+        assert_eq!(
+            none.retry,
+            json!({
+                "query": "cargo",
+                "tool_input": ["command=cargo"],
+                "kind": "tool_call",
+                "since": "7d",
+            })
+        );
+    }
+
+    #[test]
+    fn an_illegal_role_says_a_tool_call_is_an_assistant() {
+        // The trap the corpus actually sets: `role: "tool"` is the natural way to ask for tool
+        // calls and matches nothing, because a tool call's role is `assistant`.
+        let f = filters(|f| f.role = Some("tool".into()));
+        let ranked = narrowest(&f).expect("a filter is set");
+        assert_eq!(ranked.filter, "role");
+        assert_eq!(ranked.action, RetryAction::Fix);
+        assert!(
+            ranked.why.contains("use\n                 `kind`")
+                || ranked.why.contains("use `kind`")
+        );
+    }
+
+    #[test]
+    fn the_case_wrong_program_is_the_narrowest_of_a_real_request() {
+        // The worked example from the issue: a program name reproduced from memory with the
+        // wrong case, inside a project scope and a time window that must both survive the retry.
+        let f = filters(|f| {
+            f.project = Some("/home/user/code/other-tool".into());
+            f.program = vec!["Cargo".into()];
+            f.since = Some("7d".into());
+        });
+        let corpus = corpus();
+        let c = ctx(Some("build failure"), &f, &corpus);
+        let none = build(&c, 0, Vec::new())
+            .no_results
+            .expect("zero carries a suggestion");
+        assert!(
+            none.message.starts_with(
+                "0 results. Filters applied: project=/home/user/code/other-tool, program=Cargo, \
+                 since=7d. Time range resolved to 2026-09-03T11:20:14Z .. unbounded."
+            ),
+            "{}",
+            none.message
+        );
+        assert!(
+            none.message
+                .contains("The narrowest of these is program=Cargo")
+        );
+        assert_eq!(
+            none.retry,
+            json!({
+                "query": "build failure",
+                "project": "/home/user/code/other-tool",
+                "since": "7d",
+            })
+        );
+    }
+
+    #[test]
+    fn scope_is_held_back_until_nothing_else_is_left() {
+        // `project` outranks nothing: every other filter is dropped before it, and when it is
+        // the last one the sentence says the retry answers a different question.
+        for f in [
+            filters(|f| {
+                f.project = Some("/p".into());
+                f.no_sidechains = true;
+            }),
+            filters(|f| {
+                f.project = Some("/p".into());
+                f.kind = Some("message".into());
+            }),
+        ] {
+            assert_ne!(narrowest(&f).expect("set").filter, "project");
+        }
+
+        let f = filters(|f| f.project = Some("/home/user/code/other-tool".into()));
+        let corpus = corpus();
+        let c = ctx(Some("SIGBUS"), &f, &corpus);
+        let none = build(&c, 0, Vec::new())
+            .no_results
+            .expect("zero carries a suggestion");
+        assert!(
+            none.message.contains(
+                "Dropping it does not widen this question, it answers a different one — results \
+                 will come from other repositories on this machine."
+            ),
+            "{}",
+            none.message
+        );
+        assert!(
+            none.message
+                .contains("Retry across all projects: {\"query\":\"SIGBUS\"}")
+        );
+        assert_eq!(none.retry, json!({ "query": "SIGBUS" }));
+    }
+
+    #[test]
+    fn the_time_window_drops_after_every_content_filter_and_before_the_project() {
+        let f = filters(|f| {
+            f.project = Some("/p".into());
+            f.since = Some("7d".into());
+            f.until = Some("now".into());
+        });
+        assert_eq!(narrowest(&f).expect("set").filter, "since");
+        let f = filters(|f| {
+            f.project = Some("/p".into());
+            f.until = Some("now".into());
+        });
+        assert_eq!(narrowest(&f).expect("set").filter, "until");
+    }
+
+    #[test]
+    fn the_drop_order_is_exhaustive_and_stops_at_the_first_filter_set() {
+        // Every filter, alone, ranks as itself: the order cannot skip one and silently blame a
+        // filter the caller never sent.
+        let cases: Vec<(&str, Filters)> = vec![
+            ("tool_input", filters(|f| f.tool_input = vec!["k=v".into()])),
+            (
+                "tool_output",
+                filters(|f| f.tool_output = vec!["boom".into()]),
+            ),
+            ("program", filters(|f| f.program = vec!["cargo".into()])),
+            ("min_thinking", filters(|f| f.min_thinking = Some(1))),
+            ("lang", filters(|f| f.lang = vec!["rust".into()])),
+            (
+                "agent_type",
+                filters(|f| f.agent_type = Some("Explore".into())),
+            ),
+            ("model", filters(|f| f.model = Some("claude-opus-5".into()))),
+            ("branch", filters(|f| f.branch = Some("main".into()))),
+            ("tool", filters(|f| f.tool = vec!["Bash".into()])),
+            ("session", filters(|f| f.session = Some("b20208d8".into()))),
+            ("sidechains_only", filters(|f| f.sidechains_only = true)),
+            ("errors_only", filters(|f| f.errors_only = true)),
+            ("no_sidechains", filters(|f| f.no_sidechains = true)),
+            ("kind", filters(|f| f.kind = Some("message".into()))),
+            ("role", filters(|f| f.role = Some("assistant".into()))),
+            ("since", filters(|f| f.since = Some("7d".into()))),
+            ("until", filters(|f| f.until = Some("now".into()))),
+            ("project", filters(|f| f.project = Some("/p".into()))),
+        ];
+        assert_eq!(cases.len(), 18, "every Filters field is ranked");
+        for (name, f) in &cases {
+            assert_eq!(narrowest(f).expect("one filter is set").filter, *name);
+        }
+
+        // And the full set ranks as the narrowest of all of them.
+        let mut all = Filters::default();
+        for (_, f) in &cases {
+            merge(&mut all, f);
+        }
+        // `kind`/`role` are legal here, so the phrase filter wins rather than the provable case.
+        assert_eq!(narrowest(&all).expect("set").filter, "tool_input");
+    }
+
+    fn merge(into: &mut Filters, from: &Filters) {
+        if from.project.is_some() {
+            into.project = from.project.clone();
+        }
+        into.tool.extend(from.tool.iter().cloned());
+        into.tool_input.extend(from.tool_input.iter().cloned());
+        into.tool_output.extend(from.tool_output.iter().cloned());
+        into.lang.extend(from.lang.iter().cloned());
+        into.program.extend(from.program.iter().cloned());
+        into.min_thinking = into.min_thinking.or(from.min_thinking);
+        into.branch = into.branch.clone().or_else(|| from.branch.clone());
+        into.model = into.model.clone().or_else(|| from.model.clone());
+        into.role = into.role.clone().or_else(|| from.role.clone());
+        into.kind = into.kind.clone().or_else(|| from.kind.clone());
+        into.session = into.session.clone().or_else(|| from.session.clone());
+        into.agent_type = into.agent_type.clone().or_else(|| from.agent_type.clone());
+        into.since = into.since.clone().or_else(|| from.since.clone());
+        into.until = into.until.clone().or_else(|| from.until.clone());
+        into.errors_only |= from.errors_only;
+        into.no_sidechains |= from.no_sidechains;
+        into.sidechains_only |= from.sidechains_only;
+    }
+
+    #[test]
+    fn no_filters_at_all_blames_the_query_and_suggests_one_term() {
+        let f = Filters::default();
+        let corpus = corpus();
+        let c = ctx(Some("cargo build release"), &f, &corpus);
+        let none = build(&c, 0, Vec::new())
+            .no_results
+            .expect("zero carries a suggestion");
+        assert_eq!(none.narrowest_filter, None);
+        assert_eq!(none.action, RetryAction::Rephrase);
+        assert!(none.message.starts_with(
+            "0 results for cargo build release across 190233 documents in 412 indexed sessions, \
+             no filters applied."
+        ));
+        assert!(none.message.contains("requires every one of 3 terms"));
+        assert!(none.message.contains("A leading `-` is negation."));
+        assert_eq!(none.retry, json!({ "query": "release" }));
+    }
+
+    #[test]
+    fn an_empty_index_says_so_rather_than_blaming_a_query_nobody_sent() {
+        let f = Filters::default();
+        let corpus = Corpus::default();
+        let c = ctx(None, &f, &corpus);
+        let none = build(&c, 0, Vec::new())
+            .no_results
+            .expect("zero carries a suggestion");
+        assert!(
+            none.message.contains("this index is empty"),
+            "{}",
+            none.message
+        );
+        assert_eq!(none.retry, json!({}));
+    }
+
+    #[test]
+    fn a_non_empty_answer_carries_the_echo_but_never_a_retry() {
+        // The other half of the contract: a suggestion beside a page of hits trains a caller to
+        // stop reading the envelope, which is precisely when the zero-hit one stops working.
+        let f = filters(|f| f.tool = vec!["Bash".into()]);
+        let corpus = corpus();
+        let c = ctx(Some("cargo"), &f, &corpus);
+        let envelope = build(&c, 7, vec!["a warning".into()]);
+        assert!(envelope.no_results.is_none());
+        assert_eq!(envelope.applied_filters.len(), 1);
+        assert_eq!(envelope.warnings, vec!["a warning".to_string()]);
+    }
+
+    #[test]
+    fn the_retry_carries_tool_specific_arguments_through() {
+        // `aggregate` without `field` is not a request. A retry that dropped it would be
+        // unsendable, which is the same as no retry at all.
+        let f = filters(|f| f.program = vec!["Cargo".into()]);
+        let corpus = corpus();
+        let mut c = ctx(None, &f, &corpus);
+        c.tool = "aggregate";
+        c.extra = vec![("field", json!("tool_input.file_path"))];
+        let none = build(&c, 0, Vec::new())
+            .no_results
+            .expect("zero carries a suggestion");
+        assert_eq!(none.retry, json!({ "field": "tool_input.file_path" }));
+    }
+}

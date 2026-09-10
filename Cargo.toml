@@ -29,6 +29,10 @@ clap = { version = "4.6.6", features = ["derive", "env", "wrap_help"] }
 owo-colors = "4.4.0"
 pulldown-cmark = { version = "0.13", default-features = false }
 rayon = "1.12.0"
+# Already in the tree as a mandatory tantivy dependency, so depending on it directly costs no
+# extra compile time and no extra binary size. `slice::grep` needs it: the caller is a model, and
+# a "grep" that quietly matched `.*error.*` literally would report a log full of errors as clean.
+regex = "1.13"
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.151"
 tantivy = "0.26.2"

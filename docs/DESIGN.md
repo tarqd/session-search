@@ -334,12 +334,21 @@ src/
   format.rs      human + JSON rendering                           [Build C]
   cli.rs         clap definitions                                 [Build C]
   main.rs        wiring only                                      [Build C]
+  slice.rs       cut one tool output down to a readable slice     [Build B]
   api/mod.rs     server bootstrap, router, handlers, CORS         [feature http-api]
   api/dto.rs     wire shapes: query strings, Search UI envelope   [feature http-api]
   api/assets.rs  the `web/` files, compiled into the binary       [feature web-ui]
+  mcp/mod.rs     Server, tool router, 5 #[tool] methods, serve    [feature mcp]
+  mcp/types.rs   every request/response type + the envelope       [feature mcp]
+  mcp/envelope.rs  filter echo, resolved range, zero-hit retry    [feature mcp]
+  mcp/tools/turns.rs      search_turns                            [feature mcp]
+  mcp/tools/drill.rs      get_turn + get_output                   [feature mcp]
+  mcp/tools/sessions.rs   search_sessions                         [feature mcp]
+  mcp/tools/aggregate.rs  aggregate                               [feature mcp]
 web/             the browser UI; no build step, no CDN            [feature web-ui]
   index.html  styles.css  dom.js  markdown.js  tools.js  app.js
 tests/
+  mcp_stdio.rs            drives the real binary over stdio       [feature mcp]
   fixtures/*.jsonl        redacted real slices + hand-written record shapes
   fixtures/eval/          the retrieval eval corpus: six synthetic transcripts
   fixtures/eval_queries.json   the graded query fixture
@@ -1638,6 +1647,7 @@ session-search sessions [FILTERS] [--limit N] [--json] [--no-refresh]
 session-search stats [--json]
 session-search serve [--host ADDR] [--port PORT] [--cors ORIGIN]... [--refresh-secs N]
                      [--no-refresh]                                   [feature http-api]
+session-search mcp [--refresh-secs N] [--no-refresh]                  [feature mcp]
 
 FILTERS: -p/--project P  -t/--tool T  --tool-input k=v  --tool-output TEXT  --program NAME
          --lang LANG  --branch B  --model M
@@ -1646,6 +1656,16 @@ FILTERS: -p/--project P  -t/--tool T  --tool-input k=v  --tool-output TEXT  --pr
 ```
 
 Global: `--index DIR` (`$SESSION_SEARCH_INDEX`), `-v/--verbose`, `--no-color` (`$NO_COLOR`).
+`--index` is also the MCP server's startup flag for the index location — an MCP server started
+by an agent host inherits whatever environment the host gives it, so the directory it actually
+opened is reported back in the server's `instructions`.
+
+**`Command::owns_stdout`.** `cli::run` normally wraps `stdout().lock()` in a `BufWriter` for the
+whole of `dispatch`. `mcp` must not be dispatched that way: its stdio transport writes JSON-RPC
+framing from its own threads, and a `Stdout` lock is reentrant within a thread and *blocking*
+across threads, so the transport's first write parks forever — no response, no error, no log
+line. The predicate splits the two paths; a command that answers `true` is handed
+`std::io::sink()` and takes the lock itself.
 
 **Turn-shaped windows.** `search --context turn` and `show --around ... --turn` snap the window
 to the hit's enclosing turn instead of counting documents outwards. A fixed `N` is the wrong
@@ -1678,23 +1698,163 @@ counts total *values*, not documents — they can run above the
 match set (many programs per Bash call) or far below it (most matched documents are not Bash
 calls at all). `docs_with_value` is a document count either way, so it never exceeds the match.
 
-## MCP readiness (next step — do not build now)
+## MCP surface (`mcp/`, feature `mcp`) — pinned
 
-`rmcp 3.2`, `default-features = false`, `features = ["server","macros","transport-io","schemars"]`,
-behind an `mcp` cargo feature. One `#[tool]` per subcommand, taking `Parameters<T>` and
-returning `Json<T>`, where `T` is the *same* struct clap derives into. Therefore: keep
-`Filters`/`SearchRequest` plain data, no clap types leaking into `search.rs`, and derive
-`serde::Deserialize` on them from the start.
+`rmcp 3.2`, `default-features = false`, `features = ["server","macros","transport-io","schemars"]`.
+`schemars` is `^1.0`, **not** the `0.8` rmcp's README claims. Five tools, one `#[tool]` method
+each, taking `Parameters<T>` and returning `Result<Json<U>, ErrorData>`.
 
-The foundation for a third front end is in place and it is not new code, it is code that stopped
-being written twice: `sessions.rs` holds the one `SessionMatcher` and the one unanswerable-filter
-list, `search::Edge`/`when_ms` hold the one date-edge resolution, `format::skeleton_json` /
-`turn_json` hold the one skeleton envelope, and `SearchResponse::warnings` carries what used to
-reach stderr alone. An MCP tool has no stderr a caller reads at all, which makes that last one
-the load-bearing part: `tracing` on a stdio transport goes nowhere the agent can see.
+```
+search_turns    SearchTurnsRequest    -> SearchTurnsResponse    retrieval, as turn skeletons
+get_turn        GetTurnRequest        -> GetTurnResponse        one turn's documents in full
+get_output      GetOutputRequest      -> GetOutputResponse      one call's output, sliced
+search_sessions SearchSessionsRequest -> SearchSessionsResponse sessions.json, filtered
+aggregate       AggregateRequest      -> AggregateResponse      one field's values, counted
+```
 
-Two traps recorded now: rmcp's README says `schemars = "0.8"` and is **wrong** (it is `^1.0`);
-and stdio transport owns stdout, so `tracing` must write to **stderr** and color must be off.
+Three tools, not five, is what issue #28 asked for; `get_turn`/`get_output` are the drill-down
+half of skeleton-first retrieval and are two tools because they truncate and slice respectively,
+which is the difference between "show me this turn" and "show me this log".
+
+**Tool body signatures** (`mcp/tools/`, one owner per file):
+
+```rust
+pub fn turns::run(state: &State, req: SearchTurnsRequest)        -> anyhow::Result<SearchTurnsResponse>
+pub fn drill::run_turn(state: &State, req: GetTurnRequest)       -> anyhow::Result<GetTurnResponse>
+pub fn drill::run_output(state: &State, req: GetOutputRequest)   -> anyhow::Result<GetOutputResponse>
+pub fn sessions::run(state: &State, req: SearchSessionsRequest)  -> anyhow::Result<SearchSessionsResponse>
+pub fn aggregate::run(state: &State, req: AggregateRequest)      -> anyhow::Result<AggregateResponse>
+```
+
+`State` holds the `tantivy::Index`, the `Fields`, the index directory and the corpus counts,
+behind an `Arc`, shared across concurrent calls. `Server::blocking` runs each body on
+`spawn_blocking` and refreshes the index first if a refresh is due, so a body may assume both.
+
+### Requests flatten `Filters`
+
+Every request struct carries `#[serde(flatten)] pub filters: Filters` and a container
+`#[serde(default)]`. Two consequences, both load-bearing: nothing is `required`, so
+`{"query":"SIGBUS"}` is a valid call; and the eighteen filter descriptions land at the top level
+of the input schema, where a model reads them, rather than one level down behind a `$ref`. The
+retry bodies the envelope hands back are flat objects for the same reason — a caller that has to
+re-nest a suggestion will not send it.
+
+`Filters` gains `#[cfg_attr(feature = "mcp", derive(schemars::JsonSchema))]` and one
+`schemars(description = …)` per field. The `///` lines stay: they are the clap `--help` text, and
+the schemars override replaces them in the JSON Schema only. `kind` and `role` additionally carry
+`schemars(extend("enum" = [...]))` including `null`, because schemars emits
+`"type": ["string","null"]` for an `Option<String>` and a strict validator ANDs `type` with
+`enum`. This is the one place the two front ends legitimately differ: clap has no enum here
+because `Filters` may hold no clap types, and a shell user sees the zero and retries where a
+model reports it as a fact.
+
+### Every response carries an `Envelope`
+
+```rust
+pub struct Envelope {
+    pub applied_filters: Vec<AppliedFilter>,  // name, value, and `resolved` on since/until
+    pub time_range: TimeRange,                // absolute instants, both ends, both as ms
+    pub warnings: Vec<String>,
+    pub no_results: Option<NoResults>,        // Some exactly when the count is 0
+}
+```
+
+`warnings` is where `SearchResponse::warnings` lands for the index-backed tools and
+`sessions::unanswerable_filter_notes` for `search_sessions`. That channel is the load-bearing
+part of the foundation refactor: a warning that only reaches `tracing` reaches nobody here, since
+there is no stderr the caller is reading and the caller is a model that will report "nothing
+happened last week" as fact.
+
+Built by one function, `mcp::envelope::build(&Context, total, warnings) -> Envelope`, called by
+all four tool modules. Four copies of this would disagree about which filter is narrowest, which
+is the same class of bug `sessions.rs` was extracted to end.
+
+`envelope::resolve_time_range(&Filters) -> Result<TimeRange, sessions::FilterError>` runs in the
+tool layer **before** the index is touched. That placement is the contract: a bad date becomes
+`invalid_params` naming the field, instead of an `anyhow` chain surfacing from inside `search()`
+where the caller cannot tell it from an empty corpus — and the echo is impossible unless somebody
+resolved it. `FilterError` names the plain field (`since`), never a flag.
+
+### The zero-hit contract
+
+`no_results` is `Some` exactly when the result count is `0`, and never otherwise. It carries the
+prose `message`, the blamed filter and value, the mechanism that makes it narrowest, a
+`RetryAction` (`drop` / `fix` / `rephrase`), the legal set when the action is `fix`, and a
+ready-to-send `retry` arguments object.
+
+`envelope::narrowest(&Filters) -> Option<Ranked>` is the ranking, and it is a total function of
+the request: it never probes the index. The order follows from *how* each filter is matched,
+which the caller cannot see — phrase over analyzed text, then exact term over an open vocabulary,
+then prefix/range, then exact term over a closed vocabulary. Two overrides: silent-zero traps are
+promoted (`kind`/`role` outside their legal set are provably the cause and drop first, with the
+retry naming the legal set), and scope filters are held back (`project` and the time window drop
+last, because dropping them does not widen the question, it answers a different one).
+
+```
+1 kind/role illegal · 2 tool_input · 3 tool_output · 4 program · 5 min_thinking · 6 lang
+7 agent_type · 8 model · 9 branch · 10 tool · 11 session · 12 sidechains_only · 13 errors_only
+14 no_sidechains · 15 kind then role (legal) · 16 since then until · 17 project
+```
+
+Pinned by a test that asserts all eighteen `Filters` fields rank as themselves in isolation, so
+the order cannot silently skip one and blame a filter the caller never sent.
+
+### One `Index` per process, one reader per call
+
+The server opens one `tantivy::Index` and one `Fields` at startup and holds them for the process.
+Each call takes its own reader, because `search::search`, `search::facets` and the `context::*`
+entry points call `index.reader()?.searcher()` internally. **This is the answer to the open
+question in `docs/MCP.md`, and it is closed:** hoisting an `IndexReader` would buy one avoided
+`reader()` call per request and cost a change to every pinned search signature, plus a reader
+that has to be told when to reload.
+
+Refresh is a separate question because it *writes*. The CLI re-indexes before every read command,
+which is right for a process that lives 200 ms and wrong for one that lives a day. So: once at
+startup before the transport opens (unless `--no-refresh`), then at most once every
+`--refresh-secs` (default 300, `0` disables), checked at the start of a tool call and guarded by
+a mutex so concurrent calls never run two indexers. A refresh failure is logged to stderr and the
+call proceeds against the index as it stands. Because each call opens a fresh reader, a refresh —
+by this process or by a `session-search index` running beside it — is visible to the next call
+with nothing to arrange.
+
+### rmcp facts, verified against 3.2 by driving the server
+
+- `serverInfo` defaults to `{"name":"rmcp","version":"3.2.0"}`: `ServerInfo::new` calls
+  `Implementation::from_build_env()`, whose `env!` expands inside the rmcp crate.
+  `.with_server_info(Implementation::new("session-search", env!("CARGO_PKG_VERSION")))` is not
+  optional — it is what the host shows a user when it asks whether to trust the tools.
+- An input schema whose root is not `type: "object"` **panics the router at startup**, not at
+  build time. Every `Parameters<T>` must be a struct.
+- Top-level `title`/`description` are stripped from both schemas. A doc comment on a request
+  struct is silently discarded; prose belongs on the tool method and on individual fields.
+- An output schema is derived only when the return type *literally reads* `Json<T>` or
+  `Result<Json<T>, E>`. A type alias hiding `Json<..>` yields no `outputSchema`, silently.
+- `Json<Vec<T>>` writes `structuredContent` as a bare array, which the spec says must be an
+  object. Every response here is a named struct with the collection as one field.
+- `Json<T>` sends the payload **twice** — `structuredContent` and a text block with the same
+  JSON. Byte budgets are worth double what they look like.
+- Requests are handled concurrently and responses may be written out of order.
+- `rmcp::handler::server::wrapper::Parameters`, not the crate root. Nothing in scope may be named
+  `rmcp`: the macros emit unqualified `rmcp::…` paths.
+
+### Errors
+
+`ErrorData` (a JSON-RPC protocol error, which clients render opaquely) is used only for requests
+that could not be *started*: a malformed date, a reference naming nothing, a missing turn
+address. Everything a tool can answer — including "nothing matched" — comes back as a normal
+result whose envelope explains itself. `mcp::invalid_params` and `mcp::from_filter_error` are the
+two constructors; `from_anyhow` classifies whatever a tool body returned.
+
+### stdout belongs to the transport
+
+The MCP framing *is* stdout: one JSON-RPC message per line, nothing else. `tracing` writes to
+stderr, colour is off, nothing may `println!`, and the human renderers in `format.rs` take a
+`&mut impl Write` rather than reaching for stdout — which is what makes them harmless here: this
+path never calls them. Two tests, because the first build of the server answered nothing at all
+and neither test alone would have found it: `mcp::tests::stdout_belongs_to_the_transport` scans
+the module tree's source with comments stripped, and `tests/mcp_stdio.rs` drives the real binary
+and asserts stdout parses as JSON-RPC and stderr carries no escape sequences. See
+`Command::owns_stdout` under **CLI surface** for the lock that caused it.
 
 ## Conventions
 

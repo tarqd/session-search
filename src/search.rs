@@ -68,56 +68,258 @@ const CONTEXT_BOOST: Score = 0.3;
 const GROUP_FANOUT: usize = 8;
 
 #[derive(Debug, Clone, Default, clap::Args, serde::Serialize, serde::Deserialize)]
+#[cfg_attr(feature = "mcp", derive(schemars::JsonSchema))]
 #[serde(default)]
 pub struct Filters {
-    /// Project path; matches by prefix, so `-p ~/code` catches subdirectories.
+    /// Project path; matches by prefix on a path boundary, so `-p ~/code` catches subdirectories
+    /// but not `~/code-other`. `~` is expanded.
     #[arg(short = 'p', long, value_name = "PATH")]
+    #[cfg_attr(
+        feature = "mcp",
+        schemars(description = "\
+Project directory. Prefix match, aware of path boundaries: `/home/u/code` matches \
+`/home/u/code` and `/home/u/code/sub`, and never the sibling `/home/u/code-other`. A trailing \
+slash is ignored. Give an absolute path — this is the `cwd` each record recorded, never the \
+mangled project-directory name, and a `~` is expanded against the server's HOME, which is not \
+necessarily yours. This is the filter to drop last on a retry: dropping it does not widen the \
+question, it answers a different one.")
+    )]
     pub project: Option<String>,
-    /// Tool name; repeatable.
+    /// Tool name; repeatable, OR. Exact and case-sensitive — `Bash`, not `bash`.
     #[arg(short = 't', long, value_name = "NAME")]
+    #[cfg_attr(
+        feature = "mcp",
+        schemars(description = "\
+Tool names, ORed together. Exact term match and case-sensitive as the transcript spells them: \
+`Bash`, `Read`, `Edit`, `Write`, `Grep`, `Glob`, `WebFetch`, `Task`. `bash` and `BASH` match \
+nothing and do not error. If you are unsure what this corpus contains, call `aggregate` on \
+`tool_name` first — that is one call and it returns the exact vocabulary.")
+    )]
     pub tool: Vec<String>,
-    /// Tool parameter filter as `key=value`, e.g. `--tool-input command=cargo`; repeatable.
+    /// Tool parameter filter as `key=value`, e.g. `--tool-input command=cargo`; repeatable, ANDed.
     #[arg(long = "tool-input", value_name = "KEY=VALUE")]
+    #[cfg_attr(
+        feature = "mcp",
+        schemars(description = "\
+Filters on one parameter a tool was called with, written `key=value`; repeatable and ANDed. \
+The key is any parameter name the tool actually wrote — subpaths are dynamic, so \
+`file_path=/src/main.rs` works without `file_path` being declared anywhere in the schema, and so \
+does `timeout=600000` or `pattern=TODO`. The value is matched both as text terms and as the \
+whole raw value, so paths, quoted phrases and numbers all match the way they were indexed. \
+This is the narrowest filter in the set and it has two independent ways to be wrong: the key may \
+never appear on any tool, and the value may not be spelled the way it was recorded — both are \
+silent zeroes. To learn either, `aggregate` on `tool_input.<key>` and read the buckets. Use the \
+free-text query instead when you want 'this string appeared somewhere in the call', since a \
+`tool_input` match is an exact one on a single named parameter.")
+    )]
     pub tool_input: Vec<String>,
-    /// Phrase the tool's *output* must contain, e.g. `--tool-output "No such file"`;
-    /// repeatable, and ANDed.
+    /// Phrase the tool's *output* must contain, e.g. `--tool-output "No such file"`; repeatable,
+    /// and ANDed.
     #[arg(long = "tool-output", value_name = "TEXT")]
+    #[cfg_attr(
+        feature = "mcp",
+        schemars(description = "\
+An exact phrase the tool's OUTPUT must contain — what came back, not what the tool was asked to \
+do. Repeatable and ANDed. This is a phrase query over the code analyzer: the words must appear \
+adjacent and in order, and nothing is stemmed, so `compiling` does not find `compile` here. One \
+extra or missing word ends the match set. Use it for the literal text of an error you have \
+already seen (`error[E0433]`, `No such file or directory`); use the free-text query when you only \
+half-remember the wording, since a bare query already searches tool output.")
+    )]
     pub tool_output: Vec<String>,
-    /// Fenced-code language, as written in the info string (`rust`, `bash`); repeatable.
+    /// Fenced-code language, as written in the info string (`rust`, `bash`); repeatable, OR.
+    /// Lowercased before matching, so `Rust` and `rust` are the same fence — `rs` is not.
     #[arg(long, value_name = "LANG")]
+    #[cfg_attr(
+        feature = "mcp",
+        schemars(description = "\
+Fenced-code languages, ORed. Matched against the info string of a markdown code fence exactly \
+as written, after lowercasing — `Rust` and `rust` are the same filter, `rs` is a different one \
+and matches nothing if the corpus writes rust. Only messages that contain a fenced block \
+carry any value at all, so this filter excludes every tool call and every unfenced message. \
+Multi-valued: one message with a rust fence and a bash fence carries both.")
+    )]
     pub lang: Vec<String>,
     /// Only turns where the model spent at least N thinking tokens. Works even where the
     /// thinking text itself was stripped before it reached disk, which is the case for remote
     /// and web sessions.
     #[arg(long, value_name = "N")]
+    #[cfg_attr(
+        feature = "mcp",
+        schemars(description = "\
+Minimum thinking tokens: an inclusive lower bound on the token count the model spent reasoning \
+before answering. Use it to find the moments a session stopped and thought hard, which is a good \
+proxy for where the difficult decisions were made. It survives where the reasoning itself does \
+not: remote and web sessions strip the thinking text before it reaches disk but keep the count. \
+Note this is close to a presence filter — the count is attached to exactly one document per API \
+message, so even `min_thinking: 1` cuts the corpus to a small minority, and combining it with \
+another narrow filter usually returns zero. The thinking TEXT is only searchable if the index \
+was built to include it.")
+    )]
     pub min_thinking: Option<u64>,
-    /// Program run by a Bash command — any simple command in the script, e.g.
-    /// `--program cargo`; repeatable, OR.
+    /// The program that ran; exact match, case-sensitive. Any simple command in a Bash script,
+    /// e.g. `--program cargo`; repeatable, OR.
     #[arg(long, value_name = "NAME")]
+    #[cfg_attr(
+        feature = "mcp",
+        schemars(description = "\
+The program that ran; exact match, case-sensitive. Matched against `bash_cmd.program`, which is \
+indexed with the raw tokenizer, so the value is compared whole and byte for byte: `cargo` is a \
+hit, and `Cargo`, `cargo build` and `/usr/bin/cargo` are silent zeroes. Repeatable, ORed. \
+Use this instead of putting the program's name in the free-text query. `query: \"cargo\"` also \
+matches `Cargo.toml`, the flag `--cargo-flag`, a directory named `cargo` in some path, and every \
+sentence that merely mentions cargo; this filter matches only commands that actually invoked it. \
+Two limits worth knowing: the field exists only where the shell grammar parsed the command, so a \
+command it rejected is invisible here; and it is multi-valued — one pipeline contributes every \
+simple command in it, so `grep` matches `ls | grep foo`.")
+    )]
     pub program: Vec<String>,
+    /// Git branch; exact match on the whole name, so it must be spelled in full.
     #[arg(long, value_name = "BRANCH")]
+    #[cfg_attr(
+        feature = "mcp",
+        schemars(description = "\
+Git branch, exact term match on the whole recorded name. Not a prefix: `claude/` does not match \
+`claude/rust-mcp-session-indexing`, and `main` does not match `main-2` either. Slashes are safe — \
+the field is stored as one term, so a branch name is not split. A name spelled short or wrong is \
+a silent zero; `aggregate` on `git_branch` lists what exists.")
+    )]
     pub branch: Option<String>,
+    /// Model id; exact match on the full id as recorded, e.g. `claude-opus-4-1-20250805`.
     #[arg(long, value_name = "MODEL")]
+    #[cfg_attr(
+        feature = "mcp",
+        schemars(description = "\
+Model id, exact term match on the full string the transcript recorded — `claude-opus-4-1-\
+20250805`, not `opus` and not `claude-opus`. A family name matches nothing. Only assistant \
+records carry a model, so this filter also excludes every user prompt, attachment and system \
+record. `aggregate` on `model` gives the exact ids in this corpus.")
+    )]
     pub model: Option<String>,
+    /// One of `user`, `assistant`, `system`, `attachment`. Exact; any other value matches nothing.
     #[arg(long, value_name = "ROLE")]
+    #[cfg_attr(feature = "mcp", schemars(
+        extend("enum" = ["user", "assistant", "system", "attachment", null]),
+        description = "\
+Who produced the document. Exactly four legal values:
+  `user`       — a typed human prompt. In a subagent transcript these are synthesised by the \
+parent, not typed by a person.
+  `assistant`  — model output. This INCLUDES tool calls: a tool call's role is `assistant`, so \
+`role` cannot isolate them — use `kind` for that.
+  `system`     — a system record, including compaction summaries and meta turns.
+  `attachment` — injected context: system-reminders, environment blocks, file contents pulled in \
+around a prompt.
+Any other value — `human`, `tool`, `User`, `ai` — matches nothing and does not error. A zero-hit \
+result with `role` set almost always means the value, not the corpus."))]
     pub role: Option<String>,
-    /// `message` or `tool_call`.
+    /// `message` or `tool_call`. Exact; any other value matches nothing.
     #[arg(long, value_name = "KIND")]
+    #[cfg_attr(feature = "mcp", schemars(
+        extend("enum" = ["message", "tool_call", null]),
+        description = "\
+What the document is. Exactly two legal values:
+  `message`   — a prompt, an assistant reply, a system record or an attachment.
+  `tool_call` — one tool invocation joined with the result that answered it; the call's name and \
+inputs are its text, the result is its output.
+`toolcall`, `tool`, `ToolCall`, `tool_use` and `tool_result` all match nothing and do not error. \
+This filter is weak when right — the two values split the corpus roughly in half — and total when \
+wrong, which is why a zero with `kind` set is far more likely a typo than a fact about the \
+corpus."))]
     pub kind: Option<String>,
+    /// Session id; matches by prefix, so the first block of a uuid is enough.
     #[arg(long, value_name = "SESSION_ID")]
+    #[cfg_attr(
+        feature = "mcp",
+        schemars(description = "\
+Session id, matched by PREFIX — the first block of a uuid (`b20208d8`) is enough, which is what \
+anyone pasting an id has to hand. Note two things about session identity: a subagent transcript \
+records its PARENT's session id, so filtering by session includes that session's sidechains \
+(separate them with `sidechains_only` / `no_sidechains`); and two files can carry the same \
+session id after a reset or relocation, which is why a turn is addressed by `source_path` plus \
+`turn_seq` and not by session id plus a number.")
+    )]
     pub session: Option<String>,
+    /// Subagent type, e.g. `Explore`; exact match. Only sidechain documents have one.
     #[arg(long = "agent-type", value_name = "TYPE")]
+    #[cfg_attr(
+        feature = "mcp",
+        schemars(description = "\
+Subagent type, exact and case-sensitive: `Explore`, `workflow-subagent`, and whatever else this \
+machine has run. It comes from the attribution on a sidechain's assistant records, so setting it \
+implies sidechains — every document with an `agent_type` is inside a subagent transcript, and \
+combining this with `no_sidechains` is a guaranteed zero. `aggregate` on `agent_type` lists the \
+values.")
+    )]
     pub agent_type: Option<String>,
-    /// RFC3339, `YYYY-MM-DD`, or a relative span such as `7d`.
+    /// Lower bound, inclusive. RFC3339, `YYYY-MM-DD`, `YYYY-MM-DDTHH:MM[:SS]` (UTC), `now`, or a
+    /// relative span back from now: `90s`, `30m`, `24h`, `7d`, `2w`.
     #[arg(long, value_name = "WHEN")]
+    #[cfg_attr(
+        feature = "mcp",
+        schemars(description = "\
+Start of the time window, inclusive. Accepted forms:
+  RFC3339 with an offset      — `2026-09-03T14:00:00Z`, `2026-09-03T10:00:00-04:00`
+  a bare day                  — `2026-09-03`, taken from that day's midnight UTC
+  a local-looking timestamp   — `2026-09-03T14:00` or `2026-09-03T14:00:00`, assumed UTC
+  the literal `now`
+  a span counted back from now — `90s`, `30m`, `24h`, `7d`, `2w`
+A bare `YYYY-MM-DD` is inclusive at BOTH ends of the range: `since 2026-09-03 until 2026-09-05` \
+covers all three days, up to the last instant of the 5th, rather than stopping at its midnight. \
+Anything else is a parse error, not a silent zero — this is one of the few filters that tells you \
+when it is wrong. Relative spans are resolved against the server's clock at the moment of the \
+call, so the response echoes the resolved absolute range back; quote that range when you report \
+a result, never the span you sent.")
+    )]
     pub since: Option<String>,
+    /// Upper bound. Same grammar as `since`; a bare `YYYY-MM-DD` covers that whole day.
     #[arg(long, value_name = "WHEN")]
+    #[cfg_attr(
+        feature = "mcp",
+        schemars(description = "\
+End of the time window. Same grammar as `since`: RFC3339, `YYYY-MM-DD`, `YYYY-MM-DDTHH:MM[:SS]` \
+(assumed UTC), `now`, or a span back from now (`90s`, `30m`, `24h`, `7d`, `2w`). A bare day is \
+inclusive — `until 2026-09-05` covers the whole of the 5th, not just its first instant, because \
+an upper bound that stopped at midnight would silently drop a day's work. An explicit timestamp \
+is an inclusive instant. The response echoes the resolved absolute range; report that, not the \
+relative span you sent.")
+    )]
     pub until: Option<String>,
+    /// Only failed tool calls.
     #[arg(long)]
+    #[cfg_attr(
+        feature = "mcp",
+        schemars(description = "\
+Keep only documents flagged as a failed tool call. The flag is the transcript's own: the tool \
+host said the call failed, an `Error…` / `InputValidationError…` payload came back, the call was \
+interrupted, or permission was denied. It is NOT a text scan — a command that printed the word \
+`error` and exited 0 is not flagged, and for that you want a `tool_output` phrase instead. \
+Failures are a small minority of the corpus, so this narrows hard; it is the natural pairing with \
+`aggregate` for 'what errors did we see' and 'which files could we not read'.")
+    )]
     pub errors_only: bool,
+    /// Exclude subagent transcripts. Mutually exclusive with `sidechains_only`.
     #[arg(long, conflicts_with = "sidechains_only")]
+    #[cfg_attr(
+        feature = "mcp",
+        schemars(description = "\
+Exclude subagent (sidechain) transcripts, keeping only the main conversation. Use it when you \
+want what the top-level session did rather than what its delegated agents did. Cheap to drop on a \
+retry: sidechains are a minority of documents, so it rarely explains a zero on its own — unless \
+it was combined with `agent_type` or `sidechains_only`, which contradict it outright.")
+    )]
     pub no_sidechains: bool,
+    /// Only subagent transcripts. Mutually exclusive with `no_sidechains`.
     #[arg(long)]
+    #[cfg_attr(
+        feature = "mcp",
+        schemars(description = "\
+Keep only subagent (sidechain) documents — the transcripts of delegated agents, which live in \
+their own files and record the parent's session id. Worth knowing before you drill in: a \
+subagent's `user` records are synthesised by the parent and never open a new turn, so an entire \
+sidechain transcript is ONE turn. A `get_turn` on a hit from here returns that whole transcript \
+and will hit the document cap; prefer reading the skeleton and pulling single outputs with \
+`get_output`.")
+    )]
     pub sidechains_only: bool,
 }
 
@@ -145,6 +347,7 @@ pub struct Filters {
     serde::Deserialize,
     clap::ValueEnum,
 )]
+#[cfg_attr(feature = "mcp", derive(schemars::JsonSchema))]
 #[serde(rename_all = "snake_case")]
 #[clap(rename_all = "kebab-case")]
 pub enum SortBy {
@@ -208,33 +411,80 @@ impl Default for SearchRequest {
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[cfg_attr(feature = "mcp", derive(schemars::JsonSchema))]
 pub struct FacetCount {
+    /// The value itself, exactly as it was indexed.
     pub value: String,
+    /// Documents carrying this value. On a multi-valued field one document can be counted in
+    /// several buckets, so these do not sum to a document count. See [`FacetResult`].
     pub count: u64,
 }
 
-/// A terms aggregation plus the context needed to read it honestly.
+/// A terms aggregation plus the counts needed to read it honestly.
 ///
-/// The bucket list alone is misleading on a high-cardinality field: summing the returned
-/// buckets answers "how many documents are in the rows I am showing you", which a caller
-/// naturally misreads as "how many documents matched". On `tool_input.command` those differ by
-/// 50x. So the counts a caller needs to interpret the buckets travel with them.
+/// The bucket list alone is misleading: summing the returned buckets answers "how many documents
+/// are in the rows I am showing you", which reads as "how many documents matched" and on
+/// `tool_input.command` differs by 50x. Never sum the buckets. `matching_docs` is the total,
+/// `docs_with_value` is the coverage, `other_docs` says the buckets are truncated, and `distinct`
+/// says whether this field is a distribution at all.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[cfg_attr(feature = "mcp", derive(schemars::JsonSchema))]
 pub struct FacetResult {
+    /// The field these buckets count, echoed back.
     pub field: String,
+    /// The top buckets, most frequent first. Never a total — see the counts below.
     pub values: Vec<FacetCount>,
     /// Documents matching the query and filters. **Not** the sum of `values`.
+    #[cfg_attr(
+        feature = "mcp",
+        schemars(description = "\
+How many documents the query and filters matched, in total. This is the denominator for every \
+bucket count and it is the ONLY number here you may quote as a total. It is not the sum of the \
+returned buckets and will not equal it: buckets stop at the top `n`, documents without a value \
+for this field are counted here and appear in no bucket at all, and on a multi-valued field one \
+document is counted once here and several times across the buckets. If you find yourself adding \
+bucket counts together, the number you wanted was this one.")
+    )]
     pub matching_docs: u64,
     /// Of those, the ones that actually carry a value for this field. Counted with an
     /// `ExistsQuery`, not summed from the buckets: a multi-valued field like `code_lang` or
     /// `bash_cmd.program` buckets a document once per value, so the sum counts values and
     /// can exceed `matching_docs`. Documents, not values: one answer with a rust fence and a
     /// bash fence counts once here and twice in `values`.
+    #[cfg_attr(
+        feature = "mcp",
+        schemars(description = "\
+How many of the `matching_docs` carry any value for this field at all — counted directly, not \
+summed from the buckets. The gap between this and `matching_docs` is real and often large: a \
+`tool_input.file_path` aggregation over a set that includes prompts and Bash calls has a value on \
+only the small share of documents that were file reads. Report coverage as \
+`docs_with_value of matching_docs`. On a multi-valued field this is DOCUMENTS, not values: one \
+answer holding a rust fence and a bash fence counts once here and twice in the buckets.")
+    )]
     pub docs_with_value: u64,
     /// Values that fell outside the returned buckets (`sum_other_doc_count`) — one document
     /// per value, except on a multi-valued field, where one document can contribute several.
+    #[cfg_attr(
+        feature = "mcp",
+        schemars(description = "\
+How much of the matching set sits in values that did not make the top `n` buckets. Greater than \
+zero means the buckets you were given are a truncated view, and any statement of the form 'the \
+only values are…' or 'X accounts for all of them' is false. Say 'the top N are…' and name this \
+number. One document per value here, except on a multi-valued field, where one document can \
+contribute to several.")
+    )]
     pub other_docs: u64,
     /// Approximate count of distinct values (HyperLogLog), over the matching set.
+    #[cfg_attr(
+        feature = "mcp",
+        schemars(description = "\
+Roughly how many distinct values exist across the whole matching set, not just the buckets \
+returned. Approximate — it is a HyperLogLog estimate, so quote it as 'about N distinct values' \
+and never subtract it from anything. Its real job is to tell you what shape of field you are \
+looking at: when it approaches `docs_with_value`, the values barely repeat and what you have is a \
+sample of a long tail rather than a distribution — whole shell commands are the standard case — \
+and the question wants full-text search instead of an aggregation.")
+    )]
     pub distinct: Option<u64>,
 }
 
@@ -273,6 +523,7 @@ impl FacetResult {
 /// `Text` also covers the no-highlight fallback's `Doc::body`, which is the same claim — the
 /// turn's own words — rendered from the stored body rather than the indexed halves.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[cfg_attr(feature = "mcp", derive(schemars::JsonSchema))]
 #[serde(rename_all = "snake_case")]
 pub enum SnippetSource {
     Text,

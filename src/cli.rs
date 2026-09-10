@@ -268,6 +268,26 @@ pub enum Command {
         #[arg(long)]
         no_refresh: bool,
     },
+    /// Serve the index to an agent over MCP on stdio.
+    ///
+    /// The transport owns stdout: one JSON-RPC message per line and nothing else. Diagnostics
+    /// go to stderr as they always do, and no renderer in this crate is called on this path.
+    ///
+    /// The index this serves is the global `--index` / `$SESSION_SEARCH_INDEX`, resolved before
+    /// dispatch like every other command — an MCP server started by an agent host inherits
+    /// whatever environment the host gives it, so the server reports the directory it actually
+    /// opened back in its `instructions`, where the model can see it.
+    #[cfg(feature = "mcp")]
+    Mcp {
+        /// Re-index at most every N seconds while the server runs. 0 never re-indexes after
+        /// startup. Unlike the one-shot commands, a long-lived server cannot afford an index
+        /// scan on every request.
+        #[arg(long = "refresh-secs", default_value_t = crate::mcp::DEFAULT_REFRESH_SECS, value_name = "N")]
+        refresh_secs: u64,
+        /// Skip the startup refresh too, and serve the index exactly as it stands.
+        #[arg(long)]
+        no_refresh: bool,
+    },
 }
 
 impl Command {
@@ -281,6 +301,31 @@ impl Command {
             | Command::Stats { json } => *json,
             #[cfg(feature = "http-api")]
             Command::Serve { .. } => false,
+            // Not "this command emits JSON" so much as "this command emits nothing a human
+            // reads": `OutputOpts::color` is derived from it, and the one thing that must never
+            // happen on this path is an ANSI escape near stdout.
+            #[cfg(feature = "mcp")]
+            Command::Mcp { .. } => true,
+        }
+    }
+
+    /// True when the command writes to stdout itself and must not be handed a borrowed one.
+    ///
+    /// Only the MCP server does. Its stdio transport *is* stdout — JSON-RPC framing written from
+    /// the transport's own threads — and [`run`]'s buffered writer holds `stdout().lock()` for
+    /// the whole of [`dispatch`]. A `std::io::Stdout` lock is reentrant within a thread and
+    /// blocking across threads, so the transport's first write parks forever: no response, no
+    /// error, no log line, just a server that never answers. That is a five-minute bug to hit
+    /// and an hour to find, so the two paths are separated here rather than defended by a
+    /// comment.
+    fn owns_stdout(&self) -> bool {
+        #[cfg(feature = "mcp")]
+        {
+            matches!(self, Command::Mcp { .. })
+        }
+        #[cfg(not(feature = "mcp"))]
+        {
+            false
         }
     }
 }
@@ -312,6 +357,14 @@ pub fn run(cli: Cli) -> Result<()> {
         // Filled in by the `Search` arm once `--similar-to` has resolved to a document.
         similar_to: None,
     };
+
+    // A command that owns stdout gets it unborrowed; see `Command::owns_stdout`. `sink` rather
+    // than `stdout` because such a command writes nothing through this channel by definition,
+    // and handing it a second handle to the stream it is framing would invite exactly the
+    // interleaving the separation exists to prevent.
+    if cli.command.owns_stdout() {
+        return dispatch(cli.command, &index_dir, opts, &mut std::io::sink());
+    }
 
     // Buffered: the human renderings are many small writes, and a `| head` should not cost a
     // syscall per line.
@@ -564,6 +617,22 @@ fn dispatch(
             format::stats_scoped(out, &stats, &roots, &opts)
         }
 
+        #[cfg(feature = "mcp")]
+        Command::Mcp {
+            refresh_secs,
+            no_refresh,
+        } => {
+            // `out` is deliberately untouched: the stdio transport is the only thing allowed to
+            // write to stdout, and `run` flushes an empty buffer afterwards.
+            crate::mcp::serve(
+                index_dir,
+                crate::mcp::ServeOptions {
+                    refresh_secs,
+                    no_refresh,
+                },
+            )
+        }
+
         #[cfg(feature = "http-api")]
         Command::Serve {
             host,
@@ -594,7 +663,7 @@ fn dispatch(
 /// The read commands index first, so a search is never silently answered from a stale index.
 /// A refresh failure is not fatal: an unreadable transcript root should not stop you searching
 /// what was indexed yesterday.
-fn refresh(index_dir: &Path, no_refresh: bool, query_wants_thinking: bool) {
+pub(crate) fn refresh(index_dir: &Path, no_refresh: bool, query_wants_thinking: bool) {
     let meta = index::meta(index_dir);
 
     // Searching thinking that was never indexed matches nothing and looks like an empty corpus.

@@ -1607,6 +1607,7 @@ dependencies = [
  "owo-colors",
  "pulldown-cmark",
  "rayon",
+ "regex",
  "rmcp",
  "schemars",
  "serde",
