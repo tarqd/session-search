@@ -1966,4 +1966,16 @@ mod tests {
         assert_eq!(thousands(1_000), "1,000");
         assert_eq!(thousands(1_234_567), "1,234,567");
     }
+
+    /// `turn_seq` reaches `--json` with the value it carries, not just as a key: it is what
+    /// lets a consumer ask for the rest of the turn a hit came from, and a hard zero would
+    /// send every one of those requests to the head of the file.
+    #[test]
+    fn doc_json_carries_the_turn_a_document_belongs_to() {
+        let mut d = doc(7, "assistant", "because the build cache was cold");
+        d.turn_seq = 5;
+        let v = doc_json(&d);
+        assert_eq!(v["seq"], 7);
+        assert_eq!(v["turn_seq"], 5);
+    }
 }

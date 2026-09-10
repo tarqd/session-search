@@ -717,7 +717,10 @@ and the predicate excludes every one of them). Three rules pin `turn_seq`:
 
 1. **Definition.** `turn_seq` is the `seq` of the first doc emitted from the record that opened
    the turn. Every doc in the turn carries it, so a turn is a contiguous `seq` range within one
-   `source_path`, and the opening prompt is the doc whose `seq == turn_seq`.
+   `source_path`, and the opening prompt is the doc whose `seq == turn_seq`. A prompt that
+   indexes nothing — an empty message, or one whose only block carries no text — opens its turn
+   at the *next* doc instead: a number pointing at a doc that was never emitted would leave a
+   hole in the range, and contiguity is what a window scoped to a turn walks.
 2. **A file that opens mid-conversation** (`resetSessionFile()`, a `relocated` sidecar — §9) has
    assistant records before any human prompt. Those docs get `turn_seq == seq_base` — a synthetic
    opening turn — so grouping stays total and no consumer handles an `Option`.
@@ -731,7 +734,8 @@ and on a live transcript a turn straddles that boundary nearly every time; witho
 tail would restart numbering at its own `seq_base` and the incremental result would stop matching
 `parse_whole`, which the rules above require byte for byte. Replacements keep their original
 `turn_seq` for free — they are rebuilt from the carried `Doc`, and a late result only fills in
-`tool_output`.
+`tool_output`. A `Reset` is handed no carry at all (`index::Job::file_context`), so a rewind or a
+`resetSessionFile()` cannot leave a tail continuing a turn out of bytes that no longer exist.
 
 `format.rs`:
 

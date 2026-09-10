@@ -3355,4 +3355,303 @@ mod tests {
         println!("TOTAL docs={docs} tool_calls={tools} thinking={thinking} parse_errors={errors}");
         assert_eq!(errors, 0, "real transcripts must parse without errors");
     }
+
+    // -- turns --------------------------------------------------------------
+
+    /// `(seq, turn_seq)` for every document, which is the whole of what a turn is: a
+    /// contiguous run of `seq` sharing one opener.
+    fn turn_map(out: &ParseOutput) -> Vec<(u64, u64)> {
+        out.docs.iter().map(|d| (d.seq, d.turn_seq)).collect()
+    }
+
+    /// A turn is the span from one human prompt to the next, named by the `seq` of the
+    /// document that opened it. `turns.jsonl` holds three prompts and, between them, every
+    /// kind of record that is *not* one.
+    #[test]
+    fn every_document_carries_the_seq_of_the_prompt_that_opened_its_turn() {
+        let (out, _) = parse("turns.jsonl");
+        assert_eq!(
+            turn_map(&out),
+            [
+                (0, 0),
+                (1, 0),
+                (2, 0),
+                (3, 0),
+                (4, 0),
+                (5, 5),
+                (6, 5),
+                (7, 5),
+                (8, 5),
+                (9, 5),
+                (10, 5),
+                (11, 11),
+                (12, 11),
+            ],
+        );
+
+        // The opener of a turn is the prompt itself: `seq == turn_seq` is how a consumer finds
+        // the question a hit was an answer to.
+        for opener in [0usize, 5, 11] {
+            let doc = &out.docs[opener];
+            assert_eq!(doc.seq, doc.turn_seq);
+            assert_eq!(doc.role, "user");
+            assert!(!doc.is_meta, "a meta record opens no turn: {}", doc.body);
+        }
+    }
+
+    /// `is_human_turn()` is the boundary, and every other `user` record is inside the turn it
+    /// interrupts. Treating one as a boundary would cut an answer off from the prompt it
+    /// answers — a compaction lands mid-turn on any long session.
+    #[test]
+    fn a_compaction_a_meta_turn_and_a_tool_result_open_no_turn() {
+        let (out, _) = parse("turns.jsonl");
+        let with = |needle: &str| -> &Doc {
+            out.docs
+                .iter()
+                .find(|d| body_of(d).contains(needle))
+                .unwrap_or_else(|| panic!("no document holds {needle:?}: {:?}", texts(&out)))
+        };
+        assert_eq!(
+            with("scratchpad is empty").turn_seq,
+            0,
+            "an isMeta user record is not a prompt"
+        );
+        assert_eq!(
+            with("Conversation compacted").turn_seq,
+            5,
+            "the compact_boundary system record is not a prompt"
+        );
+        assert_eq!(
+            with("covered incremental indexing").turn_seq,
+            5,
+            "an isCompactSummary user record is not a prompt"
+        );
+
+        // A tool result is a `user` record too. It emits no document of its own — it completes
+        // the call it answers — and that call stays in the turn that made it.
+        let call = out
+            .docs
+            .iter()
+            .find(|d| d.tool_use_id.as_deref() == Some("toolu_2"))
+            .expect("the second Bash call");
+        assert_eq!(call.turn_seq, 5);
+        assert!(
+            call.tool_output
+                .as_deref()
+                .is_some_and(|o| o.contains("42 passed")),
+            "{:?}",
+            call.tool_output
+        );
+    }
+
+    /// Rule 2: a file that opens mid-conversation — `resetSessionFile()`, a `relocated` sidecar
+    /// (§9) — has assistant records before any prompt. They take `seq_base`, a synthetic
+    /// opening turn, so grouping stays total and no consumer handles an `Option`.
+    #[test]
+    fn a_file_that_opens_mid_conversation_starts_in_a_synthetic_turn_at_seq_base() {
+        let dir = tempfile::tempdir().unwrap();
+        let body = concat!(
+            r#"{"type":"assistant","uuid":"a1","sessionId":"s","cwd":"/p","message":{"role":"assistant","id":"m1","model":"mm","content":[{"type":"text","text":"still failing"}]}}"#,
+            "\n",
+            r#"{"type":"assistant","uuid":"a2","sessionId":"s","cwd":"/p","message":{"role":"assistant","id":"m2","model":"mm","content":[{"type":"tool_use","id":"t1","name":"Bash","input":{"command":"cargo test"}}]}}"#,
+            "\n",
+            r#"{"type":"user","uuid":"u1","sessionId":"s","cwd":"/p","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"t1","content":"1 failed"}]},"toolUseResult":{"stdout":"1 failed"}}"#,
+            "\n",
+            r#"{"type":"user","uuid":"u2","sessionId":"s","cwd":"/p","origin":{"kind":"human"},"message":{"role":"user","content":"try again"}}"#,
+            "\n",
+            r#"{"type":"assistant","uuid":"a3","sessionId":"s","cwd":"/p","message":{"role":"assistant","id":"m3","model":"mm","content":[{"type":"text","text":"rerunning"}]}}"#,
+            "\n",
+        );
+        let path = dir.path().join("relocated.jsonl");
+        std::fs::write(&path, body).unwrap();
+
+        let whole = parse_whole(&path, &ParseOptions::default()).unwrap();
+        assert_eq!(turn_map(&whole), [(0, 0), (1, 0), (2, 2), (3, 2)]);
+
+        // The same file continuing another file's numbering moves the synthetic turn with it:
+        // an absent `open_turn_seq` means exactly "start where the numbering starts", never a
+        // hard-coded zero, or the leading documents would claim a turn in some other file.
+        let ctx = FileContext::default();
+        assert_eq!(ctx.carry.open_turn_seq, None);
+        let (based, _) = parse_file(&path, 0, 40, &ParseOptions::default(), &ctx).unwrap();
+        assert_eq!(turn_map(&based), [(40, 40), (41, 40), (42, 42), (43, 42)]);
+    }
+
+    /// Rule 3: a subagent's `user` records are synthesised by the parent, so `origin.kind`
+    /// never says `human` and the whole transcript is one turn. That is arguably right — a
+    /// subagent invocation *is* one turn of the session that spawned it — but a window that
+    /// snaps to a turn has to cap, because here the turn is the whole file.
+    #[test]
+    fn a_subagent_transcript_is_a_single_turn() {
+        let (out, _) = parse("real_sidechain_slice.jsonl");
+        assert!(out.docs.len() > 5, "{} documents", out.docs.len());
+        assert!(
+            out.docs.iter().all(|d| d.turn_seq == 0),
+            "{:?}",
+            turn_map(&out)
+        );
+
+        let (based, _) = parse_file(
+            &fixture("real_sidechain_slice.jsonl"),
+            0,
+            90,
+            &ParseOptions::default(),
+            &FileContext::default(),
+        )
+        .unwrap();
+        assert!(
+            based.docs.iter().all(|d| d.turn_seq == 90),
+            "the synthetic turn follows `seq_base`: {:?}",
+            turn_map(&based)
+        );
+    }
+
+    /// A live transcript is tailed wherever the writer happened to be, which is inside a turn
+    /// nearly every time. `ParseCarry::open_turn_seq` is what stops the tail from renumbering
+    /// from its own `seq_base`; without it the incremental result stops matching `parse_whole`,
+    /// which the turn rules require byte for byte. Cut in both places the boundary really
+    /// falls: between a `tool_use` and the result answering it, and between an assistant's
+    /// text and the tool call it goes on to make.
+    #[test]
+    fn a_turn_straddling_a_tail_boundary_keeps_its_number() {
+        let all = std::fs::read_to_string(fixture("turns.jsonl")).unwrap();
+        let lines: Vec<&str> = all.split_inclusive('\n').collect();
+
+        for cut in [3usize, 8] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("live.jsonl");
+            std::fs::write(&path, lines[..cut].concat()).unwrap();
+            let (head, offset) = parse_file(
+                &path,
+                0,
+                0,
+                &ParseOptions::default(),
+                &FileContext::default(),
+            )
+            .unwrap();
+            assert!(
+                head.carry.open_turn_seq.is_some(),
+                "every carry records the turn it left open"
+            );
+
+            std::fs::write(&path, &all).unwrap();
+            // Through serde, because that is how the carry reaches the next run: it lives in
+            // `state.json` between processes.
+            let carried: ParseCarry =
+                serde_json::from_str(&serde_json::to_string(&head.carry).unwrap()).unwrap();
+            let ctx = FileContext {
+                carry: carried,
+                ..FileContext::default()
+            };
+            let (tail, _) = parse_file(
+                &path,
+                offset,
+                head.docs.len() as u64,
+                &ParseOptions::default(),
+                &ctx,
+            )
+            .unwrap();
+
+            let whole = parse_whole(&path, &ParseOptions::default()).unwrap();
+            let live: Vec<(u64, u64)> = head
+                .docs
+                .iter()
+                .chain(&tail.docs)
+                .map(|d| (d.seq, d.turn_seq))
+                .collect();
+            assert_eq!(live, turn_map(&whole), "cut after line {cut}");
+            assert!(tail.carry.open_turn_seq.is_some(), "cut after line {cut}");
+
+            // Without the carry the tail restarts turn numbering at its own `seq_base`, and
+            // the run that opened the turn keeps a number nothing else in the file shares.
+            let (naive, _) = parse_file(
+                &path,
+                offset,
+                head.docs.len() as u64,
+                &ParseOptions::default(),
+                &FileContext::default(),
+            )
+            .unwrap();
+            assert_ne!(
+                naive.docs.first().map(|d| d.turn_seq),
+                tail.docs.first().map(|d| d.turn_seq),
+                "the defect `open_turn_seq` exists to stop, cut after line {cut}"
+            );
+        }
+    }
+
+    /// A document completed across the boundary is rebuilt from the one the carry held, so it
+    /// keeps the turn it was assigned when the call was written. Rebuilding it from the tail's
+    /// own numbering would move a tool call out of the turn that made it.
+    #[test]
+    fn a_replacement_keeps_the_turn_seq_it_was_first_assigned() {
+        let all = std::fs::read_to_string(fixture("turns.jsonl")).unwrap();
+        let lines: Vec<&str> = all.split_inclusive('\n').collect();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("live.jsonl");
+
+        // Ten lines end on the second turn's `tool_use`; its result is the eleventh.
+        std::fs::write(&path, lines[..9].concat()).unwrap();
+        let (head, offset) = parse_file(
+            &path,
+            0,
+            0,
+            &ParseOptions::default(),
+            &FileContext::default(),
+        )
+        .unwrap();
+        assert_eq!(head.carry.open_turn_seq, Some(5));
+
+        std::fs::write(&path, &all).unwrap();
+        let ctx = FileContext {
+            carry: head.carry.clone(),
+            ..FileContext::default()
+        };
+        let seq_base = head.docs.len() as u64;
+        let (tail, _) =
+            parse_file(&path, offset, seq_base, &ParseOptions::default(), &ctx).unwrap();
+
+        assert_eq!(tail.replacements.len(), 1);
+        let completed = &tail.replacements[0];
+        assert_eq!(completed.turn_seq, 5);
+        assert_ne!(
+            completed.turn_seq, seq_base,
+            "a replacement must not take the tail's own numbering"
+        );
+
+        let whole = parse_whole(&path, &ParseOptions::default()).unwrap();
+        let expected = whole
+            .docs
+            .iter()
+            .find(|d| d.doc_id == completed.doc_id)
+            .expect("the same document exists in a whole-file parse");
+        assert_eq!(completed.turn_seq, expected.turn_seq);
+        assert_eq!(completed.seq, expected.seq);
+    }
+
+    /// A prompt can pass the predicate and still index nothing — an empty message, or one whose
+    /// only block is a payload with no text in it. The turn it opens starts at the next
+    /// document instead, which is what keeps a turn a *contiguous* `seq` range: numbering it
+    /// after a document that was never emitted would leave a hole no window could cross.
+    #[test]
+    fn a_prompt_that_indexes_nothing_still_opens_its_turn_at_the_next_document() {
+        let dir = tempfile::tempdir().unwrap();
+        let body = concat!(
+            r#"{"type":"user","uuid":"u1","sessionId":"s","cwd":"/p","origin":{"kind":"human"},"message":{"role":"user","content":"first"}}"#,
+            "\n",
+            r#"{"type":"assistant","uuid":"a1","sessionId":"s","cwd":"/p","message":{"role":"assistant","id":"m1","model":"mm","content":[{"type":"text","text":"answering the first"}]}}"#,
+            "\n",
+            r#"{"type":"user","uuid":"u2","sessionId":"s","cwd":"/p","origin":{"kind":"human"},"message":{"role":"user","content":"   "}}"#,
+            "\n",
+            r#"{"type":"assistant","uuid":"a2","sessionId":"s","cwd":"/p","message":{"role":"assistant","id":"m2","model":"mm","content":[{"type":"text","text":"answering the second"}]}}"#,
+            "\n",
+        );
+        let out = parse_body(dir.path(), "empty-prompt.jsonl", body);
+        assert_eq!(turn_map(&out), [(0, 0), (1, 0), (2, 2)]);
+        assert_eq!(
+            text_of(&out.docs[2]),
+            "answering the second",
+            "the second turn opens on the answer, because the prompt indexed nothing"
+        );
+    }
 }

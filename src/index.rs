@@ -1940,4 +1940,107 @@ mod tests {
             );
         }
     }
+
+    // -- turns --------------------------------------------------------------
+
+    /// `(seq, turn_seq)` for every document in the index, read back through
+    /// [`crate::search::doc_from_stored`] — the one reader of the stored payload.
+    fn indexed_turns(index_dir: &Path) -> Vec<(u64, u64)> {
+        let (index, fields) = open_or_create(index_dir).unwrap();
+        let searcher = index.reader().unwrap().searcher();
+        let limit = (searcher.num_docs() as usize).max(1);
+        let found = searcher
+            .search(
+                &AllQuery,
+                &tantivy::collector::TopDocs::with_limit(limit).order_by_score(),
+            )
+            .unwrap();
+        let mut turns: Vec<(u64, u64)> = found
+            .into_iter()
+            .map(|(_, address)| {
+                let stored: TantivyDocument = searcher.doc(address).unwrap();
+                let doc = crate::search::doc_from_stored(&fields, &stored);
+                (doc.seq, doc.turn_seq)
+            })
+            .collect();
+        turns.sort_unstable();
+        turns
+    }
+
+    /// A turn straddles the boundary a live transcript is tailed at nearly every time, and the
+    /// carry is what keeps the tail numbering turns instead of restarting at its own
+    /// `seq_base`. Proved here end to end, through `state.json` and the index, rather than
+    /// only at the parser level.
+    #[test]
+    fn an_incremental_index_agrees_with_a_whole_file_parse_on_turn_seq() {
+        let head = [
+            user_line("u1", None, "build it"),
+            assistant_line("a1", "u1", "on it"),
+            tool_use_line("a2", "a1", "toolu_1", "cargo build"),
+        ]
+        .join("\n")
+            + "\n";
+        let fx = Fixture::with_body(&head);
+        fx.index();
+
+        // The boundary falls between the call and its result, and again between an answer and
+        // the prompt that follows it. Each run must be a *tail*: a reset would reparse the
+        // whole file and agree with it for the wrong reason.
+        for line in [
+            tool_result_line("u2", "a2", "toolu_1", "Finished"),
+            user_line("u3", Some("u2"), "now test it"),
+            assistant_line("a3", "u3", "running the suite"),
+        ] {
+            fx.append(&line);
+            let stats = fx.index();
+            assert_eq!(stats.files_updated, 1);
+            assert_eq!(stats.files_reset, 0, "an append is a tail, not a reset");
+        }
+
+        let whole = crate::parse::parse_whole(&fx.transcript, &ParseOptions::default()).unwrap();
+        let expected: Vec<(u64, u64)> = whole.docs.iter().map(|d| (d.seq, d.turn_seq)).collect();
+        assert_eq!(expected, [(0, 0), (1, 0), (2, 0), (3, 3), (4, 3)]);
+        assert_eq!(indexed_turns(&fx.index_dir), expected);
+    }
+
+    /// The field has to survive the schema, not just the parser: `doc_to_json` writes it,
+    /// `doc_from_stored` reads it, and a hit that reported `turn_seq = 0` for every document
+    /// would look exactly like a corpus with one turn in it.
+    #[test]
+    fn turn_seq_round_trips_through_the_index() {
+        let mut doc = crate::search::testkit::blank_doc(7);
+        doc.turn_seq = 5;
+        doc.text = vec!["the answer to the question five documents back".into()];
+        let (index, fields) = crate::search::testkit::index_docs(&[doc]);
+
+        let window =
+            crate::context::around(&index, &fields, "s1", None, Some("/tmp/s1.jsonl"), 7, 0, 0)
+                .unwrap();
+        assert_eq!(window.len(), 1);
+        assert_eq!(window[0].seq, 7);
+        assert_eq!(window[0].turn_seq, 5);
+    }
+
+    /// `STATE_VERSION` is the reindex switch: a watermark written before `turn_seq` existed
+    /// describes documents that carry none, and trusting it would leave the whole prefix of
+    /// every file reporting turn zero for ever. A mismatch throws the state away, which makes
+    /// every file a `Reset` — and a reset must not duplicate what is already indexed.
+    #[test]
+    fn a_state_file_from_an_older_version_is_discarded_and_the_file_reindexed() {
+        let fx = Fixture::new();
+        let expected = fx.index().docs_added;
+        assert_eq!(fx.state().version, STATE_VERSION);
+
+        let path = fx.index_dir.join(STATE_FILE);
+        let mut stored: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        stored["version"] = serde_json::json!(STATE_VERSION - 1);
+        std::fs::write(&path, serde_json::to_vec(&stored).unwrap()).unwrap();
+
+        let stats = fx.index();
+        assert_eq!(stats.docs_added, expected, "the file must be read again");
+        assert_eq!(fx.live(), expected, "and replaced, not duplicated");
+        assert_eq!(fx.state().version, STATE_VERSION);
+        assert_eq!(indexed_turns(&fx.index_dir).len() as u64, expected);
+    }
 }
