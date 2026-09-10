@@ -16,7 +16,7 @@
 //! rather than swallowed — a typo'd field name must not look like an empty corpus.
 
 use std::collections::BTreeMap;
-use std::ops::Bound;
+use std::ops::{Bound, Range};
 use std::time::Instant;
 
 use anyhow::{Context, anyhow, bail};
@@ -103,9 +103,12 @@ pub struct Filters {
 /// ("every Bash call in this project"), where BM25 scores every document identically and the
 /// resulting order is whatever the segments happened to hold.
 ///
-/// **A time order can only return documents that carry a timestamp.** Every record a
-/// transcript writes has one, so in practice this is the whole corpus; but `total` counts
-/// matches, and a document with no timestamp is counted there and unreachable by paging.
+/// A document with no timestamp is **not** dropped: Tantivy sorts on `Option<T>` and puts
+/// `None` last in both directions, so it stays reachable by paging and `total` keeps matching
+/// what paging can actually reach. Every record a transcript writes carries a timestamp
+/// anyway, so this is a corner — but "the count says 40 and you can only page to 37" is
+/// exactly the kind of quiet arithmetic lie this codebase is at pains to avoid, so it is
+/// pinned by a test rather than left to be rediscovered.
 #[derive(
     Debug,
     Clone,
@@ -242,6 +245,16 @@ pub struct Hit {
     /// nothing to highlight the snippet falls back to the head of whichever body the document
     /// has, and this reports that one.
     pub snippet_field: SnippetSource,
+    /// Byte ranges into [`Hit::snippet`] covering the matched text *inside* each pair of
+    /// [`HIGHLIGHT`] markers this module wrote.
+    ///
+    /// A consumer that re-marks the snippet cannot recover these by splitting on `**`: bodies
+    /// contain `**` of their own (any turn that read a markdown file carries some), and a
+    /// splitter cannot tell those from ours. It mis-pairs them and emphasises words the query
+    /// never matched — a search tool reporting the wrong answer with total confidence. These
+    /// ranges are recorded where the truth is, at the point the markers are written.
+    #[serde(default)]
+    pub snippet_marks: Vec<Range<usize>>,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -362,10 +375,10 @@ pub fn search(
         let highlighted = |g: &Option<SnippetGenerator>, from: SnippetSource| {
             g.as_ref()
                 .map(|g| render_snippet(&g.snippet_from_doc(&stored)))
-                .filter(|s| !s.trim().is_empty())
-                .map(|s| (s, from))
+                .filter(|(text, _)| !text.trim().is_empty())
+                .map(|(text, marks)| (text, marks, from))
         };
-        let (snippet, snippet_field) = highlighted(&snippets, SnippetSource::Text)
+        let (snippet, snippet_marks, snippet_field) = highlighted(&snippets, SnippetSource::Text)
             .or_else(|| highlighted(&output_snippets, SnippetSource::ToolOutput))
             .or_else(|| highlighted(&thinking_snippets, SnippetSource::Thinking))
             .unwrap_or_else(|| {
@@ -393,13 +406,17 @@ pub fn search(
                 .filter_map(|(body, from)| Some((body?, from)))
                 .find(|(body, _)| !body.trim().is_empty())
                 .unwrap_or(("", SnippetSource::Text));
-                (excerpt(body, req.snippet_chars), from)
+                // A head-of-text excerpt marks nothing, so it carries no ranges — and an
+                // empty `snippet_marks` is exactly "nothing matched here", not "the marks were
+                // lost".
+                (excerpt(body, req.snippet_chars), Vec::new(), from)
             });
         hits.push(Hit {
             doc,
             score,
             snippet,
             snippet_field,
+            snippet_marks,
         });
     }
 
@@ -949,15 +966,21 @@ fn validate_agg_field(schema: &Schema, name: &str) -> anyhow::Result<()> {
 // snippets
 // ---------------------------------------------------------------------------
 
-/// The matched spans wrapped in `**`, taken from the stored `text`. HTML escaping (what
-/// `Snippet::to_html` does) would corrupt the code and paths these transcripts are full of.
-fn render_snippet(snippet: &Snippet) -> String {
+/// The matched spans wrapped in `**`, taken from the stored `text`, plus the byte ranges of
+/// what each pair wraps. HTML escaping (what `Snippet::to_html` does) would corrupt the code
+/// and paths these transcripts are full of.
+///
+/// The ranges are returned rather than left to be re-derived because `**` occurs in the bodies
+/// themselves, so the marked string alone no longer says which markers are ours. See
+/// [`Hit::snippet_marks`].
+fn render_snippet(snippet: &Snippet) -> (String, Vec<Range<usize>>) {
     let fragment = snippet.fragment();
     let ranges = collapse_overlapped_ranges(snippet.highlighted());
     if ranges.is_empty() {
-        return String::new();
+        return (String::new(), Vec::new());
     }
     let mut out = String::with_capacity(fragment.len() + ranges.len() * 4);
+    let mut marks = Vec::with_capacity(ranges.len());
     let mut cursor = 0;
     for range in ranges {
         if range.start < cursor || range.end > fragment.len() {
@@ -965,12 +988,14 @@ fn render_snippet(snippet: &Snippet) -> String {
         }
         out.push_str(&fragment[cursor..range.start]);
         out.push_str(HL_PREFIX);
+        let from = out.len();
         out.push_str(&fragment[range.clone()]);
+        marks.push(from..out.len());
         out.push_str(HL_SUFFIX);
         cursor = range.end;
     }
     out.push_str(&fragment[cursor..]);
-    out
+    (out, marks)
 }
 
 /// Head-of-text fallback for hits with nothing to highlight — a filter-only search, or a
@@ -1871,6 +1896,164 @@ mod tests {
         r0.snippet_chars = 20;
         let r = search(&index, &f, &r0).unwrap();
         assert_eq!(r.hits[0].snippet, "Read /home/user/sess…");
+    }
+
+    /// `snippet_field` is what the UI labels the excerpt with — "matched in what the tool
+    /// printed", "matched in the model's thinking". A label that is always `text` is a
+    /// misattributed quote, and it looks exactly like a correct one.
+    #[test]
+    fn a_snippet_reports_the_body_it_was_actually_cut_from() {
+        let mut printed = blank_doc(0);
+        printed.kind = DocKind::ToolCall;
+        printed.role = "assistant".into();
+        printed.tool_name = Some("Bash".into());
+        printed.text = "Bash\ncargo test".into();
+        printed.tool_output = Some("error: linker `cc` not found — quernstone".into());
+
+        let mut thought = blank_doc(1);
+        thought.role = "assistant".into();
+        thought.text = "the visible answer".into();
+        thought.thinking = Some("a private deliberation about parsnips".into());
+
+        let mut failed = blank_doc(2);
+        failed.kind = DocKind::ToolCall;
+        failed.role = "assistant".into();
+        failed.tool_name = Some("Cargo".into());
+        failed.text = "Cargo\ncargo build".into();
+        failed.tool_output = Some("error: could not compile session-search".into());
+        failed.is_error = true;
+
+        let (index, f) = index_docs(&[printed, thought, failed]);
+
+        // The term is in `tool_output` only; the call side is a tool name and a command line.
+        let r = search(&index, &f, &req("quernstone")).unwrap();
+        assert_eq!(r.hits.len(), 1);
+        assert_eq!(r.hits[0].snippet_field, SnippetSource::ToolOutput);
+        let hit = &r.hits[0];
+        let marked: Vec<&str> = hit
+            .snippet_marks
+            .iter()
+            .map(|m| &hit.snippet[m.clone()])
+            .collect();
+        assert_eq!(
+            marked,
+            vec!["quernstone"],
+            "the marks name the matched span and nothing else: {:?}",
+            hit.snippet
+        );
+
+        let r0 = SearchRequest {
+            include_thinking: true,
+            ..req("parsnips")
+        };
+        let r = search(&index, &f, &r0).unwrap();
+        assert_eq!(r.hits.len(), 1);
+        assert_eq!(r.hits[0].snippet_field, SnippetSource::Thinking);
+
+        // `--errors-only` carries no free-text query, so it always lands in the fallback. A
+        // failed call leads with its result, and the label has to follow it there.
+        let mut r0 = SearchRequest::default();
+        r0.filters.errors_only = true;
+        let r = search(&index, &f, &r0).unwrap();
+        assert_eq!(r.hits.len(), 1);
+        assert_eq!(r.hits[0].snippet_field, SnippetSource::ToolOutput);
+        assert!(r.hits[0].snippet.starts_with("error: could not compile"));
+        assert!(
+            r.hits[0].snippet_marks.is_empty(),
+            "an excerpt marks nothing"
+        );
+    }
+
+    /// A sort silently running backwards produces plausible output, so only the order itself
+    /// can catch it.
+    #[test]
+    fn a_time_sort_orders_by_timestamp_in_the_direction_it_names() {
+        // Deliberately not in `seq` order: a collector that ignored `sort` and returned docs
+        // in insertion order would pass against an already-sorted corpus.
+        // Whole seconds apart: the `timestamp` fast field stores seconds, so docs that differ
+        // only in milliseconds tie and come back in insertion order — which would make this
+        // test pass without the sort doing anything.
+        let docs: Vec<Doc> = [(0u64, 300i64), (1, 100), (2, 500), (3, 200), (4, 400)]
+            .into_iter()
+            .map(|(seq, seconds)| {
+                let mut d = blank_doc(seq);
+                d.text = "tantivy ordering probe".into();
+                d.timestamp_ms = Some(1_700_000_000_000 + seconds * 1000);
+                d
+            })
+            .collect();
+        let (index, f) = index_docs(&docs);
+
+        let ids = |sort, offset, facets: &[&str]| -> Vec<String> {
+            let r0 = SearchRequest {
+                sort,
+                offset,
+                facets: facets.iter().map(|s| (*s).to_string()).collect(),
+                ..req("probe")
+            };
+            search(&index, &f, &r0)
+                .unwrap()
+                .hits
+                .iter()
+                .map(|h| h.doc.doc_id.clone())
+                .collect()
+        };
+
+        let newest = ["s1:-:2", "s1:-:4", "s1:-:0", "s1:-:3", "s1:-:1"];
+        let oldest: Vec<&str> = newest.iter().rev().copied().collect();
+        assert_eq!(ids(SortBy::Newest, 0, &[]), newest);
+        assert_eq!(ids(SortBy::Oldest, 0, &[]), oldest);
+
+        // Faceting builds a second collector tuple, and paging goes through `and_offset`;
+        // either could be wired to a differently-ordered `TopDocs` without the plain case
+        // noticing.
+        assert_eq!(ids(SortBy::Newest, 0, &["tool_name"]), newest);
+        assert_eq!(ids(SortBy::Newest, 2, &[]), newest[2..]);
+        assert_eq!(ids(SortBy::Oldest, 2, &["tool_name"]), oldest[2..]);
+    }
+
+    /// A document with no timestamp has no value in the fast field at all. Tantivy sorts on
+    /// `Option<T>` and orders `None` last either way, so such a document is still returned —
+    /// which is what keeps `total` honest, since `Count` has no idea the sort exists.
+    #[test]
+    fn a_time_sort_still_returns_a_document_that_has_no_timestamp() {
+        let mut docs: Vec<Doc> = [(0u64, 100i64), (1, 200)]
+            .into_iter()
+            .map(|(seq, seconds)| {
+                let mut d = blank_doc(seq);
+                d.text = "undated probe".into();
+                d.timestamp_ms = Some(1_700_000_000_000 + seconds * 1000);
+                d
+            })
+            .collect();
+        let mut undated = blank_doc(2);
+        undated.text = "undated probe".into();
+        undated.timestamp_ms = None;
+        docs.push(undated);
+        let (index, f) = index_docs(&docs);
+
+        for sort in [SortBy::Newest, SortBy::Oldest] {
+            let r = search(
+                &index,
+                &f,
+                &SearchRequest {
+                    sort,
+                    ..req("undated")
+                },
+            )
+            .unwrap();
+            let ids: Vec<&str> = r.hits.iter().map(|h| h.doc.doc_id.as_str()).collect();
+            assert_eq!(
+                r.hits.len(),
+                r.total,
+                "{sort:?}: every counted match must be reachable, got {ids:?}"
+            );
+            assert_eq!(
+                ids.last(),
+                Some(&"s1:-:2"),
+                "{sort:?}: the undated document sorts last, not first and not away"
+            );
+        }
     }
 
     #[test]

@@ -201,10 +201,14 @@ export function iconFor(name) {
 
 export function debounce(fn, ms) {
   let timer = 0;
-  return (...args) => {
+  const run = (...args) => {
     clearTimeout(timer);
     timer = setTimeout(() => fn(...args), ms);
   };
+  /** Drop a scheduled call. For the caller who decided to act *now* and would otherwise get
+   *  the debounced one landing on top of it a moment later. */
+  run.cancel = () => clearTimeout(timer);
+  return run;
 }
 
 /** Bytes as a short human string. */

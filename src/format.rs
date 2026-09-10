@@ -1090,6 +1090,7 @@ mod tests {
             score,
             snippet: snippet.into(),
             snippet_field: crate::search::SnippetSource::Text,
+            snippet_marks: Vec::new(),
         }
     }
 

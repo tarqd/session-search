@@ -33,7 +33,13 @@ use crate::model::{
 // pinned public types
 // ---------------------------------------------------------------------------
 
+/// `rename_all` so that serde spells these the way everything else does: it is the value the
+/// `kind` field stores, the value `--kind` filters on, and the value the API documents. The
+/// derive's default is the Rust variant name, `"ToolCall"`, which is a spelling nothing in this
+/// system accepts — and a consumer switching on it fails silently, since a document that is not
+/// a tool call is a perfectly ordinary thing to be.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum DocKind {
     Message,
     ToolCall,
@@ -1541,6 +1547,22 @@ fn truncate_chars(s: &str, max_chars: usize) -> String {
 
 #[cfg(test)]
 mod tests {
+    /// One vocabulary, three spellings of it — the stored field, the CLI flag, and serde. They
+    /// have to agree, and nothing else in the codebase would notice if they stopped.
+    #[test]
+    fn dockind_serializes_as_the_value_the_index_and_the_cli_use() {
+        for kind in [super::DocKind::Message, super::DocKind::ToolCall] {
+            assert_eq!(
+                serde_json::to_value(kind).unwrap(),
+                serde_json::Value::String(kind.as_str().to_string())
+            );
+            assert_eq!(
+                serde_json::from_value::<super::DocKind>(serde_json::json!(kind.as_str())).unwrap(),
+                kind
+            );
+        }
+    }
+
     use super::*;
 
     fn fixture(name: &str) -> PathBuf {

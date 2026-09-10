@@ -147,6 +147,8 @@ Response:
   "totalPages": 22,
   "pagingStart": 1,
   "pagingEnd": 20,
+  "current": 1,                        // the page and size actually used, echoed back: a
+  "resultsPerPage": 20,                // request that said neither still has to say which
   "requestId": "",
   "resultSearchTerm": "memmap SIGBUS",
   "wasSearched": true,
@@ -174,7 +176,10 @@ those are errors.
 `snippet` is **HTML**: the text is escaped first and the matched spans are then wrapped in
 `<em>`, which is the convention Elastic's own snippets follow (and what every Search UI
 template expects to `dangerouslySetInnerHTML`). The unescaped, `**`-marked form the CLI
-prints is in `_meta.doc` only by way of the plain body text.
+prints is in `_meta.doc` only by way of the plain body text. Which spans those are comes from
+`Hit::snippet_marks`, recorded where the markers are written: a `**` in the body — every turn
+that read a markdown file has some — is otherwise indistinguishable from the highlighter's,
+and emphasis on a word the caller did not search for is a wrong answer given confidently.
 
 ### `GET /api/search` — the same envelope, for `curl`
 
@@ -214,8 +219,15 @@ honesty fields spelled out:
                   "messages": 214, "tool_calls": 96, "first_prompt": "…",
                   "description": null,
                   "key": "9f2c…" } ],   // key = session_id[:agent_id], the display id
-  "total": 12 }
+  "total": 12,
+  "warnings": [] }
 ```
+
+`total` counts the sessions that matched, not the ones `?limit=` returned. `warnings` says what
+the listing could not honour: `sessions.json` holds one row per transcript and no per-message
+field, so `?model=` is accepted (it is in the parameter list) and then ignored — and an ignored
+filter that quietly returns the unfiltered listing is indistinguishable from a filter that
+matched everything.
 
 ### `GET /api/sessions/{session_id}` and `GET /api/sessions/{session_id}/around`
 
@@ -395,8 +407,10 @@ pub const SESSION_LIST_PARAMS: &[&str];
 pub fn api_doc(doc: &crate::parse::Doc, include_raw: bool) -> serde_json::Value;
 pub fn facet_json(f: &crate::search::FacetResult) -> serde_json::Value;
 pub fn session_json(info: &crate::parse::SessionInfo) -> serde_json::Value;
-/// `**marked**` plain text -> HTML-escaped text with `<em>` around the marked spans.
-pub fn highlight_html(snippet: &str) -> String;
+/// `**marked**` plain text -> HTML-escaped text with `<em>` around the marked spans. The
+/// ranges are `Hit::snippet_marks`: transcript bodies contain `**` of their own, so the
+/// marked string alone cannot say which markers the highlighter wrote.
+pub fn highlight_html(snippet: &str, marks: &[std::ops::Range<usize>]) -> String;
 /// The `Filters` a session listing honours, from a query string.
 pub fn session_filters(p: &Params) -> Result<(crate::search::Filters, usize), String>;
 ```
@@ -409,3 +423,21 @@ pub struct ServeOptions { pub host: String, pub port: u16, pub cors: Vec<String>
 pub fn serve(index_dir: &std::path::Path, opts: ServeOptions, out: &mut impl std::io::Write)
     -> anyhow::Result<()>;
 ```
+
+## Known limitations
+
+**A reader is rebuilt per request.** `search::search`, `search::facets`, `context::session` and
+`context::around` take `&Index` and call `index.reader()` themselves — a shape inherited from
+the CLI, where a process did it once and exited. Under the server that re-parses `meta.json`
+and reopens every segment on every request. It is not what makes an outside commit visible
+(`ReloadPolicy::OnCommitWithDelay` already does that on a long-lived reader), so the fix is to
+hold one `IndexReader` in `AppState` and pass a `&Searcher` down — `docs_by_seq` already takes
+one. That is a change to the pinned core signatures for the sake of a local tool's request
+rate, so it is recorded rather than smuggled in alongside the server.
+
+**No authentication, and no plan for any.** The bind address is the whole security model. That
+is why the default is loopback and why a non-loopback `--host` warns.
+
+**Sorting is relevance or time, nothing else.** There is no ordering by session, project or
+tool, because none of them has a meaning a reader could predict. `sortList` naming any field
+but `timestamp` is a `400` rather than a silently ignored request.
