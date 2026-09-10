@@ -68,6 +68,8 @@ pub struct IndexOptions {
     /// Follow `Full output saved to: <path>` pointers into `tool-results/<id>.txt`, so an
     /// oversized tool result is searchable rather than just its "output too large" stub.
     pub load_spilled_results: bool,
+    /// Cap on each indexed body field of one document. See [`crate::parse::ParseOptions`] for
+    /// why the default is where it is.
     pub max_text_bytes: usize,
     pub heap_bytes: usize,
 }
@@ -79,7 +81,7 @@ impl Default for IndexOptions {
             jobs: None,
             include_thinking: true,
             load_spilled_results: true,
-            max_text_bytes: 32 * 1024,
+            max_text_bytes: 1024 * 1024,
             heap_bytes: 200 * 1024 * 1024,
         }
     }
@@ -1377,7 +1379,14 @@ mod tests {
         let doc = &found.hits[0].doc;
         assert_eq!(doc.tool_name.as_deref(), Some("Bash"));
         assert_eq!(doc.tool_input.as_ref().unwrap()["command"], "cargo build");
-        assert!(doc.text.contains("Finished"), "{:?}", doc.text);
+        assert!(doc.text.contains("cargo build"), "{:?}", doc.text);
+        assert!(
+            doc.tool_output
+                .as_deref()
+                .is_some_and(|o| o.contains("Finished")),
+            "{:?}",
+            doc.tool_output
+        );
 
         // A third run with nothing new must still add nothing.
         assert_eq!(fx.index().docs_added, 0);

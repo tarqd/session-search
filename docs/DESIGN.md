@@ -17,6 +17,10 @@ errors. A CLI now; an `mcp` subcommand serving the same operations over stdio ne
 - **One doc per message, one doc per tool call.** Hits are precise and facetable; the CLI
   expands a hit to surrounding turns on demand.
 - **Indexed text:** user prompts, assistant text, tool inputs, tool results (size-capped).
+  A tool call's result lives in its own `tool_output` field rather than being concatenated
+  onto `text`, so `tool_output:"No such file"` asks about what a tool *returned* and
+  `text:...` about what it was asked to do. Both are default query fields, so a bare query
+  still spans the pair.
   Assistant **thinking is stored but not indexed** — `--include-thinking` opts in, default off.
 - **Incremental one-shot indexing** keyed on (size, mtime, byte offset) per file.
   The read commands (`search`, `facets`, `show`, `sessions`) auto-refresh unless `--no-refresh`;
@@ -161,6 +165,7 @@ pub struct Doc {
     pub tool_name: Option<String>,
     pub tool_use_id: Option<String>,
     pub tool_input: Option<serde_json::Value>,
+    pub tool_output: Option<String>, // the joined tool_result, indexed in its own right
     pub is_error: bool,
     pub is_sidechain: bool,
     pub is_meta: bool,           // compaction summaries, meta turns — excluded from "human prompt"
@@ -287,6 +292,7 @@ Field names and options:
 | `project_facet` | `FacetOptions` — hierarchical, `/home/user/session-search` |
 | `tool_input` | JSON, indexed + `set_fast(Some("raw"))` + `set_expand_dots_enabled()` + stored |
 | `text` | `TEXT \| STORED` |
+| `tool_output` | `TEXT \| STORED` |
 | `thinking` | `TEXT \| STORED` (only populated when `include_thinking`) |
 | `thinking_tokens` | `U64 \| FAST \| STORED \| INDEXED` — per-message reasoning cost |
 | `timestamp` | date field, `INDEXED \| STORED \| FAST` (tantivy 0.26 has no `DATE` flag const; `add_date_field` takes the numeric flags) |
@@ -304,7 +310,8 @@ pub struct IndexOptions {
                                      // into `tool-results/<id>.txt`, else an oversized tool
                                      // result is only its "output too large" stub. CLI:
                                      // `index --no-spilled-results` opts out.
-    pub max_text_bytes: usize,   // default 32 * 1024, and it caps the spill too
+    pub max_text_bytes: usize,   // per body field, 1 MiB default; caps the spill too.
+                                 // CLI: `index --max-text-bytes N`
     pub heap_bytes: usize,       // default 200 MB
 }
 pub struct IndexStats {
@@ -333,11 +340,18 @@ first to emit — repeated with the same value on up to four of them, so it is c
 `message.id` on a record that actually carries it (`ParseCarry::charged_message_ids` keeps that
 true across an incremental boundary). Filter with `--min-thinking N`.
 
-A tool-call document's body is `name`, the input's own strings, and the result text — but when
-the call **failed** the result leads, since then it is the answer and the input is only context.
-`Parser::tool_call_body` is shared with the incremental completion path: a document finished
-across a boundary must be byte-identical to one a whole-file parse produced, and for a failed call
-that cannot be reached by appending, because the result belongs *before* the input.
+A tool-call document is two fields: `text` is `name` plus the input's own strings
+(`Parser::tool_call_body`), and `tool_output` is the result. A document finished across an
+incremental boundary must be byte-identical to one a whole-file parse produced — which is now
+straightforward, since `text` is the call side and the arriving result only fills in
+`tool_output`.
+
+**A failed call previews its result first.** `--errors-only` otherwise retrieves exactly the
+right documents and shows the command that failed rather than the reason it broke — on a real
+corpus the error sat 1,000–2,400 characters into the body, past a heredoc. This is a rendering
+rule (`format::doc_body`, and the no-snippet fallback in `search`), not a storage one: with the
+result in a field of its own there is no ordering inside a body to get wrong, and nothing is
+reordered underneath a query.
 
 Incremental rules:
 - Watermark per file: `{size, mtime_ms, byte_offset, docs, carry}`.
@@ -365,6 +379,7 @@ Incremental rules:
 #[derive(Debug, Clone, Default)]
 pub struct Filters {
     pub project: Option<String>, pub tool: Vec<String>, pub tool_input: Vec<String>, // "key=value"
+    pub tool_output: Vec<String>,   // phrases the result must contain, ANDed
     pub branch: Option<String>, pub model: Option<String>, pub role: Option<String>,
     pub kind: Option<String>, pub session: Option<String>, pub agent_type: Option<String>,
     pub since: Option<String>, pub until: Option<String>,   // RFC3339 or YYYY-MM-DD or "7d"
@@ -405,13 +420,16 @@ pub fn facets(index: &tantivy::Index, f: &Fields, field: &str, req: &SearchReque
     -> anyhow::Result<FacetResult>;
 ```
 
-Query semantics: the free-text query goes through `QueryParser` over `text` (+ `thinking` when
-opted in, + `tool_input`), so phrases, booleans and `field:value` all work. **There is no fuzzy
+Query semantics: the free-text query goes through `QueryParser` over `text` and `tool_output`
+(+ `thinking` when opted in, + `tool_input`), so phrases, booleans and `field:value` all work.
+`tool_output` is a *default* field, not an opt-in one: the result text used to live in `text`,
+and leaving it out would make a bare query stop matching what it always matched. **There is no fuzzy
 operator**: `~` is phrase slop in Tantivy 0.26 and `set_field_fuzzy` is deliberately not wired
 up, so do not advertise `term~1`. A query that fails to parse falls back to
 `parse_query_lenient`, and the discarded errors are logged at WARN — a typo'd field name must
 not look like an empty corpus. Filters are ANDed on top as term/range queries. `--tool-input
-k=v` becomes a term query on `tool_input.k` for `v`; an empty key *or value* is an error, not a
+k=v` becomes a term query on `tool_input.k` for `v`; `--tool-output TEXT` becomes a phrase
+query on `tool_output`, repeatable and ANDed; an empty key *or value* is an error, not a
 silent zero. `project` matches by prefix **on a path boundary**, so `-p ~/code` catches
 subdirectories but `-p ~/code` does not catch `~/code-scratch`; `--session` is a bare character
 prefix, so the leading block of a uuid is enough (`show` resolves an unambiguous id prefix the
@@ -463,7 +481,8 @@ session-search show <SESSION_ID> [--agent AGENT_ID] [--around UUID|SEQ]
 session-search sessions [FILTERS] [--limit N] [--json] [--no-refresh]
 session-search stats [--json]
 
-FILTERS: -p/--project P  -t/--tool T  --tool-input k=v  --branch B  --model M
+FILTERS: -p/--project P  -t/--tool T  --tool-input k=v  --tool-output TEXT
+         --branch B  --model M
          --role R  --kind message|tool_call  --session S  --agent-type A
          --since D  --until D  --errors-only  --no-sidechains  --sidechains-only
 ```
