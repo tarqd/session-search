@@ -83,6 +83,11 @@ pub struct Doc {
     pub tool_output: Option<String>,
     /// Stored; indexed only with `include_thinking`.
     pub thinking: Option<String>,
+    /// `usage.output_tokens_details.thinking_tokens`, attached to exactly ONE document per API
+    /// message so sums and facets are not multiplied by the block count. Remote and web
+    /// sessions strip the thinking *text* but keep this, so it is the only surviving measure of
+    /// where a session stopped to reason.
+    pub thinking_tokens: Option<u64>,
     /// The original JSONL line.
     pub raw: String,
 }
@@ -185,6 +190,10 @@ pub struct ParseCarry {
     pub pending_tool_uses: Vec<PendingToolCall>,
     /// API `message.id`s already counted towards [`SessionInfo::messages`].
     pub counted_message_ids: Vec<String>,
+    /// API `message.id`s whose thinking cost has already been charged to a document. Separate
+    /// from `counted_message_ids` because the record carrying `thinking_tokens` is usually the
+    /// `tool_use` one, not whichever block record emitted first.
+    pub charged_message_ids: Vec<String>,
     /// `(start offset, hash)` of the last complete line consumed.
     pub tail_line: Option<TailLine>,
 }
@@ -380,6 +389,8 @@ struct Parser<'a> {
     /// API `message.id`s already counted, seeded from the carry so a tail boundary inside one
     /// message does not count it twice.
     counted_message_ids: HashSet<String>,
+    charged_message_ids: HashSet<String>,
+    charged_order: Vec<String>,
     /// The same ids in arrival order, so the carry can keep the most recent ones.
     counted_order: Vec<String>,
     last_uuid: Option<String>,
@@ -423,6 +434,8 @@ impl<'a> Parser<'a> {
             sidecars: BTreeMap::new(),
             last_prompt: None,
             counted_message_ids: ctx.carry.counted_message_ids.iter().cloned().collect(),
+            charged_message_ids: ctx.carry.charged_message_ids.iter().cloned().collect(),
+            charged_order: ctx.carry.charged_message_ids.clone(),
             counted_order: ctx.carry.counted_message_ids.clone(),
             last_uuid: None,
             tail_line: ctx.carry.tail_line,
@@ -768,6 +781,10 @@ impl<'a> Parser<'a> {
                 continue;
             };
             let mut doc = doc.clone();
+            // `text` is the call side, which the result cannot change, so completing a
+            // document only fills in `tool_output`. Byte-identity with a whole-file parse is
+            // what it always was; it no longer depends on rebuilding the body, because there
+            // is no longer an ordering inside it to get wrong.
             doc.tool_output =
                 Some(truncate(&outcome.text, self.opts.max_text_bytes)).filter(|s| !s.is_empty());
             doc.is_error = outcome.is_error;
@@ -811,7 +828,19 @@ impl<'a> Parser<'a> {
         ParseCarry {
             pending_tool_uses: pending,
             counted_message_ids: tail_of(self.counted_order.clone(), CARRY_CAP),
+            charged_message_ids: tail_of(self.charged_order.clone(), CARRY_CAP),
             tail_line: self.tail_line,
+        }
+    }
+
+    /// Claim a message's thinking cost. Returns false if it was already charged, including in
+    /// an earlier incremental run.
+    fn charge_message(&mut self, id: &str) -> bool {
+        if self.charged_message_ids.insert(id.to_string()) {
+            self.charged_order.push(id.to_string());
+            true
+        } else {
+            false
         }
     }
 
@@ -1009,6 +1038,7 @@ impl<'a> Parser<'a> {
         let mut counted = id
             .as_deref()
             .is_some_and(|id| self.counted_message_ids.contains(id));
+        let first_emitted = out.len();
 
         for block in msg.content.blocks() {
             match block {
@@ -1050,6 +1080,46 @@ impl<'a> Parser<'a> {
                 _ => {}
             }
         }
+
+        // `thinking_tokens` is a per-message total that appears on *some* of the message's
+        // block records — usually the `tool_use` one, not the first to emit — and is repeated
+        // on 1 to 4 of them with the same value. So charge it on a record that actually carries
+        // it, once per message, or the sum is multiplied by however many records repeated it.
+        if let Some(tokens) = msg
+            .usage
+            .as_ref()
+            .and_then(|u| u.output_tokens_details.as_ref())
+            .and_then(|d| d.thinking_tokens)
+            .filter(|n| *n > 0)
+            && let Some(doc) = out.get_mut(first_emitted)
+            && id.as_deref().is_none_or(|id| self.charge_message(id))
+        {
+            doc.thinking_tokens = Some(tokens);
+        }
+    }
+
+    /// The indexed body of a tool-call document: the tool name and the input's own strings, so
+    /// `Bash cargo build` matches on `text` as well as through `tool_input.command`.
+    ///
+    /// The result is NOT here — it is a field of its own, `tool_output`. That is what retired
+    /// the ordering this function used to carry: a failed call's body used to lead with the
+    /// error, because a preview of `text` otherwise showed a heredoc and never the one line
+    /// saying what broke. With two fields the same guarantee is a rendering decision instead
+    /// (`format::doc_body`, and the snippet fallback in `search`), which reaches the previews
+    /// that motivated it without reordering bytes anyone might later search.
+    fn tool_call_body(&self, name: Option<&str>, input: Option<&serde_json::Value>) -> String {
+        // A quarter of the budget, as before this field existed: `text` no longer shares its
+        // budget with the result, but a `Write` payload is still not worth 32 KB of it.
+        let input_budget = self.opts.max_text_bytes / 4;
+        let name = name.unwrap_or_default();
+        let input = input
+            .map(|i| truncate(&string_leaves(i).join("\n"), input_budget))
+            .unwrap_or_default();
+        let mut body = String::with_capacity(name.len() + input.len() + 1);
+        body.push_str(name);
+        body.push('\n');
+        body.push_str(&input);
+        body
     }
 
     fn tool_call_doc(&self, tu: &ToolUseBlock) -> PartialDoc {
@@ -1060,20 +1130,7 @@ impl<'a> Parser<'a> {
             .cloned()
             .unwrap_or_default();
 
-        // Index the input's own strings, so `Bash cargo build` matches on `text` as well as
-        // through `tool_input.command`. The same quarter-of-the-budget cap as before this
-        // field existed: `text` no longer shares its budget with the result, but a `Write`
-        // payload is still not worth 32 KB of it.
-        let input_budget = self.opts.max_text_bytes / 4;
-        let mut body = String::new();
-        if let Some(name) = &tu.name {
-            body.push_str(name);
-            body.push('\n');
-        }
-        if let Some(input) = &tu.input {
-            body.push_str(&truncate(&string_leaves(input).join("\n"), input_budget));
-            body.push('\n');
-        }
+        let body = self.tool_call_body(tu.name.as_deref(), tu.input.as_ref());
 
         PartialDoc::tool_call(
             tu.name.clone(),
@@ -1202,6 +1259,7 @@ impl<'a> Parser<'a> {
             text: p.text,
             tool_output: p.tool_output,
             thinking: p.thinking,
+            thinking_tokens: p.thinking_tokens,
             raw: raw.to_string(),
         }
     }
@@ -1215,6 +1273,7 @@ struct PartialDoc {
     text: String,
     tool_output: Option<String>,
     thinking: Option<String>,
+    thinking_tokens: Option<u64>,
     model: Option<String>,
     tool_name: Option<String>,
     tool_use_id: Option<String>,
@@ -1231,6 +1290,7 @@ impl PartialDoc {
             text,
             tool_output: None,
             thinking: None,
+            thinking_tokens: None,
             model: None,
             tool_name: None,
             tool_use_id: None,
@@ -1255,6 +1315,7 @@ impl PartialDoc {
             text,
             tool_output: None,
             thinking: None,
+            thinking_tokens: None,
             model: None,
             tool_name,
             tool_use_id,
@@ -1500,6 +1561,161 @@ mod tests {
     /// two fields a tool call happened to put it in.
     fn body_of(d: &Doc) -> String {
         format!("{}{}", d.text, d.tool_output.as_deref().unwrap_or(""))
+    }
+
+    /// `thinking_tokens` is a per-message total that appears on only *some* of the message's
+    /// block records — in real transcripts usually the `tool_use` one, not the first to emit —
+    /// and is repeated with the same value on up to four of them. Charging per record would
+    /// multiply the total; keying off "the record that emitted first" would miss it entirely,
+    /// which is how a first attempt at this recovered 20,154 of a real 185,472 tokens.
+    #[test]
+    fn thinking_tokens_are_charged_once_on_a_record_that_carries_them() {
+        let block = |idx: u32, uuid: &str, parent: &str, content: &str, usage: &str| {
+            format!(
+                r#"{{"type":"assistant","uuid":"{uuid}","parentUuid":"{parent}","timestamp":"2026-09-09T19:07:19.248Z","sessionId":"sess-1","cwd":"/home/user/proj","gitBranch":"main","version":"2.1.266","isSidechain":false,"apiBlockIndex":{idx},"requestId":"req1","message":{{"role":"assistant","id":"msg1","model":"claude-opus-5","content":[{content}],"usage":{{"output_tokens":623{usage}}}}}}}"#
+            )
+        };
+        let carries = r#","output_tokens_details":{"thinking_tokens":300}"#;
+        let body = [
+            // Emits first, and does NOT carry the count. (On a stripped transcript this block
+            // emits nothing at all, since the thinking text is empty.)
+            block(
+                0,
+                "a1",
+                "u0",
+                r#"{"type":"text","text":"here is the plan"}"#,
+                "",
+            ),
+            // Carries it.
+            block(
+                1,
+                "a2",
+                "a1",
+                r#"{"type":"tool_use","id":"toolu_1","name":"Bash","input":{"command":"ls"}}"#,
+                carries,
+            ),
+            // Repeats the same value; must not be charged twice.
+            block(2, "a3", "a2", r#"{"type":"text","text":"done"}"#, carries),
+        ]
+        .join("\n")
+            + "\n";
+
+        let tmp = tempfile::tempdir().unwrap();
+        let out = parse_body(tmp.path(), "sess-1.jsonl", &body);
+
+        let charged: Vec<u64> = out.docs.iter().filter_map(|d| d.thinking_tokens).collect();
+        assert_eq!(charged, [300], "one message, one charge, on the carrier");
+    }
+
+    /// A failed call's error must be reachable without digging past the command that failed.
+    /// `--errors-only` otherwise retrieves exactly the right documents and then shows the
+    /// command: on a real corpus the error text sat 1,000-2,400 characters in, past a heredoc,
+    /// so every preview was the thing that ran rather than the reason it broke.
+    ///
+    /// The body used to be reordered to fix that. Now the two are separate fields, so the
+    /// error is at offset 0 of its own — and `format::a_failed_tool_call_previews_its_error`
+    /// pins the rendering half, which is what the reorder was really protecting.
+    #[test]
+    fn a_failed_tool_call_keeps_its_error_out_of_the_command() {
+        let dir = tempfile::tempdir().unwrap();
+        let long_input = "x".repeat(600);
+        let body = format!(
+            concat!(
+                r#"{{"type":"assistant","uuid":"a1","sessionId":"s","cwd":"/p","message":{{"role":"assistant","id":"m1","content":[{{"type":"tool_use","id":"t1","name":"Bash","input":{{"command":"cat > f <<'PY'\n{long_input}"}}}}]}}}}"#,
+                "\n",
+                r#"{{"type":"user","uuid":"u1","sessionId":"s","cwd":"/p","message":{{"role":"user","content":[{{"type":"tool_result","tool_use_id":"t1","is_error":true,"content":"InputValidationError: JSON parse failed"}}]}},"toolUseResult":"InputValidationError: JSON parse failed"}}"#,
+                "\n",
+            ),
+            long_input = long_input
+        );
+        let out = parse_body(dir.path(), "e.jsonl", &body);
+
+        let doc = out
+            .docs
+            .iter()
+            .find(|d| d.kind == DocKind::ToolCall)
+            .expect("a tool call");
+        assert!(doc.is_error);
+        let output = doc.tool_output.as_deref().expect("error indexed");
+        assert!(
+            output.starts_with("InputValidationError"),
+            "the error is the whole of its field, not buried in one: {output:?}"
+        );
+        assert!(
+            doc.text.contains("cat > f"),
+            "the command is still indexed, on the call side"
+        );
+        assert!(
+            !doc.text.contains("InputValidationError"),
+            "and the error is not also duplicated into it"
+        );
+    }
+
+    /// The reorder is only safe if the incremental path rebuilds the body rather than appending
+    /// to it — a failed call needs its result inserted *before* the input, which no append can
+    /// do. This is the byte-identity invariant, for the error case specifically.
+    #[test]
+    fn a_failed_call_completed_across_a_boundary_matches_a_whole_file_parse() {
+        let dir = tempfile::tempdir().unwrap();
+        let head = concat!(
+            r#"{"type":"assistant","uuid":"a1","sessionId":"s","cwd":"/p","message":{"role":"assistant","id":"m1","content":[{"type":"tool_use","id":"t1","name":"Bash","input":{"command":"set -e\nbroken"}}]}}"#,
+            "\n",
+        );
+        let tail = concat!(
+            r#"{"type":"user","uuid":"u1","sessionId":"s","cwd":"/p","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"t1","is_error":true,"content":"Error: exit 1"}]},"toolUseResult":"Error: exit 1"}"#,
+            "\n",
+        );
+        let path = dir.path().join("split-err.jsonl");
+
+        // Split parse: the tool_use in one run, its failure in the next.
+        std::fs::write(&path, head).unwrap();
+        let (first, offset) = parse_file(
+            &path,
+            0,
+            0,
+            &ParseOptions::default(),
+            &FileContext::default(),
+        )
+        .unwrap();
+        std::fs::write(&path, format!("{head}{tail}")).unwrap();
+        let ctx = FileContext {
+            carry: first.carry.clone(),
+            ..FileContext::default()
+        };
+        let (second, _) = parse_file(
+            &path,
+            offset,
+            first.docs.len() as u64,
+            &ParseOptions::default(),
+            &ctx,
+        )
+        .unwrap();
+
+        let completed = second
+            .replacements
+            .iter()
+            .find(|d| d.tool_use_id.as_deref() == Some("t1"))
+            .expect("the pending document is completed, not duplicated");
+
+        // Whole-file parse of the same bytes.
+        let whole = parse_body(dir.path(), "whole-err.jsonl", &format!("{head}{tail}"));
+        let expected = whole
+            .docs
+            .iter()
+            .find(|d| d.tool_use_id.as_deref() == Some("t1"))
+            .expect("a tool call");
+
+        assert_eq!(completed.text, expected.text, "body must be byte-identical");
+        assert_eq!(
+            completed.tool_output, expected.tool_output,
+            "and so must the result"
+        );
+        assert_eq!(completed.is_error, expected.is_error);
+        assert_eq!(
+            completed.tool_output.as_deref(),
+            Some("Error: exit 1"),
+            "the error is the result field, whichever side of the boundary it arrived on"
+        );
     }
 
     // -- file-level hazards -------------------------------------------------

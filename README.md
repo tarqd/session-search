@@ -450,6 +450,13 @@ kind  2 values · 978 of 978 matching docs have a value
 And `search --facets a,b` returns hits and aggregations in one pass, so a single call answers
 "show me the top matches *and* the distribution behind them".
 
+> **Colons.** `tool_input` is a JSON field in the default search fields, so `word:value` is a
+> lookup on that JSON subpath — which is why `command:cargo` works as shorthand for
+> `tool_input.command:cargo`. A colon followed by whitespace or `/` is treated as ordinary
+> punctuation instead, so `https://github.com` and `note: this` search as text. If an
+> unqualified `word:value` returns nothing, the tool says so on stderr rather than letting a
+> misread colon look like an empty corpus; quote the term to force a literal search.
+
 > One asymmetry worth knowing: **facets key on the raw, untokenized value; search matches words
 > inside it.** So `facets tool_input.command` shows whole command lines, while
 > `search --tool-input command=cargo` matches any command *containing* `cargo`. That is
@@ -915,11 +922,21 @@ waits for `index --full`.
 and `elapsed 0 ms` — meaningless for a static read — and labels the index's document count as
 `documents added`.
 
-**Thinking is off by default and index-time.** `--include-thinking` on `index` decides whether
-thinking blocks are searchable at all; `--include-thinking` on `search` only opts the query into
-them. Flipping the index-time one requires `index --full`. Note also that remote sessions strip
-thinking text before it reaches disk, so on some machines every thinking block is empty and there
-is nothing to index either way.
+**Thinking is indexed but not searched by default.** `index` stores thinking blocks unless you
+pass `--no-thinking`; `search --include-thinking` opts a query into them. So the common case needs
+no rebuild — only opting *out* and back in does.
+
+Remote and web sessions strip thinking text before it reaches disk: the block survives with its
+`signature` intact but `"thinking": ""`, so on those machines there is nothing to index. Empty
+blocks are skipped rather than indexed as blank documents — in a corpus with 453 stripped blocks,
+the index holds none of them. What *does* survive is the cost: `thinking_tokens` is indexed as a
+fast field, so `--min-thinking N` and `facets thinking_tokens` still find the turns where the
+model stopped to reason, even when you cannot read what it reasoned about.
+
+**Changing what is indexed needs `index --full`.** The watermarks say a file is unchanged, so
+they will not re-read it. This applies to `--no-thinking`, `--no-spilled-results`, and to any
+release that changes how a document body is built — for instance the one that split a tool
+call's result out of `text` into its own `tool_output` field.
 
 **Snippet markers can collide with the text.** Matches are wrapped in `**…**`; if the indexed text
 already contains `**` (this tool's own Markdown output, for instance) you will see `****term****`.

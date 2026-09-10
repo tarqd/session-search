@@ -180,16 +180,21 @@ fn hit_json(hit: &Hit, context: &[Doc]) -> Value {
 
 /// Whichever body a document actually has. A tool call with no input, and an orphaned
 /// `tool_result`, both carry an empty `text` and everything worth showing in `tool_output`.
+///
+/// **A failed call shows its result first.** `--errors-only` otherwise retrieves exactly the
+/// right documents and previews the command that failed rather than the reason it broke — the
+/// error is the answer there, and the input is only context.
 fn doc_body(d: &Doc) -> &str {
-    [
-        Some(d.text.as_str()),
-        d.tool_output.as_deref(),
-        d.thinking.as_deref(),
-    ]
-    .into_iter()
-    .flatten()
-    .find(|b| !b.trim().is_empty())
-    .unwrap_or("")
+    let (first, second) = if d.is_error {
+        (d.tool_output.as_deref(), Some(d.text.as_str()))
+    } else {
+        (Some(d.text.as_str()), d.tool_output.as_deref())
+    };
+    [first, second, d.thinking.as_deref()]
+        .into_iter()
+        .flatten()
+        .find(|b| !b.trim().is_empty())
+        .unwrap_or("")
 }
 
 /// The stable JSON shape of one document. `raw` is deliberately not included.
@@ -686,10 +691,44 @@ fn session_json(info: &SessionInfo) -> Value {
 // ---------------------------------------------------------------------------
 
 pub fn stats(w: &mut impl Write, s: &IndexStats, o: &OutputOpts) -> Result<()> {
+    stats_scoped(w, s, &[], o)
+}
+
+/// [`stats`] that also names the corpus the index is bound to. Worth printing: a count is
+/// meaningless without knowing what it counted over, and an index silently holding a corpus
+/// the caller did not expect is exactly the failure this guards against.
+pub fn stats_scoped(
+    w: &mut impl Write,
+    s: &IndexStats,
+    roots: &[std::path::PathBuf],
+    o: &OutputOpts,
+) -> Result<()> {
     if o.json {
-        return json_line(w, &serde_json::to_value(s)?);
+        let mut value = serde_json::to_value(s)?;
+        if let Some(object) = value.as_object_mut() {
+            object.insert(
+                "roots".into(),
+                json!(
+                    roots
+                        .iter()
+                        .map(|r| r.display().to_string())
+                        .collect::<Vec<_>>()
+                ),
+            );
+        }
+        return json_line(w, &value);
     }
     let ink = Ink::new(o.color);
+    if !roots.is_empty() {
+        for (i, root) in roots.iter().enumerate() {
+            writeln!(
+                w,
+                "  {}  {}",
+                ink.paint(if i == 0 { "corpus" } else { "      " }, dim()),
+                ink.paint(&root.display().to_string(), bold()),
+            )?;
+        }
+    }
     let rows: [(&str, String); 8] = [
         ("files scanned", thousands(s.files_scanned as u64)),
         ("files updated", thousands(s.files_updated as u64)),
@@ -1028,6 +1067,7 @@ mod tests {
             text: text.into(),
             tool_output: None,
             thinking: None,
+            thinking_tokens: None,
             raw: "{\"type\":\"user\"}".into(),
         }
     }
@@ -1452,6 +1492,51 @@ mod tests {
         pending.tool_output = None;
         let out = render(|w| session_view(w, &[pending], &plain()));
         assert!(!out.contains("\n\n\n"), "{out:?}");
+    }
+
+    /// The behaviour `6fc7afe` won by reordering the stored body, now kept at the render
+    /// layer: a failed call previews the error, not the heredoc that failed. `--errors-only`
+    /// carries no free-text query, so it lands in the no-snippet fallback every time.
+    #[test]
+    fn a_failed_tool_call_previews_its_error() {
+        let long = format!("cat > f <<'PY'\n{}", "x".repeat(600));
+        let mut failed = tool_doc(
+            9,
+            "Bash",
+            json!({ "command": long.clone() }),
+            &format!("Bash\n{long}"),
+        );
+        failed.is_error = true;
+        failed.tool_output = Some("InputValidationError: JSON parse failed".into());
+
+        assert!(
+            doc_body(&failed).starts_with("InputValidationError"),
+            "{:?}",
+            doc_body(&failed)
+        );
+
+        // An empty snippet is what a filter-only search such as `--errors-only` produces. The
+        // hit *header* still identifies the call by its params — it is the body that must not
+        // be the heredoc, so the assertion is on the body line, not on the whole render.
+        let r = response(vec![hit(failed.clone(), 1.0, "")]);
+        let out = render(|w| search_results(w, &r, &plain()));
+        let body = out
+            .lines()
+            .skip_while(|l| !l.contains("#9"))
+            .nth(1)
+            .expect("a body line under the hit");
+        assert!(body.contains("InputValidationError"), "{out}");
+        assert!(!body.contains("cat > f"), "{out}");
+
+        // A call that succeeded is unchanged: the command leads, as it always did.
+        let mut ok = failed.clone();
+        ok.is_error = false;
+        ok.tool_output = Some("Finished dev profile".into());
+        assert!(
+            doc_body(&ok).starts_with("Bash\ncat > f"),
+            "{:?}",
+            doc_body(&ok)
+        );
     }
 
     /// A document whose whole body is its output — an orphaned `tool_result` — must not render

@@ -56,6 +56,11 @@ pub struct Filters {
     /// repeatable, and ANDed.
     #[arg(long = "tool-output", value_name = "TEXT")]
     pub tool_output: Vec<String>,
+    /// Only turns where the model spent at least N thinking tokens. Works even where the
+    /// thinking text itself was stripped before it reached disk, which is the case for remote
+    /// and web sessions.
+    #[arg(long, value_name = "N")]
+    pub min_thinking: Option<u64>,
     #[arg(long, value_name = "BRANCH")]
     pub branch: Option<String>,
     #[arg(long, value_name = "MODEL")]
@@ -266,15 +271,19 @@ pub fn search(
             .or_else(|| highlighted(&thinking_snippets))
             .unwrap_or_else(|| {
                 // Nothing highlighted: fall back to whichever body this document actually has.
-                let body = [
-                    Some(doc.text.as_str()),
-                    doc.tool_output.as_deref(),
-                    doc.thinking.as_deref(),
-                ]
-                .into_iter()
-                .flatten()
-                .find(|b| !b.trim().is_empty())
-                .unwrap_or("");
+                // A failed call leads with its result — on `--errors-only`, which carries no
+                // free-text query and so lands here every time, the error is the answer and
+                // the command that failed is only context.
+                let (first, second) = if doc.is_error {
+                    (doc.tool_output.as_deref(), Some(doc.text.as_str()))
+                } else {
+                    (Some(doc.text.as_str()), doc.tool_output.as_deref())
+                };
+                let body = [first, second, doc.thinking.as_deref()]
+                    .into_iter()
+                    .flatten()
+                    .find(|b| !b.trim().is_empty())
+                    .unwrap_or("");
                 excerpt(body, req.snippet_chars)
             });
         hits.push(Hit {
@@ -282,6 +291,21 @@ pub fn search(
             score,
             snippet,
         });
+    }
+
+    // An unqualified `word:value` is a JSON-subpath lookup, so it cannot fail to parse — it
+    // just finds nothing when that subpath does not exist. Zero hits from a query shaped like
+    // that is far more often a misread colon than an empty corpus, so say so rather than
+    // letting it look like an authoritative "no".
+    if total == 0
+        && let Some(text) = non_empty(req.query.as_deref())
+        && has_unqualified_field_term(&schema, text)
+    {
+        tracing::warn!(
+            query = %text,
+            "no matches: a `word:value` term here was read as a tool_input JSON subpath. \
+             If you meant it as text, quote it."
+        );
     }
 
     Ok(SearchResponse {
@@ -342,6 +366,7 @@ fn build_query(
         // Bare multi-word input reads as "all of these words", which is what people mean;
         // explicit `OR` / `AND` / `"phrases"` / `field:value` still work.
         qp.set_conjunction_by_default();
+        let text = &escape_stray_colons(text);
         let parsed = match qp.parse_query(text) {
             Ok(q) => q,
             Err(err) => {
@@ -396,6 +421,15 @@ fn build_query(
     if flt.errors_only {
         clauses.push((Occur::Must, flag_query(f.is_error, 1)));
     }
+    if let Some(min) = flt.min_thinking {
+        clauses.push((
+            Occur::Must,
+            Box::new(RangeQuery::new(
+                std::ops::Bound::Included(Term::from_field_u64(f.thinking_tokens, min)),
+                std::ops::Bound::Unbounded,
+            )),
+        ));
+    }
     if flt.sidechains_only {
         clauses.push((Occur::Must, flag_query(f.is_sidechain, 1)));
     } else if flt.no_sidechains {
@@ -422,6 +456,71 @@ fn term_query(field: Field, value: &str) -> Box<dyn Query> {
         Term::from_field_text(field, value),
         IndexRecordOption::Basic,
     ))
+}
+
+/// Escape a `:` that punctuates prose rather than starting a field lookup.
+///
+/// `tool_input` is a JSON field sitting in the default search fields, so *any* `word:value`
+/// parses cleanly — it reads as a lookup on the JSON subpath `word`. That is a deliberate
+/// shorthand (`command:cargo` finds Bash commands without spelling out `tool_input.`), but it
+/// also means the parser can never report an unknown field, so a pasted URL or ordinary prose
+/// parses fine and then matches nothing, silently. The corpus this was found on holds
+/// `https://github.com` 86 times and the query returned zero.
+///
+/// The two cases are separable by what follows the colon. A field lookup always has a value
+/// immediately after it — `cargo`, `1`, `>=5000`, `[1 TO *]`, `"a phrase"`. Prose does not:
+/// `https://github.com` has a `/`, and `note: this` has a space. So a colon followed by
+/// whitespace, by `/`, or by nothing is punctuation, and is escaped to be searched literally.
+/// Quoted spans are left exactly as written.
+fn escape_stray_colons(query: &str) -> String {
+    let mut out = String::with_capacity(query.len() + 8);
+    let mut in_quotes = false;
+    let mut chars = query.char_indices().peekable();
+
+    while let Some((_, c)) = chars.next() {
+        if c == '"' {
+            in_quotes = !in_quotes;
+            out.push(c);
+            continue;
+        }
+        if c == ':' && !in_quotes {
+            let starts_a_value = chars
+                .peek()
+                .is_some_and(|(_, next)| !next.is_whitespace() && *next != '/');
+            if !starts_a_value {
+                out.push('\\');
+            }
+        }
+        out.push(c);
+    }
+    out
+}
+
+/// Does this query contain a `word:` whose root is not a field in the schema? Such a term is a
+/// JSON-subpath lookup, which is valid but matches nothing when the subpath does not exist —
+/// worth saying out loud when the search came back empty.
+fn has_unqualified_field_term(schema: &Schema, query: &str) -> bool {
+    let mut in_quotes = false;
+    let mut token = String::new();
+    for c in query.chars() {
+        match c {
+            '"' => {
+                in_quotes = !in_quotes;
+                token.clear();
+            }
+            _ if in_quotes => {}
+            ':' => {
+                let root = token.split('.').next().unwrap_or("");
+                if !root.is_empty() && schema.get_field(root).is_err() {
+                    return true;
+                }
+                token.clear();
+            }
+            c if c.is_whitespace() || matches!(c, '(' | ')' | '+' | '-') => token.clear(),
+            c => token.push(c),
+        }
+    }
+    false
 }
 
 fn flag_query(field: Field, value: u64) -> Box<dyn Query> {
@@ -849,6 +948,7 @@ pub fn doc_from_stored(f: &Fields, stored: &TantivyDocument) -> Doc {
         text: s(f.text).unwrap_or_default(),
         tool_output: s(f.tool_output),
         thinking: s(f.thinking),
+        thinking_tokens: u(f.thinking_tokens),
         raw: s(f.raw).unwrap_or_default(),
     }
 }
@@ -953,6 +1053,7 @@ pub(crate) mod testkit {
             text: String::new(),
             tool_output: None,
             thinking: None,
+            thinking_tokens: None,
             raw: "{}".into(),
         }
     }
@@ -1064,6 +1165,63 @@ mod tests {
             query: (!query.is_empty()).then(|| query.to_string()),
             ..SearchRequest::default()
         }
+    }
+
+    /// `tool_input` is a JSON field in the default search fields, so any `word:value` parses
+    /// cleanly as a JSON-subpath lookup — which made a pasted URL match nothing and say nothing.
+    /// The corpus this was found on holds `https://github.com` 86 times; the query returned 0.
+    #[test]
+    fn a_colon_in_ordinary_text_is_not_a_field_lookup() {
+        let mut docs = corpus();
+        let mut d = blank_doc(90);
+        d.text = "see https://github.com/tarqd/session-search for the source".into();
+        docs.push(d);
+        let mut d = blank_doc(91);
+        d.text = "note: this one is prose, not a field".into();
+        docs.push(d);
+        let (index, fields) = index_docs(&docs);
+
+        let hits = |q: &str| search(&index, &fields, &req(q)).unwrap().total;
+
+        assert_eq!(hits("https://github.com"), 1, "a URL must search as text");
+        assert_eq!(
+            hits("https://github.com"),
+            hits("\"https://github.com\""),
+            "quoting it must not change the answer"
+        );
+        assert_eq!(
+            hits("note: this"),
+            1,
+            "prose with a colon must search as text"
+        );
+    }
+
+    /// The other half of the same rule: a prefix that *does* name a field is still a lookup,
+    /// including a JSON subpath, which is the feature the whole schema is built around.
+    #[test]
+    fn a_colon_after_a_real_field_name_is_still_a_field_lookup() {
+        let (index, fields) = index_docs(&corpus());
+        let hits = |q: &str| search(&index, &fields, &req(q)).unwrap().total;
+
+        assert!(hits("tool_input.command:cargo") > 0, "JSON subpath lookup");
+        assert!(hits("text:tantivy") > 0, "plain field lookup");
+        assert_eq!(
+            hits("is_error:1"),
+            search(
+                &index,
+                &fields,
+                &SearchRequest {
+                    filters: Filters {
+                        errors_only: true,
+                        ..Filters::default()
+                    },
+                    ..SearchRequest::default()
+                }
+            )
+            .unwrap()
+            .total,
+            "the flag and the field query are the same filter"
+        );
     }
 
     /// The bug this guards: the facet total used to be the sum of the returned buckets, so a
