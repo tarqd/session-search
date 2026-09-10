@@ -1627,9 +1627,13 @@ running 373 tests
 test result: ok. 369 passed; 0 failed; 4 ignored; 0 measured; 0 filtered out; finished in 4.11s
 ```
 
-`--all-features` on `clippy` and `test`, plain on `build`. "It compiles with `web-ui` on" and "it
-still compiles with it off" are two different claims, and only the second one describes the binary
-a default `cargo install` produces.
+The compiler is pinned: [`rust-toolchain.toml`](rust-toolchain.toml) names the version and the
+components those commands need. rustup reads it before its own default, so the first `cargo`
+command run in this directory installs that toolchain if the machine does not already have it,
+and every command after it — yours and CI's alike — is the same compiler and the same clippy. A
+lint the runner would fail on therefore cannot hide behind an older toolchain at your end.
+Moving to a newer Rust is its own one-line pull request: change `channel`, run the four commands,
+and fix whatever the newer clippy has learned to see.
 
 The four ignored tests all need this machine's own `~/.claude/projects` and are the ones worth
 running by hand after any change to the parser or the indexer — in particular the live-replay
@@ -1642,12 +1646,10 @@ cargo test --release -- --ignored --nocapture
 
 ### Continuous integration
 
-[`.github/workflows/ci.yml`](.github/workflows/ci.yml) runs exactly the four commands above on
-every push to `main` and every pull request, as a single Linux job — `fmt`, then `clippy` with
-`-D warnings` and `--all-features`, then `build --all-targets` with the default features, then
-`test --all-features`. One job rather than four: each job is a fresh runner that re-downloads the
-cache and rebuilds the dependency graph, which on a private repo is billed minutes for no extra
-signal. The ignored four are not among them: a runner has no `~/.claude/projects`, so they stay a
+[`.github/workflows/ci.yml`](.github/workflows/ci.yml) runs exactly the four commands above, on
+the toolchain `rust-toolchain.toml` names, on every push to `main` and every pull request, as a
+single Linux job — `fmt`, then `clippy` with `-D warnings`, then `build --all-targets`, then
+`test`. The ignored four are not among them: a runner has no `~/.claude/projects`, so they stay a
 by-hand check.
 
 The crate resolves `~/.claude` through `$HOME`, which Windows does not set, so Windows is neither
