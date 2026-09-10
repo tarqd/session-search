@@ -700,6 +700,14 @@ pub fn session(index: &tantivy::Index, f: &Fields, session_id: &str, agent_id: O
 /// `TermQuery` on `source_path` ANDed with a term query on the `turn_seq` fast field.
 pub fn turn(index: &tantivy::Index, f: &Fields, source_path: &str, turn_seq: u64, limit: usize)
     -> anyhow::Result<Vec<Doc>>;
+/// One turn's documents and the size of the turn they were cut from. `total` is a `Count` over
+/// the same query, because `docs_by_seq` clamps `limit` against the index and a short window
+/// therefore means either "the turn ends here" or "the cap bit" — only the count separates them,
+/// and a capped window that says nothing reads as the whole turn.
+pub struct TurnWindow { pub turn_seq: u64, pub docs: Vec<Doc>, pub total: usize }
+/// [`turn`] with that count. Every renderer wants this one; `turn` is the pinned shape.
+pub fn turn_window(index: &tantivy::Index, f: &Fields, source_path: &str, turn_seq: u64,
+                   limit: usize) -> anyhow::Result<TurnWindow>;
 ```
 
 ### Turns
@@ -737,14 +745,31 @@ tail would restart numbering at its own `seq_base` and the incremental result wo
 
 ```rust
 pub struct OutputOpts { pub json: bool, pub color: bool, pub context: usize, pub width: usize }
+/// The turn a window snapped to, and the size of that turn. A turn window is capped, so the
+/// rendering needs both numbers to say "turn #12 · 200 of 347 docs" instead of showing a
+/// truncated turn as if it were whole.
+pub struct TurnSpan { pub turn_seq: u64, pub total: usize }
+/// One hit's pre-fetched surroundings. `--context N` fills `docs` alone; `--context turn` fills
+/// `turn` as well, since documents by themselves cannot say whether any were left out.
+pub struct HitContext { pub docs: Vec<Doc>, pub turn: Option<TurnSpan> }
+impl HitContext {
+    pub fn around(docs: Vec<Doc>) -> Self;                          // turn: None
+    pub fn turn(docs: Vec<Doc>, turn_seq: u64, total: usize) -> Self;
+}
 pub fn search_results(w: &mut impl Write, r: &SearchResponse, o: &OutputOpts) -> anyhow::Result<()>;
-/// `--context N`: `SearchResponse` carries no surrounding turns and `format.rs` holds no index
-/// handle, so `cli.rs` fetches one `context::around` window per hit and passes them in here.
-/// `search_results` is the `context: &[]` case of this.
-pub fn search_results_ctx(w: &mut impl Write, r: &SearchResponse, context: &[Vec<Doc>],
+/// `--context N|turn`: `SearchResponse` carries no surrounding turns and `format.rs` holds no
+/// index handle, so `cli.rs` fetches one `context::around` (or `context::turn_window`) window
+/// per hit and passes them in here. `search_results` is the `context: &[]` case of this.
+/// A turn window adds a `context_turn` object — `{turn_seq, shown, docs_in_turn, truncated}` —
+/// to the hit's JSON, and a `turn #N · ...` line to the human rendering.
+pub fn search_results_ctx(w: &mut impl Write, r: &SearchResponse, context: &[HitContext],
                           o: &OutputOpts) -> anyhow::Result<()>;
 pub fn facet_list(w: &mut impl Write, r: &FacetResult, o: &OutputOpts) -> anyhow::Result<()>;
 pub fn session_view(w: &mut impl Write, docs: &[Doc], o: &OutputOpts) -> anyhow::Result<()>;
+/// `session_view` for `show --around ... --turn`: the same rendering, plus the line under the
+/// session header saying which turn it is and what the cap left out (`"turn"` in the JSON).
+pub fn turn_view(w: &mut impl Write, docs: &[Doc], span: TurnSpan, o: &OutputOpts)
+    -> anyhow::Result<()>;
 pub fn session_list(w: &mut impl Write, s: &[SessionInfo], o: &OutputOpts) -> anyhow::Result<()>;
 pub fn stats(w: &mut impl Write, s: &IndexStats, o: &OutputOpts) -> anyhow::Result<()>;
 ```
@@ -760,11 +785,11 @@ the rule above — a failed call previews its error first. `doc_json` carries `b
 ```
 session-search index [--full] [--root DIR]... [--index DIR] [--jobs N] [--include-thinking]
                      [--no-spilled-results]
-session-search search <QUERY> [FILTERS] [--facets f1,f2] [--context N]
+session-search search <QUERY> [FILTERS] [--facets f1,f2] [--context N|turn]
                               [--limit N] [--offset N] [--json] [--no-refresh]
                               [--include-thinking]
 session-search facets <FIELD> [--query Q] [FILTERS] [--top N] [--json] [--no-refresh]
-session-search show <SESSION_ID> [--agent AGENT_ID] [--around UUID|SEQ]
+session-search show <SESSION_ID> [--agent AGENT_ID] [--around UUID|SEQ] [--turn]
                                  [--before N] [--after N] [--limit N] [--json] [--no-refresh]
 session-search sessions [FILTERS] [--limit N] [--json] [--no-refresh]
 session-search stats [--json]
@@ -776,6 +801,16 @@ FILTERS: -p/--project P  -t/--tool T  --tool-input k=v  --tool-output TEXT  --pr
 ```
 
 Global: `--index DIR` (`$SESSION_SEARCH_INDEX`), `-v/--verbose`, `--no-color` (`$NO_COLOR`).
+
+**Turn-shaped windows.** `search --context turn` and `show --around ... --turn` snap the window
+to the hit's enclosing turn instead of counting documents outwards. A fixed `N` is the wrong
+shape for this data twice over: inside a forty-call turn it shows neighbouring `Bash` calls and
+never the prompt that explains them, and on a short turn it drags in the turns either side.
+`--turn` is meaningless without `--around` and clap requires it. Both are capped by document
+count — `cli::TURN_WINDOW_LIMIT` for `search`, `show`'s own `--limit` — because a turn is
+unbounded (rule 3 makes a whole sidechain transcript one turn) and `TopDocs` preallocates
+whatever it is handed. What the cap leaves out is always reported, never dropped silently:
+`turn #12 · 200 of 347 docs` in the human rendering, `context_turn` / `turn` in the JSON.
 
 **`FIELD` for `facets`** is any fast field name (`tool_name`, `project`, `model`,
 `git_branch`, `role`, `kind`, `agent_type`, `entrypoint`, `code_lang`) **or any JSON path** such

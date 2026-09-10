@@ -280,6 +280,57 @@ session-search search "expand_dots" --limit 1 --context 2
 The four indented `#NN` lines under the snippet are the surrounding turns — two before, two
 after — each collapsed to one line.
 
+`--context turn` asks for a different window: the hit's whole enclosing turn, from the prompt
+that opened it to the last thing that came back before the next one. A fixed `N` is the wrong
+shape twice over — on a hit inside a forty-call turn it shows three neighbouring `Bash` calls
+and never the prompt that explains them, and on a short turn it drags in the turns either side:
+
+```bash
+session-search search "transcript" --limit 1 --context turn --sidechains-only
+```
+
+```
+1 of 2 hits · 6 ms
+
+▌ b20208d8-fbdb-5918-ba69-d203de6ed6dc  wild-spinning-puppy  agent a10845c5ff9c7d4ec · Explore  (1 hit)
+▌ /home/user/session-search · claude/rust-mcp-session-indexing-67tza2 · 2026-09-09 19:09
+
+   1. 19:09:19  assistant  #6  2.51
+      I'll start by exploring the directory structure and the **transcript** store
+      turn #0 · 11 docs
+      #0     user                 Read-only investigation. Goal: exhaustively characterize the on-d…
+      #1     attachment           environment <system-reminder> # Environment You have been invoked…
+      #2     attachment           model <system-reminder> You are powered by the model named Opus 5…
+      #3     attachment           session_context <system-reminder> As you answer the user's questi…
+      #4     attachment           date <system-reminder> Today's date is 2026-09-09. </system-remin…
+      #5     attachment           remote_session_change <system-reminder> Attribution for git commi…
+      #7     assistant Bash       Bash ls -la /home/PLACEHOLDER/.claude/ 2>&1 | head -50; echo "===…
+      #8     assistant Bash       Bash ls -la /home/PLACEHOLDER/.claude/sessions/ /home/PLACEHOLDER…
+      #9     assistant Bash       Bash ls -la /usr/lib/node_modules/ /opt 2>&1 | head -40; echo "==…
+      #10    attachment           plan_mode <system-reminder> Plan mode is active. The user indicat…
+```
+
+`show` has the same window under `--turn`, which snaps `--around` to the turn instead of
+counting documents out with `--before`/`--after`:
+
+```bash
+session-search show b20208d8 --agent a10845 --around 7 --turn --limit 3
+```
+
+```
+▌ b20208d8-fbdb-5918-ba69-d203de6ed6dc  wild-spinning-puppy  agent a10845c5ff9c7d4ec · Explore
+▌ /home/user/session-search · claude/rust-mcp-session-indexing-67tza2 · 2026-09-09 19:09
+▌ turn #0 · 3 of 11 docs
+```
+
+**A turn is not a bounded thing, so the window is capped.** One prompt can spawn hundreds of
+tool calls over an hour, and a subagent transcript is a *single* turn — its `user` records are
+synthesised by the parent, so there is no human prompt inside it to end one. `search --context
+turn` stops at 200 documents per hit and `show --turn` at its own `--limit`, and both say so:
+`turn #0 · 3 of 11 docs` is three shown out of eleven. In `--json` the same fact rides on the
+hit as `context_turn` (`{turn_seq, shown, docs_in_turn, truncated}`), and on `show --turn` as
+`turn`.
+
 Or replay a whole session — an id prefix is enough, as long as it is unambiguous:
 
 ```bash
@@ -824,7 +875,9 @@ Options:
                           `tool_name,code_lang,tool_input.file_path`
       --index <DIR>       Index directory. Defaults to `$XDG_DATA_HOME/session-search` [env:
                           SESSION_SEARCH_INDEX=]
-      --context <N>       Also show N turns either side of each hit [default: 0]
+      --context <N|turn>  Also show N turns either side of each hit, or `turn` for the hit's whole
+                          enclosing turn — the prompt that opened it, what was tried, and what came
+                          back [default: 0]
   -v, --verbose...        Raise the log level on stderr; repeatable (`-v` info, `-vv` debug, `-vvv`
                           trace)
       --limit <N>         [default: 20]
@@ -884,9 +937,12 @@ Options:
                            session
   -v, --verbose...         Raise the log level on stderr; repeatable (`-v` info, `-vv` debug, `-vvv`
                            trace)
-      --before <N>         [default: 3]
       --no-color           Never colourise. Also honoured: a non-empty `$NO_COLOR`, and a non-tty
                            stdout
+      --turn               Snap the `--around` window to the enclosing turn instead of counting
+                           documents with `--before`/`--after`. Capped by `--limit`, and what the
+                           cap left out is reported
+      --before <N>         [default: 3]
       --after <N>          [default: 3]
       --limit <N>          [default: 200]
       --json
@@ -1211,8 +1267,10 @@ on the next run.
 already contains `**` (this tool's own Markdown output, for instance) you will see `****term****`.
 Colour output makes it unambiguous; `--no-color` does not.
 
-**Context windows assume dense `seq`.** `show --around` and `search --context` walk `seq` numbers
+**Context windows assume dense `seq`.** `show --around` and `search --context N` walk `seq` numbers
 within a file. If a re-index ever leaves a hole, the window comes back short rather than erroring.
+A turn window (`--context turn`, `show --turn`) does not care: it asks for a `turn_seq` value
+rather than a range, so a hole costs it the one document and nothing else.
 
 **Spilled tool results are read from a path found in transcript text.** Oversized tool output is
 written to `tool-results/<id>.txt` and the transcript carries a `Full output saved to: <path>`

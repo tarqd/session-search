@@ -1,12 +1,14 @@
 //! Expand a hit to the turns around it, or reconstruct a whole session.
 //!
-//! Both entry points are targeted lookups, never a scan: a term query on `session_id` (plus
+//! Every entry point is a targeted lookup, never a scan: a term query on `session_id` (plus
 //! `agent_id`, or its *absence* for a main transcript, plus `source_path` when the caller knows
 //! which file it means) narrows to one file's worth of docs, a range query on the `seq` fast
-//! field narrows to the window, and `TopDocs` orders by `seq`.
+//! field narrows to the window, and `TopDocs` orders by `seq`. A turn window swaps the range
+//! query for a term on `turn_seq`, which is the same shape one field over.
 
-use tantivy::query::{BooleanQuery, Occur, Query, RangeQuery};
-use tantivy::schema::Term;
+use tantivy::collector::Count;
+use tantivy::query::{BooleanQuery, Occur, Query, RangeQuery, TermQuery};
+use tantivy::schema::{IndexRecordOption, Term};
 
 use crate::parse::Doc;
 use crate::schema::Fields;
@@ -64,6 +66,79 @@ pub fn session(
     let clauses = session_clauses(f, session_id, agent_id, source_path);
     let searcher = index.reader()?.searcher();
     docs_by_seq(&searcher, f, &BooleanQuery::new(clauses), limit)
+}
+
+/// One turn's documents, and how many the turn holds in full.
+///
+/// The count is not decoration: one prompt can open a turn that runs to hundreds of tool calls,
+/// and a sidechain transcript is a single turn by rule 3 of the "Turns" section, so the cap bites
+/// on real transcripts. A window that stops at `limit` and says nothing reads as the whole turn,
+/// which is the one thing a turn-shaped window exists to promise.
+#[derive(Debug, Clone)]
+pub struct TurnWindow {
+    pub turn_seq: u64,
+    /// The head of the turn in `seq` order, at most `limit` documents.
+    pub docs: Vec<Doc>,
+    /// Documents in the turn before the cap; equal to `docs.len()` when nothing was left out.
+    pub total: usize,
+}
+
+/// Every document of one turn, in `seq` order, capped at `limit` docs.
+///
+/// `source_path` is required where [`around`] takes an `Option`: `turn_seq` is a per-FILE
+/// ordinal like `seq`, and two files can share a `session_id` (§9), so scoping by path is what
+/// keeps two transcripts from interleaving their turns. Callers that render the window want
+/// [`turn_window`] instead — this drops the count that says whether the cap bit.
+pub fn turn(
+    index: &tantivy::Index,
+    f: &Fields,
+    source_path: &str,
+    turn_seq: u64,
+    limit: usize,
+) -> anyhow::Result<Vec<Doc>> {
+    Ok(turn_window(index, f, source_path, turn_seq, limit)?.docs)
+}
+
+/// [`turn`], plus the size of the turn it was cut from — see [`TurnWindow`].
+pub fn turn_window(
+    index: &tantivy::Index,
+    f: &Fields,
+    source_path: &str,
+    turn_seq: u64,
+    limit: usize,
+) -> anyhow::Result<TurnWindow> {
+    let query = turn_query(f, source_path, turn_seq);
+    let searcher = index.reader()?.searcher();
+    // The count is a second pass over the same query rather than a guess from `docs.len()`:
+    // `docs_by_seq` clamps `limit` against the index, so a short result means either "the turn
+    // ends here" or "the cap bit", and only the count tells the two apart.
+    let total = searcher.search(&query, &Count)?;
+    let docs = docs_by_seq(&searcher, f, &query, limit)?;
+    Ok(TurnWindow {
+        turn_seq,
+        docs,
+        total,
+    })
+}
+
+/// The one turn of one file: a term on `source_path` ANDed with a term on the `turn_seq` field.
+fn turn_query(f: &Fields, source_path: &str, turn_seq: u64) -> BooleanQuery {
+    BooleanQuery::new(vec![
+        (
+            Occur::Must,
+            Box::new(TermQuery::new(
+                Term::from_field_text(f.source_path, source_path),
+                IndexRecordOption::Basic,
+            )) as Box<dyn Query>,
+        ),
+        (
+            Occur::Must,
+            Box::new(TermQuery::new(
+                Term::from_field_u64(f.turn_seq, turn_seq),
+                IndexRecordOption::Basic,
+            )),
+        ),
+    ])
 }
 
 #[cfg(test)]
@@ -311,5 +386,151 @@ mod tests {
         let one_file = session(&index, &f, "s1", None, Some("/tmp/s1.jsonl"), 100).unwrap();
         assert_eq!(one_file.len(), 10);
         assert!(one_file.iter().all(|d| d.source_path == "/tmp/s1.jsonl"));
+    }
+
+    /// One file's docs, grouped into turns the way `parse.rs` numbers them: `sizes[i]` documents
+    /// in turn `i`, every one of them carrying the `seq` of the doc that opened it.
+    fn turns(path: &str, label: &str, sizes: &[usize]) -> Vec<Doc> {
+        let mut docs = Vec::new();
+        let mut seq = 0u64;
+        for (turn, size) in sizes.iter().enumerate() {
+            let opened_at = seq;
+            for offset in 0..*size {
+                let mut d = blank_doc(seq);
+                d.doc_id = format!("s1:-:{label}:{seq}");
+                d.source_path = path.into();
+                d.turn_seq = opened_at;
+                d.body = format!("{label} turn {turn} doc {offset}");
+                docs.push(d);
+                seq += 1;
+            }
+        }
+        docs
+    }
+
+    #[test]
+    fn turn_returns_the_whole_turn_and_nothing_around_it() {
+        let (index, f) = index_docs(&turns("/tmp/s1.jsonl", "main", &[3, 4, 2]));
+
+        // The middle turn opened at seq 3, so that is its `turn_seq`.
+        let got = turn(&index, &f, "/tmp/s1.jsonl", 3, 100).unwrap();
+        assert_eq!(
+            texts(&got),
+            vec![
+                "main turn 1 doc 0",
+                "main turn 1 doc 1",
+                "main turn 1 doc 2",
+                "main turn 1 doc 3"
+            ]
+        );
+        assert!(got.windows(2).all(|w| w[1].seq == w[0].seq + 1));
+
+        // A hit anywhere inside the turn asks for the same window, which is the point of
+        // snapping: the prompt comes back even when the hit was the last tool call.
+        let from_the_tail = got.last().unwrap();
+        assert_eq!(from_the_tail.turn_seq, 3);
+        let again = turn(&index, &f, "/tmp/s1.jsonl", from_the_tail.turn_seq, 100).unwrap();
+        assert_eq!(texts(&again), texts(&got));
+
+        // A turn number nothing carries is empty, not an error.
+        assert!(
+            turn(&index, &f, "/tmp/s1.jsonl", 4, 100)
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    /// `turn_seq` is a per-*file* ordinal, exactly like `seq`. Two transcripts can share a
+    /// `sessionId` (TRANSCRIPT-FORMAT §9), and both number their turns from zero, so a lookup
+    /// scoped by anything less than the path interleaves two conversations.
+    #[test]
+    fn a_turn_never_spans_two_transcript_files() {
+        let mut docs = turns("/tmp/s1.jsonl", "main", &[2, 3]);
+        docs.extend(turns("/tmp/relocated/s1.jsonl", "relocated", &[2, 3]));
+        let (index, f) = index_docs(&docs);
+
+        let main = turn(&index, &f, "/tmp/s1.jsonl", 2, 100).unwrap();
+        assert_eq!(
+            texts(&main),
+            vec![
+                "main turn 1 doc 0",
+                "main turn 1 doc 1",
+                "main turn 1 doc 2"
+            ]
+        );
+        let relocated = turn(&index, &f, "/tmp/relocated/s1.jsonl", 2, 100).unwrap();
+        assert_eq!(
+            texts(&relocated),
+            vec![
+                "relocated turn 1 doc 0",
+                "relocated turn 1 doc 1",
+                "relocated turn 1 doc 2"
+            ]
+        );
+        // Same session id, same `turn_seq`, same `seq` numbers: only the path separates them.
+        assert!(main.iter().all(|d| d.session_id == "s1"));
+        assert!(relocated.iter().all(|d| d.session_id == "s1"));
+    }
+
+    /// One prompt can spawn hundreds of tool calls. The window is capped by document count, and
+    /// the count of what the turn actually holds comes back with it — a short window that says
+    /// nothing reads as the whole turn.
+    #[test]
+    fn a_runaway_turn_is_capped_and_reports_its_real_size() {
+        let (index, f) = index_docs(&turns("/tmp/s1.jsonl", "runaway", &[250]));
+
+        let window = turn_window(&index, &f, "/tmp/s1.jsonl", 0, 200).unwrap();
+        assert_eq!(window.turn_seq, 0);
+        assert_eq!(window.total, 250);
+        assert_eq!(window.docs.len(), 200);
+        // The cap keeps the *head* of the turn: the prompt that opened it is the document that
+        // explains the rest.
+        assert_eq!(window.docs.first().unwrap().body, "runaway turn 0 doc 0");
+        assert_eq!(window.docs.last().unwrap().seq, 199);
+
+        // Under the cap, the count is the window and nothing is claimed to be missing.
+        let whole = turn_window(&index, &f, "/tmp/s1.jsonl", 0, 1000).unwrap();
+        assert_eq!((whole.total, whole.docs.len()), (250, 250));
+    }
+
+    /// A subagent's `user` records are synthesised by the parent, so `origin.kind == "human"`
+    /// never fires and the whole sidechain file is one turn (rule 3 of the Turns section). The
+    /// cap is what keeps that from meaning "the whole transcript".
+    #[test]
+    fn a_sidechain_file_is_one_turn_the_cap_covers() {
+        let mut docs = corpus();
+        for seq in 0..30u64 {
+            let mut d = blank_doc(seq);
+            d.doc_id = format!("s1:a2cce0b9f6d21fbd9:{seq}");
+            d.source_path = "/tmp/s1/subagents/agent-a2cce0b9f6d21fbd9.jsonl".into();
+            d.agent_id = Some("a2cce0b9f6d21fbd9".into());
+            d.agent_type = Some("Explore".into());
+            d.is_sidechain = true;
+            d.turn_seq = 0;
+            d.body = format!("explore step {seq}");
+            docs.push(d);
+        }
+        let (index, f) = index_docs(&docs);
+
+        let window = turn_window(
+            &index,
+            &f,
+            "/tmp/s1/subagents/agent-a2cce0b9f6d21fbd9.jsonl",
+            0,
+            10,
+        )
+        .unwrap();
+        assert_eq!(window.total, 30);
+        assert_eq!(window.docs.len(), 10);
+        assert!(window.docs.iter().all(|d| d.is_sidechain));
+        assert_eq!(window.docs.first().unwrap().body, "explore step 0");
+
+        // The parent transcript numbers its own opening turn 0 as well, and it stays out.
+        assert!(
+            window
+                .docs
+                .iter()
+                .all(|d| d.source_path.contains("subagents"))
+        );
     }
 }

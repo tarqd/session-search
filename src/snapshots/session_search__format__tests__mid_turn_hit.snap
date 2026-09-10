@@ -1,0 +1,16 @@
+---
+source: src/format.rs
+expression: rendered
+---
+1 of 1 hit · 7 ms
+
+▌ s1  (1 hit)
+▌ [path] · main · [date]
+
+   1. [time]  assistant Read  #13  4.25
+      Read src/tokenizer.rs
+      turn #10 · 5 docs
+      #10    user                 why did the release build start failing?
+      #11    assistant            Checking what the last green run did.
+      #12    assistant Bash       Bash cargo build --release
+      #14    assistant            The analyzer was renamed, so every field's tokenizer is missing.
