@@ -1,0 +1,160 @@
+name: Release
+
+# Push a tag to cut a release:
+#
+#   git tag -a v0.1.0 -m 'v0.1.0' && git push origin v0.1.0
+#
+# The tag must agree with `version` in Cargo.toml — the first job checks, and refuses to
+# build a `v0.2.0` tag out of a tree that still says 0.1.0.
+on:
+  push:
+    tags: ["v*"]
+  # Dry runs: builds and uploads the artifacts to the workflow run, publishes nothing.
+  workflow_dispatch:
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  verify:
+    name: verify tag
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Tag matches Cargo.toml
+        id: version
+        run: |
+          set -euo pipefail
+          # Read Cargo.toml directly rather than via `cargo metadata`, so this check does not
+          # depend on a toolchain being installed first (it runs before the setup step).
+          crate="$(python3 -c 'import tomllib; print(tomllib.load(open("Cargo.toml","rb"))["package"]["version"])')"
+          echo "version=$crate" >> "$GITHUB_OUTPUT"
+
+          if [ "${GITHUB_REF_TYPE}" != "tag" ]; then
+            echo "Dry run at version $crate (no tag to check)."
+            exit 0
+          fi
+
+          tag="${GITHUB_REF_NAME#v}"
+          if [ "$tag" != "$crate" ]; then
+            echo "::error::tag ${GITHUB_REF_NAME} does not match Cargo.toml version ${crate}."
+            exit 1
+          fi
+          echo "Tag ${GITHUB_REF_NAME} matches Cargo.toml version ${crate}."
+
+      # A release is not the place to discover the tree is red.
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo fmt --check
+      - run: cargo clippy --locked --all-targets --all-features -- -D warnings
+      - run: cargo test --locked
+
+  build:
+    name: ${{ matrix.target }}
+    needs: verify
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Built on 22.04, not `ubuntu-latest`: the binary then needs only glibc 2.35,
+          # so it also runs on distros older than the runner image.
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-22.04
+          - target: aarch64-apple-darwin
+            os: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      # `--config` rather than a `[profile.release]` key in Cargo.toml: stripping is a property
+      # of what we ship, and a local `cargo build --release` should keep its symbols.
+      - name: Build
+        run: >-
+          cargo build --locked --release
+          --target ${{ matrix.target }}
+          --config profile.release.strip=true
+
+      # `session-search-v0.1.0-x86_64-unknown-linux-gnu.tar.gz`, unpacking to a directory of
+      # the same name so two extracted releases cannot overwrite each other.
+      - name: Package
+        id: package
+        shell: bash
+        run: |
+          set -euo pipefail
+          name="session-search-v${{ needs.verify.outputs.version }}-${{ matrix.target }}"
+          mkdir -p "dist/$name"
+          cp "target/${{ matrix.target }}/release/session-search" "dist/$name/"
+          cp README.md LICENSE "dist/$name/"
+          tar -czf "dist/$name.tar.gz" -C dist "$name"
+
+          # macOS ships `shasum`; Linux images ship `sha256sum`.
+          cd dist
+          if command -v sha256sum >/dev/null; then
+            sha256sum "$name.tar.gz" > "$name.tar.gz.sha256"
+          else
+            shasum -a 256 "$name.tar.gz" > "$name.tar.gz.sha256"
+          fi
+          echo "name=$name" >> "$GITHUB_OUTPUT"
+
+      # Confirms the thing we are about to ship actually starts on this platform.
+      - name: Smoke test
+        run: ./target/${{ matrix.target }}/release/session-search --version
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.package.outputs.name }}
+          path: dist/*.tar.gz*
+          if-no-files-found: error
+          retention-days: 7
+
+  publish:
+    name: publish release
+    needs: [verify, build]
+    # A dry run stops here: the artifacts are on the run, but nothing is published.
+    if: github.ref_type == 'tag'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      # One SHA256SUMS covering every artifact, so a verifier fetches a single file.
+      - name: Collect checksums
+        run: |
+          set -euo pipefail
+          cd dist
+          cat ./*.sha256 > SHA256SUMS
+          rm -f ./*.sha256
+          echo "--- SHA256SUMS ---"
+          cat SHA256SUMS
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*
+          generate_release_notes: true
+          fail_on_unmatched_files: true
+          # A semver prerelease carries a hyphen — `v0.2.0-rc.1`, never `v0.2.0`.
+          prerelease: ${{ contains(github.ref_name, '-') }}
