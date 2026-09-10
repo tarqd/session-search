@@ -46,6 +46,14 @@ pub struct OutputOpts {
     /// windows themselves arrive as an argument to [`search_results_ctx`].
     pub context: usize,
     pub width: usize,
+    /// What `--similar-to` resolved to, as [`crate::search::SimilarSource::label`] renders it.
+    ///
+    /// Human output only, and on purpose. A reference is usually typed as a prefix, so without
+    /// this line the caller has no way to see *which* turn the results are similar to short of
+    /// re-running under `-v`. The `--json` envelope deliberately does not echo it: a caller that
+    /// passed `--similar-to` already knows what it asked for, and the value of that envelope
+    /// staying byte-stable is higher than the value of the echo.
+    pub similar_to: Option<String>,
 }
 
 impl Default for OutputOpts {
@@ -55,6 +63,7 @@ impl Default for OutputOpts {
             color: false,
             context: 0,
             width: 100,
+            similar_to: None,
         }
     }
 }
@@ -336,6 +345,12 @@ fn human_search(
 ) -> Result<()> {
     let ink = Ink::new(o.color);
     let cols = o.cols();
+
+    // Before the count, because it says what the count is *of*: a similarity search's hits are
+    // relative to a turn the caller named by prefix and has not necessarily seen.
+    if let Some(label) = &o.similar_to {
+        writeln!(w, "{}", ink.paint(label, dim()))?;
+    }
 
     // "no matches" is reserved for a query that matched nothing. Zero *rendered* hits with a
     // non-zero total is `--limit 0` (documented as "totals and facets, no hits") or a page past
@@ -1539,6 +1554,40 @@ mod tests {
         // Facets follow the hits.
         assert!(out.contains("tool_name"), "{out}");
         assert!(out.contains("█"), "{out}");
+    }
+
+    /// A similarity search says what it is similar *to*, above the count.
+    ///
+    /// A reference is usually typed as a prefix and the seed is a turn the reader has not
+    /// necessarily seen, so without this line `9 of 31 hits` is a count of something unnamed —
+    /// and the missing tenth (the excluded source turn) looks like an arithmetic error rather
+    /// than a decision. The `--json` envelope deliberately does not echo it, which is what the
+    /// `json` half of this test pins.
+    #[test]
+    fn a_similarity_search_names_the_turn_it_is_similar_to() {
+        let opts = OutputOpts {
+            similar_to: Some("similar to s1:-:a1b2c3d4:17 · turn #12 · 9 docs".into()),
+            ..plain()
+        };
+        let out = render(|w| search_results(w, &sample(), &opts));
+        let first = out.lines().next().unwrap_or_default();
+        assert_eq!(first, "similar to s1:-:a1b2c3d4:17 · turn #12 · 9 docs");
+        assert!(out.contains("2 of 42 hits"), "{out}");
+
+        let json = render(|w| {
+            search_results(
+                w,
+                &sample(),
+                &OutputOpts {
+                    similar_to: opts.similar_to.clone(),
+                    ..json_opts()
+                },
+            )
+        });
+        assert!(
+            !json.contains("similar"),
+            "the JSON envelope must not change shape: {json}"
+        );
     }
 
     #[test]

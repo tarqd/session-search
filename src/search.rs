@@ -27,8 +27,8 @@ use tantivy::aggregation::AggregationCollector;
 use tantivy::aggregation::agg_req::Aggregations;
 use tantivy::collector::{Count, TopDocs};
 use tantivy::query::{
-    AllQuery, BooleanQuery, ExistsQuery, Occur, Query, QueryParser, RangeQuery, RegexQuery,
-    TermQuery,
+    AllQuery, BooleanQuery, EnableScoring, ExistsQuery, MoreLikeThisQuery, Occur, Query,
+    QueryParser, RangeQuery, RegexQuery, TermQuery, Weight,
 };
 use tantivy::schema::{Field, IndexRecordOption, OwnedValue, Schema, Term, Value as _};
 use tantivy::snippet::{Snippet, SnippetGenerator, collapse_overlapped_ranges};
@@ -158,6 +158,14 @@ pub struct SearchRequest {
     pub snippet_chars: usize,
     pub include_thinking: bool,
     pub sort: SortBy,
+    /// The seed of a "find similar" search, already resolved. `None` is an ordinary search.
+    ///
+    /// Resolved rather than a raw reference string on purpose: expanding `abc123` into a
+    /// document is an index lookup with its own ambiguity error, and a request struct that
+    /// carried the string would have to fail that lookup from inside `search()` — where the
+    /// caller has no way to tell "your reference was ambiguous" from "your query found
+    /// nothing". `cli::run` resolves it with [`resolve_similar`] before building the request.
+    pub similar_to: Option<SimilarSource>,
 }
 
 impl Default for SearchRequest {
@@ -172,6 +180,7 @@ impl Default for SearchRequest {
             snippet_chars: 240,
             include_thinking: false,
             sort: SortBy::Relevance,
+            similar_to: None,
         }
     }
 }
@@ -372,23 +381,64 @@ pub fn search(
     // its own field, and each tokenizes with that field's own analyzer.
     let raw_query = non_empty(req.query.as_deref()).unwrap_or_default();
     let snippet_chars = req.snippet_chars.max(32);
-    let snippets = snippet_generator(&searcher, &*query, f.text, raw_query, snippet_chars).ok();
+    // The seed text of a similarity search, per field: the *other* source of highlight terms.
+    // See `snippet_generator`. Empty for every ordinary search, which is exactly the old
+    // behaviour.
+    let seed = |field: SimilarField| -> String {
+        req.similar_to
+            .as_ref()
+            .map(|source| source.text_for(field))
+            .unwrap_or_default()
+    };
+    let snippets = snippet_generator(
+        &searcher,
+        &*query,
+        f.text,
+        raw_query,
+        &seed(SimilarField::Text),
+        snippet_chars,
+    )
+    .ok();
     // A tool call keeps its output in `code`, and a message its snippets, so a hit that landed
     // there has nothing to highlight in `text` — which is most tool-call hits.
-    let code_snippets =
-        snippet_generator(&searcher, &*query, f.code, raw_query, snippet_chars).ok();
+    let code_snippets = snippet_generator(
+        &searcher,
+        &*query,
+        f.code,
+        raw_query,
+        &seed(SimilarField::Code),
+        snippet_chars,
+    )
+    .ok();
     // A doc matched *through* `thinking` stores its body in that field and leaves `text`
     // empty, so without a third generator the one thing `--include-thinking` is paid for is
     // the one thing never shown.
     let thinking_snippets = req
         .include_thinking
-        .then(|| snippet_generator(&searcher, &*query, f.thinking, raw_query, snippet_chars).ok())
+        .then(|| {
+            snippet_generator(
+                &searcher,
+                &*query,
+                f.thinking,
+                raw_query,
+                &seed(SimilarField::Thinking),
+                snippet_chars,
+            )
+            .ok()
+        })
         .flatten();
     // Likewise for a tool call matched through its result: the call side is a tool name and a
     // command line, and highlighting that instead of the output the query actually hit shows
     // the caller the one part of the document they did not ask about.
-    let output_snippets =
-        snippet_generator(&searcher, &*query, f.tool_output, raw_query, snippet_chars).ok();
+    let output_snippets = snippet_generator(
+        &searcher,
+        &*query,
+        f.tool_output,
+        raw_query,
+        &seed(SimilarField::ToolOutput),
+        snippet_chars,
+    )
+    .ok();
 
     // `TopDocs::with_limit(0)` panics, so the collector always asks for at least one doc;
     // an explicit `--limit 0` still means "no hits, just totals and facets".
@@ -444,6 +494,23 @@ pub fn search(
         );
     }
 
+    // The second silent-nothing outcome of `MoreLikeThisQuery` (the first is refused in
+    // `resolve_similar`): a seed whose every term fell outside the tuning yields a
+    // `BooleanQuery` with zero clauses, which matches nothing and reports no error at all. From
+    // the outside that is indistinguishable from "nothing in this corpus is similar", so say
+    // which knobs decide it rather than letting an over-tuned query look like an answer.
+    if total == 0
+        && let Some(source) = &req.similar_to
+    {
+        tracing::warn!(
+            doc = %source.doc_id,
+            turn = source.turn_seq,
+            "no matches: every term of the seed turn may have fallen outside the similarity \
+             tuning (too rare, too common, too short or too long). Widen the seed with \
+             --similar-in text,code,tool_output, or check the filters."
+        );
+    }
+
     Ok(SearchResponse {
         hits,
         total,
@@ -452,7 +519,8 @@ pub fn search(
     })
 }
 
-/// A snippet generator for `field`, driven by the *whole* terms of the query.
+/// A snippet generator for `field`, driven by the *whole* terms of the query — plus, on a
+/// similarity search, the whole terms of the seed text.
 ///
 /// `SnippetGenerator::create` gives every term of the parsed query equal standing and scores a
 /// fragment by summing the hits in it, while the `code` analyzer turns one query word into an
@@ -462,11 +530,31 @@ pub fn search(
 ///
 /// Keeping only the whole forms fixes it. Every matching document contains them: the parts share
 /// the whole's position, so the phrase query the parser builds demands the whole form too.
+///
+/// `similar` is the second source of terms, and it exists because `MoreLikeThisQuery` reports
+/// none. It implements only `weight` and inherits the no-op `Query::query_terms`, so on a
+/// `--similar-to` search the loop below finds nothing, `search_fragments` produces no
+/// candidates, `render_snippet` returns `""` and every hit silently falls through to a
+/// head-of-body excerpt with an empty `snippet_marks`. No error, no warning — just a search
+/// tool that stopped saying why anything matched. So the terms are taken from where the truth
+/// is: the seed turn's own text for this field, tokenized with this field's analyzer.
+///
+/// Every filter the similarity query applies is applied here too — the word-length bounds, the
+/// document-frequency band and the stop words — because a highlight is a claim about *why* a
+/// document came back, and marking `Bash` in a tool call when `bash` is on the stop-word list
+/// would be a confident, wrong answer to that question. The one filter that is not applied is
+/// `SIMILAR_MAX_QUERY_TERMS`: it keeps the best 32 of the survivors, and which 32 depends on a
+/// `tf * idf` ordering this function has no reason to recompute. Keeping a few terms the query
+/// dropped costs nothing — they are terms the hit genuinely contains, and the
+/// `1 / (1 + doc_freq)` weighting already sorts them to the bottom of the fragment score.
+///
+/// Pass `""` for an ordinary search, which is exactly the old behaviour.
 fn snippet_generator(
     searcher: &Searcher,
     query: &dyn Query,
     field: Field,
     raw_query: &str,
+    similar: &str,
     max_num_chars: usize,
 ) -> anyhow::Result<SnippetGenerator> {
     let tokenizer = searcher.index().tokenizer_for_field(field)?;
@@ -480,6 +568,16 @@ fn snippet_generator(
     });
 
     let mut terms_text: BTreeMap<String, Score> = BTreeMap::new();
+    let mut weigh = |text: &str, term: &Term| -> anyhow::Result<()> {
+        // Same weighting as `SnippetGenerator::create`: a rare term is worth more than a
+        // common one, and a term the corpus does not hold at all is worth nothing.
+        let doc_freq = searcher.doc_freq(term)?;
+        if doc_freq > 0 {
+            terms_text.insert(text.to_string(), 1.0 / (1.0 + doc_freq as Score));
+        }
+        Ok(())
+    };
+
     for term in terms {
         let value = term.value();
         let Some(text) = value.as_str() else {
@@ -488,13 +586,34 @@ fn snippet_generator(
         if parts.contains(text) {
             continue;
         }
-        // Same weighting as `SnippetGenerator::create`: a rare term is worth more than a
-        // common one, and a term the corpus does not hold at all is worth nothing.
-        let doc_freq = searcher.doc_freq(term)?;
-        if doc_freq > 0 {
-            terms_text.insert(text.to_string(), 1.0 / (1.0 + doc_freq as Score));
+        weigh(text, term)?;
+    }
+
+    if !similar.is_empty() {
+        // The seed text goes through the same whole-versus-part filter as a query does, for the
+        // same reason: highlighting `user` and `email` across a paragraph instead of the one
+        // `userEmail` that made the document similar shows everything but the answer.
+        let seed_parts = part_terms(&mut tokenizer.clone(), similar);
+        let mut seeds: BTreeSet<String> = BTreeSet::new();
+        tokenizer
+            .clone()
+            .token_stream(similar)
+            .process(&mut |token: &Token| {
+                seeds.insert(token.text.clone());
+            });
+        let doc_frequency = similar_doc_frequency_band(searcher.num_docs());
+        for text in seeds {
+            if seed_parts.contains(&text) || !is_similarity_term(&text) {
+                continue;
+            }
+            let term = Term::from_field_text(field, &text);
+            if !doc_frequency.contains(&searcher.doc_freq(&term)?) {
+                continue;
+            }
+            weigh(&text, &term)?;
         }
     }
+
     Ok(SnippetGenerator::new(
         terms_text,
         tokenizer,
@@ -609,6 +728,41 @@ fn build_query(
             }
         };
         clauses.push((Occur::Must, parsed));
+    }
+
+    // The similarity clause is one more `Occur::Must`, sitting beside the free-text query and
+    // every filter — which is the whole reason "more like this, but only in this project, only
+    // last month" composes. Nothing downstream learns that one clause came from a document
+    // rather than from a word: the collectors, the `Count`, the aggregations, `docs_with_value`
+    // and paging all see an ordinary `BooleanQuery`.
+    if let Some(source) = &req.similar_to {
+        // Read per query rather than captured once: `max_doc_frequency` is an absolute
+        // document count in Tantivy's API, so it has to be recomputed against the index the
+        // query is about to run on. One reader open, on a path that already opens one.
+        let num_docs = index.reader()?.searcher().num_docs();
+        clauses.push((Occur::Must, similar_query(f, source, num_docs)));
+
+        if !source.include_source {
+            // The seed turn is excluded, and its *whole turn* rather than just the referenced
+            // document. `MoreLikeThisQuery` returns the source ranked first by construction —
+            // it matches every clause it generated, which Tantivy's own test asserts — and the
+            // turn's siblings share its vocabulary by construction too, so without this the
+            // first page is "the tool call you just read and the four around it". That is what
+            // `show --turn` is for. `--include-source` puts it back, for debugging and because
+            // an eval wants "the source ranks first" as a sanity check.
+            //
+            // A `MustNot` sets `minimum_number_should_match` to 0 on the outer boolean, which
+            // is correct here because the similarity clause is a `Must`: something still has to
+            // match positively.
+            clauses.push((
+                Occur::MustNot,
+                Box::new(crate::context::turn_query(
+                    f,
+                    &source.source_path,
+                    source.turn_seq,
+                )),
+            ));
+        }
     }
 
     let flt = &req.filters;
@@ -1217,6 +1371,587 @@ fn excerpt(text: &str, max_chars: usize) -> String {
         chars += 1;
     }
     out
+}
+
+// ---------------------------------------------------------------------------
+// find similar
+// ---------------------------------------------------------------------------
+
+//  "Find me more turns like this one" is a different question from "find me turns matching
+//  these words", and Tantivy answers it with `MoreLikeThisQuery`: it tokenizes a source
+//  document's own text, keeps the terms that discriminate, and ORs them into a `BooleanQuery`
+//  of `TermQuery`s weighted by `tf * idf`. Everything in this section exists because the
+//  vendored 0.26 API has four sharp edges that a naive call falls straight onto.
+//
+//  1. **`with_document` reads STORED fields, and every one of them.** It calls
+//     `searcher.doc(addr)` and walks the stored payload, so for this schema the term pool would
+//     include `session_id`, `doc_id`, `source_path`, `seq`, `turn_seq`, `timestamp` and the
+//     flags. A `session_id` term's document frequency is exactly the size of the source
+//     session — squarely inside the band `min_doc_frequency`/`max_doc_frequency` calls
+//     interesting — so `with_document` would hand back the rest of the source session and call
+//     it similarity. [`similar_query`] uses `with_document_fields` instead, which names the
+//     fields explicitly, and that is also the only way to seed from a *turn* rather than from
+//     one document: `with_document` takes a single `DocAddress` and does not accumulate.
+//  2. **`context_text` must be excluded deliberately, not by accident.** It is indexed and not
+//     stored, so `with_document` could never see it — but `with_document_fields` only checks
+//     `is_indexed()`, so it *can* target it. It must not: the header is near-identical for
+//     every document of a session by construction, so its terms would drag the whole source
+//     session back, which is the one false positive this feature exists to avoid.
+//  3. **JSON fields contribute nothing, silently.** `add_term_frequencies` matches
+//     `FieldType::Json` under a `_ => {}` arm, so `tool_input` and `bash_cmd` can never drive
+//     similarity through this API. [`SimilarField`] therefore offers only the four text
+//     bodies, and nothing in the CLI promises `--similar-in tool_input`.
+//  4. **`MoreLikeThisQuery` is opaque to the rest of the query machinery.** It implements only
+//     `weight`; it inherits the no-op `query_terms`, so [`snippet_generator`] would find no
+//     terms and every hit would fall back to a head-of-body excerpt with no highlight (see the
+//     `similar` argument there), and its `weight` *errors* when scoring is disabled (see
+//     [`ScoredQuery`]).
+//
+//  Two empty outcomes, which are different and only one of which is an error. An empty
+//  `field_to_values` slice makes Tantivy return "Cannot create more like this query on empty
+//  field values. The document may not have stored fields" — a message that would be an
+//  outright lie here, since this code uses no stored fields at all, so [`resolve_similar`]
+//  refuses before it can be reached. A *non-empty* source whose terms are all filtered out by
+//  the tuning yields a zero-clause `BooleanQuery` that matches nothing with no error at all;
+//  that one is caught after the fact, by the `total == 0` warning in [`search`].
+
+/// A body that can seed a similarity search.
+///
+/// Only the four text fields, and deliberately not `tool_input` / `bash_cmd`: those are JSON
+/// fields, and Tantivy's term extraction ignores JSON fields without saying so, so a
+/// `--similar-in tool_input` would be a flag that silently did nothing. `context_text` is
+/// absent for the opposite reason — it *would* work, and it is exactly wrong (see the section
+/// comment above).
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    serde::Serialize,
+    serde::Deserialize,
+    clap::ValueEnum,
+)]
+#[serde(rename_all = "snake_case")]
+#[clap(rename_all = "snake_case")]
+pub enum SimilarField {
+    /// The prose half of a message. The default, and on its own the one that means "about the
+    /// same thing" rather than "built from the same files".
+    Text,
+    /// The fenced blocks and inline spans. Analyzed by `code`, so it matches on identifiers.
+    Code,
+    /// What the tools printed. Useful for "another run that failed like this one".
+    ToolOutput,
+    /// The model's private reasoning. Behind `--include-thinking`, like everywhere else.
+    Thinking,
+}
+
+impl SimilarField {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            SimilarField::Text => "text",
+            SimilarField::Code => "code",
+            SimilarField::ToolOutput => "tool_output",
+            SimilarField::Thinking => "thinking",
+        }
+    }
+
+    fn field(self, f: &Fields) -> Field {
+        match self {
+            SimilarField::Text => f.text,
+            SimilarField::Code => f.code,
+            SimilarField::ToolOutput => f.tool_output,
+            SimilarField::Thinking => f.thinking,
+        }
+    }
+
+    /// The values one document holds for this field, in the order they were indexed.
+    fn values_of(self, doc: &Doc) -> Vec<String> {
+        match self {
+            SimilarField::Text => doc.text.clone(),
+            SimilarField::Code => doc.code.clone(),
+            SimilarField::ToolOutput => doc.tool_output.clone().into_iter().collect(),
+            SimilarField::Thinking => doc.thinking.clone().into_iter().collect(),
+        }
+    }
+}
+
+/// The resolved seed of a similarity search: which turn it is, and the text that turn holds.
+///
+/// Plain data with no `Field` handles and no `DocAddress` in it, for the same reason [`Filters`]
+/// is plain data: it is resolved once — by the CLI, by an MCP tool later, by the eval harness —
+/// and handed to [`search`] to be turned into a query. Carrying the *values* rather than an
+/// address is not an optimisation, it is what lets one turn's several documents seed a single
+/// query; `MoreLikeThisQuery::with_document` accepts exactly one address and cannot be called
+/// twice to accumulate.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct SimilarSource {
+    /// The document the reference resolved to. Reported so a resolved prefix is visible.
+    pub doc_id: String,
+    /// The file that `turn_seq` numbers within. `seq` and `turn_seq` are per-*file* ordinals
+    /// and one session id can name two files (§9), so a turn is only identified by the pair.
+    pub source_path: String,
+    pub turn_seq: u64,
+    /// Documents in the source turn, before [`SIMILAR_SOURCE_DOCS`] capped the read.
+    pub turn_docs: usize,
+    /// Put the source turn back in the results. Off by default — see [`build_query`].
+    pub include_source: bool,
+    /// The seed text, one entry per selected field. Empty vectors are dropped at resolution
+    /// time, so a non-empty `SimilarSource` always has something to tokenize.
+    pub values: Vec<(SimilarField, Vec<String>)>,
+}
+
+impl SimilarSource {
+    /// One line naming what a reference resolved to, for the human header and for `-v`.
+    pub fn label(&self) -> String {
+        format!(
+            "similar to {} · turn #{} · {} doc{}",
+            self.doc_id,
+            self.turn_seq,
+            self.turn_docs,
+            if self.turn_docs == 1 { "" } else { "s" }
+        )
+    }
+
+    /// The seed text for one field, joined — what [`snippet_generator`] highlights from.
+    fn text_for(&self, field: SimilarField) -> String {
+        self.values
+            .iter()
+            .find(|(f, _)| *f == field)
+            .map(|(_, values)| values.join("\n"))
+            .unwrap_or_default()
+    }
+}
+
+/// Documents of the source turn read to seed the query.
+///
+/// Same shape and same reason as `cli::TURN_WINDOW_LIMIT`: a turn is not a bounded thing — one
+/// prompt can open a turn of hundreds of tool calls, and a sidechain file is a single turn by
+/// rule 3 of the "Turns" section — so without a cap the seed of a similarity search is a whole
+/// subagent transcript.
+pub const SIMILAR_SOURCE_DOCS: usize = 200;
+
+/// Seed text per field, in bytes. A turn that `cat`ted a large file would otherwise be
+/// re-tokenized in full on every similarity search, and the terms past the first few hundred
+/// kilobytes cannot change the outcome — `SIMILAR_MAX_QUERY_TERMS` keeps only 32 of them.
+pub const SIMILAR_SOURCE_BYTES: usize = 256 * 1024;
+
+/// A term in fewer than this many documents of the whole corpus is a path, a uuid fragment, a
+/// blob id or a typo. It can match one or two documents at most, and its idf makes it dominate
+/// the score while it does so.
+///
+/// 3 rather than Tantivy's default of 5: a document here is one message or one tool call, not
+/// an article, so a genuinely shared technical term can legitimately live in only a handful of
+/// them. Not 1, because `tokenizer::MAX_TOKEN_BYTES` deliberately lets whole sha256s into the
+/// term dictionary — so that pasting one back finds it — and every similarity search seeded
+/// from a tool call would otherwise be decided by blob ids.
+const SIMILAR_MIN_DOC_FREQUENCY: u64 = 3;
+
+/// A term in more than `num_docs / SIMILAR_MAX_DOC_FREQUENCY_RATIO` documents carries no
+/// discrimination and is dropped.
+///
+/// One quarter specifically because **neither analyzer has a stop-word filter**
+/// (`tokenizer::prose_analyzer`, `tokenizer::code_analyzer`): `the`, `and` and `is` are real
+/// terms with real posting lists, and they sit above 90% of any transcript corpus, while the
+/// ambient technical vocabulary (`test`, `file`, `error`, `run`) sits in the 10-30% band. A
+/// quarter cuts the first group and keeps the discriminating half of the second.
+const SIMILAR_MAX_DOC_FREQUENCY_RATIO: u64 = 4;
+
+/// Floor under the computed `max_doc_frequency`. On an index of 80 documents a quarter is 20,
+/// which discards every ordinary word and leaves the empty query that matches nothing.
+const SIMILAR_MAX_DOC_FREQUENCY_FLOOR: u64 = 50;
+
+/// How often a term must occur *in the source turn* to be considered.
+///
+/// 1, not Tantivy's default of 2. The source is a turn made of short documents, and demanding a
+/// repeat throws away the single mention of the identifier that is the whole reason the turn is
+/// memorable. Term frequency stays the multiplier in `tf * idf`, so a term said five times
+/// still outranks one said once: this widens the candidate pool without flattening the ranking,
+/// and the document-frequency bounds and `SIMILAR_MAX_QUERY_TERMS` bound the clause count
+/// anyway.
+const SIMILAR_MIN_TERM_FREQUENCY: usize = 1;
+
+/// Clauses in the generated query. Every one is a posting-list walk, so latency is linear in
+/// this number.
+///
+/// Lucene ships 25 and Tantivy copies it; the seed here is a whole turn (a prompt, the calls it
+/// made and the answer) rather than one document, so the budget has to span more subjects.
+/// Above ~50 the tail scores sit within noise of each other and buy only latency. Note that
+/// Tantivy's cutoff is `if score_terms.len() > limit`, so the real cap is 33.
+const SIMILAR_MAX_QUERY_TERMS: usize = 32;
+
+/// Shortest analyzed token that can seed similarity, in **bytes on the analyzed token** —
+/// lowercased, and stemmed on a `prose` field.
+///
+/// `WordTokenizer` splits on non-word characters, so `-f` arrives as `f`, `2>&1` as `2` and
+/// `1`, and `&&` as nothing at all: every flag and redirection in a shell transcript becomes a
+/// one- or two-character token with an enormous document frequency. 3 removes those and every
+/// bare digit while keeping `git`, `api`, `run`. Not 4 — that would drop `bug`, `cli`, `sql`,
+/// `pdf`, and three-letter technical nouns are the densest signal a transcript has.
+const SIMILAR_MIN_WORD_LENGTH: usize = 3;
+
+/// Longest analyzed token that can seed similarity, in bytes.
+///
+/// `tokenizer::MAX_TOKEN_BYTES` is 255 precisely so a sha256 survives into the term dictionary
+/// and stays findable by pasting it back. That is right for an explicit query and wrong here:
+/// two documents sharing a 64-hex blob id share one build, not a topic. 32 sits above every
+/// identifier a person writes and below every hash, base64 chunk and dash-stripped uuid.
+const SIMILAR_MAX_WORD_LENGTH: usize = 32;
+
+/// Multiplier on the similarity clause as a whole.
+///
+/// `create_query` normalizes every clause by the best term's score, so this factor is uniform
+/// across the clause and only means anything *relative to a co-occurring free-text `Must`*.
+/// 1.0 lets an explicit query outvote the similarity when both are given, which is the right
+/// default: the words a person typed are evidence about what they want, and the seed turn is an
+/// inference. Lowering it is the one knob to reach for if the eval says otherwise.
+const SIMILAR_BOOST: Score = 1.0;
+
+/// Structural words that say "these two documents are the same *kind* of record", never "these
+/// two documents are about the same thing".
+///
+/// Written in **post-analyzer form** — lowercased and English-stemmed — because
+/// `MoreLikeThis::is_noise_word` is applied to the token the analyzer emitted, so `assistant`
+/// here would be a silent no-op. `the_similarity_stop_words_are_spelled_as_the_analyzer_emits`
+/// pins every entry against that.
+///
+/// The list is short on purpose, and stops where [`SIMILAR_MAX_DOC_FREQUENCY_RATIO`] starts.
+/// These are the words `parse.rs` writes into the `text` copy of every tool call by
+/// construction (the tool's own name) plus the role and harness vocabulary; a similarity that
+/// rides on "both of these are Bash calls" is precisely the false positive this feature must
+/// not make, and their frequency is a fact about how the corpus was assembled rather than about
+/// any topic in it. Everything else — English function words included — is left to the
+/// corpus-relative frequency bound, which adapts as an index grows and cannot go stale.
+///
+/// The cost is real and worth stating: `read`, `write`, `edit` and `task` are ordinary English
+/// words too, and a turn that is genuinely *about* writing to a file loses them as evidence.
+/// On this corpus the structural sense outnumbers the topical one by an order of magnitude.
+const SIMILAR_STOP_WORDS: [&str; 20] = [
+    // Tool names, as they appear at the head of every tool call's `text`.
+    "bash",
+    "read",
+    "write",
+    "edit",
+    "multiedit",
+    "grep",
+    "glob",
+    "task",
+    "todowrit", // TodoWrite
+    "webfetch",
+    "websearch",
+    "notebookedit",
+    // Roles.
+    "assist", // assistant
+    "user",
+    "human",
+    // Harness vocabulary, which every transcript carries and no transcript is about.
+    "system",
+    "remind", // reminder
+    "sidechain",
+    "toolus",     // tool_use, whose whole-identifier token drops the underscore
+    "toolresult", // tool_result
+];
+
+/// Could this analyzed token seed a similarity query? The word-length bounds and the stop-word
+/// list of Tantivy's own `MoreLikeThis::is_noise_word`, reimplemented because that type is not
+/// exported.
+///
+/// Kept beside the constants it applies rather than inside [`similar_query`], because its second
+/// caller is [`snippet_generator`]: the highlight has to answer "why did this come back" with
+/// the same vocabulary the query asked the question in.
+fn is_similarity_term(token: &str) -> bool {
+    (SIMILAR_MIN_WORD_LENGTH..=SIMILAR_MAX_WORD_LENGTH).contains(&token.len())
+        && !SIMILAR_STOP_WORDS.contains(&token)
+}
+
+/// The document-frequency band a term has to sit inside, for an index of `num_docs` documents.
+/// The upper bound is derived rather than frozen — see [`SIMILAR_MAX_DOC_FREQUENCY_RATIO`].
+fn similar_doc_frequency_band(num_docs: u64) -> std::ops::RangeInclusive<u64> {
+    SIMILAR_MIN_DOC_FREQUENCY
+        ..=(num_docs / SIMILAR_MAX_DOC_FREQUENCY_RATIO).max(SIMILAR_MAX_DOC_FREQUENCY_FLOOR)
+}
+
+/// The reference grammar, quoted verbatim in every error this module raises about one.
+const SIMILAR_REFERENCE_GRAMMAR: &str = "a reference is SESSION:SEQ, SESSION:AGENT:SEQ, a record uuid, or a doc_id — \
+     any of them by unambiguous prefix";
+
+/// Resolve a document reference to the turn it belongs to, and read that turn's text.
+///
+/// The reference grammar, disambiguated before any index access:
+///
+/// * `SESSION:SEQ` — two colon-separated parts whose second parses as a number. The main
+///   transcript of that session; the session part may be a prefix.
+/// * `SESSION:AGENT:SEQ` — three parts, the last a number, with `-` for the main transcript.
+///   This is the shape `Doc::doc_id` has once its `file_tag` is removed, and it is what a
+///   person copies out of a document listing.
+/// * anything else — an id: `doc_id`, `uuid` or `tool_use_id`, matched exactly first and then
+///   by prefix, so the leading block a user pastes works the way `resolve_id` already lets a
+///   session prefix work.
+///
+/// An ambiguous prefix is an error naming what it matched, never a silent pick — a "find
+/// similar" that quietly seeded from the wrong document would produce a plausible, wrong answer
+/// with no way to notice.
+///
+/// The source is the whole **turn**, not the referenced document. That is a deliberate default
+/// rather than a flag: a turn is the unit a person remembers ("the time we chased the fieldnorm
+/// bug"), and its documents are a prompt, the calls it made and the answer — each of which on
+/// its own is a fragment. A single tool call as a seed is mostly a file path and a diff, and
+/// the neighbours that explain it are exactly what a similarity search should be matching on.
+pub fn resolve_similar(
+    index: &tantivy::Index,
+    f: &Fields,
+    spec: &str,
+    fields: &[SimilarField],
+    include_source: bool,
+) -> anyhow::Result<SimilarSource> {
+    let doc = resolve_doc(index, f, spec)?;
+    let window = crate::context::turn_window(
+        index,
+        f,
+        &doc.source_path,
+        doc.turn_seq,
+        SIMILAR_SOURCE_DOCS,
+    )?;
+
+    // Sorted and deduplicated: `--similar-in text,text,code` is one selection, and a stable
+    // order keeps the resulting `SimilarSource` (which `--json` consumers and the eval harness
+    // both read) independent of the order the flags happened to be typed in.
+    let selected: BTreeSet<SimilarField> = fields.iter().copied().collect();
+
+    let mut values: Vec<(SimilarField, Vec<String>)> = Vec::new();
+    for field in selected.iter().copied() {
+        let mut collected: Vec<String> = Vec::new();
+        let mut bytes = 0usize;
+        for doc in &window.docs {
+            for value in field.values_of(doc) {
+                if value.trim().is_empty() || bytes >= SIMILAR_SOURCE_BYTES {
+                    continue;
+                }
+                bytes += value.len();
+                collected.push(value);
+            }
+        }
+        if !collected.is_empty() {
+            values.push((field, collected));
+        }
+    }
+
+    if values.is_empty() {
+        // Never let Tantivy's own message out: it says "the document may not have stored
+        // fields", and nothing here reads a stored field.
+        let names: Vec<&str> = selected.iter().map(|f| f.as_str()).collect();
+        bail!(
+            "the turn at {spec:?} (turn #{} of {}) has no indexed text in {}; \
+             try --similar-in text,code,tool_output",
+            doc.turn_seq,
+            doc.source_path,
+            names.join(",")
+        );
+    }
+
+    let source = SimilarSource {
+        doc_id: doc.doc_id,
+        source_path: doc.source_path,
+        turn_seq: doc.turn_seq,
+        turn_docs: window.total,
+        include_source,
+        values,
+    };
+    tracing::info!(
+        reference = %spec,
+        doc = %source.doc_id,
+        turn = source.turn_seq,
+        docs = source.turn_docs,
+        "similarity source resolved"
+    );
+    Ok(source)
+}
+
+/// The one document a reference names. See [`resolve_similar`] for the grammar.
+///
+/// Public because `show --around` takes the same references, and because two commands
+/// disagreeing about what `abc123` means would be worse than either behaviour on its own.
+pub fn resolve_doc(index: &tantivy::Index, f: &Fields, spec: &str) -> anyhow::Result<Doc> {
+    let spec = spec.trim();
+    if spec.is_empty() {
+        bail!("a document reference cannot be empty; {SIMILAR_REFERENCE_GRAMMAR}");
+    }
+    let searcher = index.reader()?.searcher();
+    let parts: Vec<&str> = spec.split(':').collect();
+
+    // The coordinate shapes are decided by their arity and by the last part parsing as a
+    // number, with no index access at all — so `s1:7` can never be mistaken for the prefix of
+    // some uuid that happens to contain a colon.
+    let coordinates = match parts.as_slice() {
+        [session, seq] => seq.parse::<u64>().ok().map(|seq| (*session, None, seq)),
+        [session, agent, seq] => seq
+            .parse::<u64>()
+            .ok()
+            .map(|seq| (*session, Some(*agent), seq)),
+        _ => None,
+    };
+
+    if let Some((session, agent, seq)) = coordinates {
+        let query = coordinate_query(f, session, agent, seq)?;
+        return match single_doc(&searcher, f, &query, spec)? {
+            Some(doc) => Ok(doc),
+            None => bail!("no document at {spec:?}; {SIMILAR_REFERENCE_GRAMMAR}"),
+        };
+    }
+
+    // Exact before prefix, mirroring `cli::resolve_id`: an id that is itself also the prefix of
+    // a longer one resolves to itself rather than reporting an ambiguity nobody has.
+    let exact = BooleanQuery::new(
+        [f.doc_id, f.uuid, f.tool_use_id]
+            .into_iter()
+            .map(|field| (Occur::Should, term_query(field, spec)))
+            .collect(),
+    );
+    if let Some(doc) = single_doc(&searcher, f, &exact, spec)? {
+        return Ok(doc);
+    }
+
+    let mut shoulds: Vec<(Occur, Box<dyn Query>)> = Vec::new();
+    for field in [f.doc_id, f.uuid, f.tool_use_id] {
+        shoulds.push((Occur::Should, prefix_query(field, spec)?));
+    }
+    match single_doc(&searcher, f, &BooleanQuery::new(shoulds), spec)? {
+        Some(doc) => Ok(doc),
+        None => bail!("no document matches {spec:?}; {SIMILAR_REFERENCE_GRAMMAR}"),
+    }
+}
+
+/// `SESSION:SEQ` / `SESSION:AGENT:SEQ` as a query. The session and agent parts match by prefix
+/// for the same reason `--session` does: a session id is a 36-character uuid and what a person
+/// pastes is its leading block.
+fn coordinate_query(
+    f: &Fields,
+    session: &str,
+    agent: Option<&str>,
+    seq: u64,
+) -> anyhow::Result<Box<dyn Query>> {
+    if session.trim().is_empty() {
+        bail!(
+            "a document reference needs a session id before the colon; {SIMILAR_REFERENCE_GRAMMAR}"
+        );
+    }
+    let mut clauses: Vec<(Occur, Box<dyn Query>)> =
+        vec![(Occur::Must, prefix_query(f.session_id, session)?)];
+    // `-` is how `doc_id` spells "the main transcript", and an absent agent means the same
+    // thing. Both become the `MustNot(Exists)` that `session_clauses` uses, because a subagent
+    // file numbers its own `seq` from zero and would otherwise collide with the parent.
+    match agent.map(str::trim).filter(|a| !a.is_empty() && *a != "-") {
+        Some(agent) => clauses.push((Occur::Must, prefix_query(f.agent_id, agent)?)),
+        None => clauses.push((
+            Occur::MustNot,
+            Box::new(ExistsQuery::new("agent_id".to_string(), false)),
+        )),
+    }
+    clauses.push((Occur::Must, flag_query(f.seq, seq)));
+    Ok(Box::new(BooleanQuery::new(clauses)))
+}
+
+/// Exactly one document, or an error naming the alternatives.
+///
+/// Two hits are fetched, never one: "the first of several" and "the only one" are the same
+/// result to a collector, and picking the first silently is how a similarity search ends up
+/// seeded from a document the caller never named. The order is by the `seq` fast field so the
+/// two candidates an error names are the same two on every run.
+fn single_doc(
+    searcher: &Searcher,
+    f: &Fields,
+    query: &dyn Query,
+    spec: &str,
+) -> anyhow::Result<Option<Doc>> {
+    let docs = docs_by_seq(searcher, f, query, 2)?;
+    match docs.as_slice() {
+        [] => Ok(None),
+        [only] => Ok(Some(only.clone())),
+        [a, b, ..] => bail!(
+            "ambiguous document reference {spec:?} matches at least 2: {}, {}",
+            a.doc_id,
+            b.doc_id
+        ),
+    }
+}
+
+/// The similarity clause: `MoreLikeThisQuery` over the seed turn's own text, wrapped so it
+/// survives a collector that turns scoring off.
+fn similar_query(f: &Fields, source: &SimilarSource, num_docs: u64) -> Box<dyn Query> {
+    let doc_fields: Vec<(Field, Vec<OwnedValue>)> = source
+        .values
+        .iter()
+        .map(|(field, values)| {
+            (
+                field.field(f),
+                values.iter().map(|v| OwnedValue::Str(v.clone())).collect(),
+            )
+        })
+        .collect();
+
+    // Derived from the corpus size on every query, and deliberately not a frozen literal:
+    // Tantivy's bound is an absolute document count, so a constant would quietly change meaning
+    // as an index grows from a thousand documents to a million.
+    let doc_frequency = similar_doc_frequency_band(num_docs);
+
+    let query = MoreLikeThisQuery::builder()
+        .with_min_doc_frequency(*doc_frequency.start())
+        .with_max_doc_frequency(*doc_frequency.end())
+        .with_min_term_frequency(SIMILAR_MIN_TERM_FREQUENCY)
+        .with_max_query_terms(SIMILAR_MAX_QUERY_TERMS)
+        .with_min_word_length(SIMILAR_MIN_WORD_LENGTH)
+        .with_max_word_length(SIMILAR_MAX_WORD_LENGTH)
+        .with_boost_factor(SIMILAR_BOOST)
+        .with_stop_words(SIMILAR_STOP_WORDS.iter().map(|s| s.to_string()).collect())
+        .with_document_fields(doc_fields);
+    Box::new(ScoredQuery(Box::new(query)))
+}
+
+/// A query that scores even when the collector asked it not to.
+///
+/// `MoreLikeThisQuery::weight` returns `Err("MoreLikeThisQuery requires to enable scoring.")`
+/// under `EnableScoring::Disabled`, and `Searcher::search` passes exactly that whenever
+/// `collector.requires_scoring()` is false. Three call sites in this module do:
+/// `TopDocs::order_by_fast_field` (`--sort newest|oldest`), [`docs_with_value`] (`&Count`) and
+/// all of [`facets`] (`&(Count, collector)`). `BooleanQuery` forwards `enable_scoring` verbatim
+/// to its sub-queries, so wrapping the similarity clause in a boolean does not rescue it —
+/// without this adapter, `--similar-to X --sort newest` and `--similar-to X --facets tool_name`
+/// are Tantivy errors about scoring rather than answers.
+///
+/// Re-enabling costs a BM25 computation nobody reads, and changes no output: the two time
+/// orders already replace every hit's score with `0.0` before returning it, and `Count` never
+/// looks at one. The `searcher_opt: None` arm is forwarded untouched — there is no searcher to
+/// score against there, so the honest outcome is Tantivy's own error.
+#[derive(Debug)]
+struct ScoredQuery(Box<dyn Query>);
+
+impl Clone for ScoredQuery {
+    fn clone(&self) -> Self {
+        ScoredQuery(self.0.box_clone())
+    }
+}
+
+impl Query for ScoredQuery {
+    fn weight(&self, enable_scoring: EnableScoring<'_>) -> tantivy::Result<Box<dyn Weight>> {
+        match enable_scoring {
+            EnableScoring::Disabled {
+                searcher_opt: Some(searcher),
+                ..
+            } => self
+                .0
+                .weight(EnableScoring::enabled_from_searcher(searcher)),
+            other => self.0.weight(other),
+        }
+    }
+
+    fn query_terms<'a>(&'a self, visitor: &mut dyn FnMut(&'a Term, bool)) {
+        // Forwarded for correctness, and empty in practice: the wrapped query is a
+        // `MoreLikeThisQuery`, which inherits the no-op default. Highlighting a similarity hit
+        // is handled where the terms actually are — see `snippet_generator`'s `similar`.
+        self.0.query_terms(visitor);
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -3479,5 +4214,300 @@ mod tests {
         );
         let ids: Vec<&str> = scored.iter().map(|(d, _)| d.as_str()).collect();
         assert_eq!(&ids[..2], ["b:-:0", "c:-:0"], "{scored:?}");
+    }
+
+    // -----------------------------------------------------------------------
+    // find similar
+    // -----------------------------------------------------------------------
+
+    /// Twelve documents in six two-document turns, split between two topics that share **no**
+    /// vocabulary at all.
+    ///
+    /// The disjoint vocabulary is what makes the assertions mean something on a corpus this
+    /// small. `SIMILAR_MAX_DOC_FREQUENCY_FLOOR` is 50, so on twelve documents nothing is ever
+    /// cut for being too common — a filler word shared by both topics would become a query term
+    /// and every document would match, leaving "topic B is absent" untestable. Every content
+    /// word here occurs in six documents, comfortably over `SIMILAR_MIN_DOC_FREQUENCY`, and no
+    /// word occurs in both halves.
+    fn similar_docs() -> Vec<Doc> {
+        const SCORING: &str = "fieldnorm normalisation lets bm25 discount lengthy documents";
+        const PARSING: &str = "recursive descent parsing turns grammar into syntax nodes";
+
+        (0..12u64)
+            .map(|seq| {
+                let mut d = blank_doc(seq);
+                // Two documents per turn, so excluding "the source turn" and excluding "the
+                // source document" are observably different outcomes.
+                d.turn_seq = seq - seq % 2;
+                // One document carries a real 36-character uuid so a *prefix* of one can be
+                // tested; `uuid-{seq}` prefixes each other and would only ever be ambiguous.
+                d.uuid = Some(if seq == 3 {
+                    "b20208d8-fbdb-5918-ba69-d203de6ed6dc".to_string()
+                } else {
+                    format!("uuid-{seq}")
+                });
+                d.doc_id = format!("s1:-:5e0f1a2b:{seq}");
+                d.text = vec![if seq < 6 {
+                    format!("{SCORING} {seq}")
+                } else {
+                    format!("{PARSING} {seq}")
+                }];
+                d
+            })
+            .collect()
+    }
+
+    fn similar_req(source: SimilarSource) -> SearchRequest {
+        SearchRequest {
+            similar_to: Some(source),
+            ..SearchRequest::default()
+        }
+    }
+
+    fn seeded(index: &tantivy::Index, f: &Fields, spec: &str) -> SimilarSource {
+        resolve_similar(index, f, spec, &[SimilarField::Text], false).unwrap()
+    }
+
+    fn refs(r: &SearchResponse) -> Vec<u64> {
+        r.hits.iter().map(|h| h.doc.seq).collect()
+    }
+
+    /// Every spelling of a reference names the same document, and so does an unambiguous prefix
+    /// of each. This is the acceptance box: `--similar-to` must resolve a reference the way
+    /// `show` resolves an id.
+    #[test]
+    fn every_spelling_of_a_document_reference_resolves_to_one_document() {
+        let (index, f) = index_docs(&similar_docs());
+        for spec in [
+            "s1:3",                                 // SESSION:SEQ
+            "s1:-:3",                               // SESSION:AGENT:SEQ, `-` for the main file
+            "s1:-:5e0f1a2b:3",                      // the doc_id itself
+            "b20208d8-fbdb-5918-ba69-d203de6ed6dc", // a record uuid
+            "b20208d8",                             // the leading block of one, as pasted
+        ] {
+            let doc = resolve_doc(&index, &f, spec).unwrap_or_else(|e| panic!("{spec:?}: {e:#}"));
+            assert_eq!(doc.seq, 3, "{spec:?} resolved to {}", doc.doc_id);
+        }
+        // A session prefix works in the coordinate shape too, exactly as `--session` does.
+        assert_eq!(resolve_doc(&index, &f, "s:3").unwrap().seq, 3);
+    }
+
+    /// An ambiguous prefix is a question, never a silent pick. A "find similar" seeded from a
+    /// document the caller never named produces a plausible, entirely wrong answer.
+    #[test]
+    fn an_ambiguous_document_reference_names_its_candidates() {
+        let mut docs = similar_docs();
+        docs[4].uuid = Some("dup-alpha".into());
+        docs[5].uuid = Some("dup-beta".into());
+        let (index, f) = index_docs(&docs);
+
+        let err = format!("{:#}", resolve_doc(&index, &f, "dup").unwrap_err());
+        assert!(err.contains("ambiguous document reference"), "{err}");
+        assert!(err.contains("at least 2"), "{err}");
+        assert!(
+            err.contains(&docs[4].doc_id) && err.contains(&docs[5].doc_id),
+            "{err}"
+        );
+
+        // The exact-before-prefix rule: one of them spelled in full is not ambiguous.
+        assert_eq!(resolve_doc(&index, &f, "dup-alpha").unwrap().seq, 4);
+    }
+
+    /// An unknown reference is an error naming the grammar, not an empty result set. The two
+    /// look identical on a terminal and only one of them is an answer.
+    #[test]
+    fn an_unknown_document_reference_is_an_error_not_an_empty_page() {
+        let (index, f) = index_docs(&similar_docs());
+        let err = format!("{:#}", resolve_doc(&index, &f, "nope-nothing").unwrap_err());
+        assert!(err.contains("no document matches"), "{err}");
+        assert!(err.contains("SESSION:SEQ"), "{err}");
+
+        let err = format!("{:#}", resolve_doc(&index, &f, "s1:999").unwrap_err());
+        assert!(err.contains("no document at"), "{err}");
+    }
+
+    /// The point of the feature: the other turns of the same topic come back, and the other
+    /// topic does not.
+    #[test]
+    fn similarity_finds_the_topic_and_not_the_corpus() {
+        let (index, f) = index_docs(&similar_docs());
+        let response = search(&index, &f, &similar_req(seeded(&index, &f, "s1:0"))).unwrap();
+        assert_eq!(
+            refs(&response),
+            vec![2, 3, 4, 5],
+            "the two remaining turns of the scoring topic, and nothing from the parsing one"
+        );
+    }
+
+    /// The source turn is excluded by default and restored by `--include-source`, where it
+    /// ranks first — which is what `MoreLikeThis` does by construction, and why the default is
+    /// the other way round.
+    #[test]
+    fn the_source_turn_is_excluded_unless_it_is_asked_for() {
+        let (index, f) = index_docs(&similar_docs());
+
+        let default = search(&index, &f, &similar_req(seeded(&index, &f, "s1:0"))).unwrap();
+        assert!(
+            !refs(&default).contains(&0) && !refs(&default).contains(&1),
+            "the seed at seq 0 and its turn sibling at seq 1 are both out: {:?}",
+            refs(&default)
+        );
+
+        let source = resolve_similar(&index, &f, "s1:0", &[SimilarField::Text], true).unwrap();
+        let included = search(&index, &f, &similar_req(source)).unwrap();
+        assert_eq!(
+            refs(&included).first(),
+            Some(&0),
+            "with --include-source the seed is back, and it ranks first: {:?}",
+            refs(&included)
+        );
+        assert_eq!(
+            included.total,
+            default.total + 2,
+            "the whole turn came back"
+        );
+    }
+
+    /// `--similar-to X -p /elsewhere --sort newest --facets tool_name` has to be one query.
+    ///
+    /// The two sorted arms and the facet arm are the regression test for [`ScoredQuery`]: all
+    /// three run collectors that disable scoring, and a bare `MoreLikeThisQuery` answers that
+    /// with `Err("MoreLikeThisQuery requires to enable scoring.")`. Without the adapter these
+    /// are not worse results, they are errors.
+    #[test]
+    fn similarity_composes_with_filters_sorting_and_facets() {
+        let (index, f) = index_docs(&similar_docs());
+        let source = seeded(&index, &f, "s1:0");
+
+        let filtered = SearchRequest {
+            filters: Filters {
+                project: Some("/home/user/other-project".into()),
+                ..Filters::default()
+            },
+            ..similar_req(source.clone())
+        };
+        assert_eq!(
+            search(&index, &f, &filtered).unwrap().total,
+            0,
+            "a project filter still ANDs on top of the similarity clause"
+        );
+        assert!(
+            search(&index, &f, &similar_req(source.clone()))
+                .unwrap()
+                .total
+                > 0
+        );
+
+        for sort in [SortBy::Newest, SortBy::Oldest] {
+            let request = SearchRequest {
+                sort,
+                ..similar_req(source.clone())
+            };
+            let response = search(&index, &f, &request)
+                .unwrap_or_else(|e| panic!("--similar-to --sort {sort:?} failed: {e:#}"));
+            assert_eq!(response.total, 4, "{sort:?}");
+        }
+        assert_eq!(
+            refs(
+                &search(
+                    &index,
+                    &f,
+                    &SearchRequest {
+                        sort: SortBy::Oldest,
+                        ..similar_req(source.clone())
+                    }
+                )
+                .unwrap()
+            ),
+            vec![2, 3, 4, 5]
+        );
+
+        // Both faceting entry points: the one that rides along with the hits, and `facets()`,
+        // which collects with `&(Count, collector)` and no `TopDocs` at all.
+        let with_facets = SearchRequest {
+            facets: vec!["role".to_string()],
+            ..similar_req(source.clone())
+        };
+        assert!(!search(&index, &f, &with_facets).unwrap().facets.is_empty());
+        let facet = facets(&index, &f, "role", &similar_req(source)).unwrap();
+        assert_eq!(facet.matching_docs, 4);
+        assert_eq!(facet.docs_with_value, 4);
+    }
+
+    /// A turn with nothing indexed in the selected fields is our error, naming the flag that
+    /// fixes it — never Tantivy's, which blames stored fields this code does not read.
+    #[test]
+    fn a_seed_with_no_indexed_text_is_refused_with_our_own_message() {
+        let mut docs = similar_docs();
+        // A turn of its own, carrying a rendered body and nothing the schema indexes as text.
+        let mut empty = blank_doc(12);
+        empty.turn_seq = 12;
+        empty.uuid = Some("uuid-12".into());
+        empty.doc_id = "s1:-:5e0f1a2b:12".into();
+        empty.body = "ok".into();
+        docs.push(empty);
+        let (index, f) = index_docs(&docs);
+
+        let err = format!(
+            "{:#}",
+            resolve_similar(&index, &f, "uuid-12", &[SimilarField::Text], false).unwrap_err()
+        );
+        assert!(err.contains("has no indexed text"), "{err}");
+        assert!(err.contains("--similar-in"), "{err}");
+        assert!(
+            !err.contains("stored fields"),
+            "Tantivy's own message leaked: {err}"
+        );
+    }
+
+    /// A similarity hit is highlighted from the seed turn's terms.
+    ///
+    /// `MoreLikeThisQuery` reports no `query_terms`, so without the `similar` argument to
+    /// `snippet_generator` every hit here would carry an unmarked head-of-body excerpt — no
+    /// error, no warning, just a search tool that stopped saying why anything matched.
+    #[test]
+    fn a_similarity_hit_still_says_why_it_matched() {
+        let (index, f) = index_docs(&similar_docs());
+        let response = search(&index, &f, &similar_req(seeded(&index, &f, "s1:0"))).unwrap();
+        let hit = response.hits.first().expect("a hit");
+        assert!(
+            !hit.snippet_marks.is_empty(),
+            "no highlight on {}: {:?}",
+            hit.doc.doc_id,
+            hit.snippet
+        );
+        assert!(hit.snippet.contains(HIGHLIGHT), "{:?}", hit.snippet);
+        assert_eq!(hit.snippet_field, SnippetSource::Text);
+    }
+
+    /// Every stop word is spelled the way the analyzer emits it.
+    ///
+    /// `MoreLikeThis::is_noise_word` tests the token *after* the analyzer has run, so an entry
+    /// written in surface form (`assistant`, `reminder`) is a silent no-op: the list would look
+    /// right and do nothing. Each entry is fed back through `prose_analyzer` here and has to
+    /// come out as itself.
+    #[test]
+    fn the_similarity_stop_words_are_spelled_as_the_analyzer_emits_them() {
+        let mut analyzer = crate::tokenizer::prose_analyzer();
+        for word in SIMILAR_STOP_WORDS {
+            let mut emitted: Vec<String> = Vec::new();
+            analyzer
+                .token_stream(word)
+                .process(&mut |token: &Token| emitted.push(token.text.clone()));
+            assert_eq!(
+                emitted,
+                vec![word.to_string()],
+                "{word:?} is not what the prose analyzer emits for it, so it would never match \
+                 a token and the entry would do nothing"
+            );
+        }
+        // The trap this test exists for, stated as an example: the surface spellings do not
+        // survive the stemmer, and `tool_use` loses its underscore in the whole-identifier
+        // token before it is stemmed at all.
+        let mut emitted: Vec<String> = Vec::new();
+        analyzer
+            .token_stream("assistant")
+            .process(&mut |token: &Token| emitted.push(token.text.clone()));
+        assert_eq!(emitted, vec!["assist".to_string()]);
     }
 }

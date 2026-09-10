@@ -94,6 +94,41 @@ intended: facets show whole commands/paths, search matches words inside them.
   ```
 - `tantivy` needs no extra cargo features for aggregations — they are built in.
 
+**`MoreLikeThisQuery` (0.26.2), read in full before `--similar-to` was written.** Five facts,
+each of which changes the design rather than decorating it:
+
+- **`with_document(addr)` collects from STORED fields, and from every one of them.** It calls
+  `searcher.doc(addr)` and walks `get_sorted_field_values()`; a field that is indexed and not
+  stored (`context_text`) is invisible to it, and a field that is stored and not indexed (`body`,
+  `raw`) is fetched and then dropped by an `is_indexed()` guard. For this schema that puts
+  `session_id`, `doc_id`, `source_path`, `seq`, `turn_seq`, `timestamp` and the flags into the
+  term pool — and a `session_id` term's document frequency is exactly the size of the source
+  session, which is squarely inside the "interesting" band. `with_document` would therefore
+  return the rest of the source session and call it similarity. **Use `with_document_fields`,
+  even for a single-document source.**
+- **`with_document_fields` checks only `is_indexed()`**, so it *can* target `context_text`.
+  Excluding the header has to be a written decision, not an accident of the storage flags.
+- **JSON fields hit a `_ => {}` arm** in `add_term_frequencies`: `tool_input` and `bash_cmd`
+  contribute nothing to similarity, silently. Do not offer `--similar-in tool_input`.
+- **`MoreLikeThisQuery` implements only `weight`.** It inherits the no-op default
+  `Query::query_terms`, so `SnippetGenerator::create` — and `search::snippet_generator`, which
+  is driven the same way — sees zero terms and every hit degrades to an unhighlighted
+  head-of-body excerpt. No error, no warning.
+- **`MoreLikeThisQuery::weight` errors under `EnableScoring::Disabled`** ("MoreLikeThisQuery
+  requires to enable scoring."), and `BooleanQuery`/`BoostQuery` forward `enable_scoring`
+  verbatim, so wrapping does not rescue it. `Searcher::search` passes `Disabled` whenever
+  `collector.requires_scoring()` is false — which is `TopDocs::order_by_fast_field`,
+  `docs_with_value`'s bare `Count`, and all of `facets()`. `search::ScoredQuery` rewrites
+  `Disabled { searcher_opt: Some(s) }` back to `enabled_from_searcher(s)`.
+
+Two more, smaller: an empty `field_to_values` slice is an `Err` whose message blames missing
+stored fields (a lie for any caller using `with_document_fields`), while a non-empty source whose
+terms are all filtered out yields a zero-clause `BooleanQuery` that matches nothing with no error
+at all — two different outcomes needing two different guards. And `max_query_terms` is off by
+one (`if score_terms.len() > limit`), so 32 admits 33 clauses. `MoreLikeThis` itself — the struct
+with the tuning fields — is **not** exported; only `MoreLikeThisQuery` and its builder are, so
+there is no way to inspect or reuse the `BooleanQuery` it builds.
+
 ## The two analyzers (`tokenizer.rs`)
 
 Two registered analyzers, one per kind of text:
@@ -284,7 +319,7 @@ tests/
   fixtures/eval/          the retrieval eval corpus: six synthetic transcripts
   fixtures/eval_queries.json   the graded query fixture
   eval/                   the retrieval eval harness [test target `eval`]
-    main.rs  corpus.rs  fixture.rs  metrics.rs  report.rs
+    main.rs  corpus.rs  fixture.rs  metrics.rs  report.rs  similar.rs
 docs/
   TRANSCRIPT-FORMAT.md   DESIGN.md   WEB-UI.md
 ```
@@ -867,7 +902,12 @@ falls through to the excerpt of its own body.
 `format.rs`:
 
 ```rust
-pub struct OutputOpts { pub json: bool, pub color: bool, pub context: usize, pub width: usize }
+pub struct OutputOpts {
+    pub json: bool, pub color: bool, pub context: usize, pub width: usize,
+    /// `SimilarSource::label()` for a `--similar-to` search: one header line naming the turn the
+    /// hits are similar to. Human rendering only — the `--json` envelope does not echo it.
+    pub similar_to: Option<String>,
+}
 /// The turn a window snapped to, and the size of that turn. A turn window is capped, so the
 /// rendering needs both numbers to say "turn #12 · 200 of 347 docs" instead of showing a
 /// truncated turn as if it were whole.
@@ -903,13 +943,165 @@ every inline span twice and move a fenced block to the end of the message. The o
 the rule above — a failed call previews its error first. `doc_json` carries `body`, `text`,
 `code`, `headings`, `code_lang` and `tool_output`.
 
+### Similarity (`--similar-to`)
+
+"Find me more turns like this one" is a different question from "find me turns matching these
+words", and the difference is not stylistic: a person who has found one good answer usually
+cannot say *which* of the words in front of them were the ones that mattered. Tantivy answers it
+with `MoreLikeThisQuery` — re-tokenize a source document, keep the terms that discriminate, OR
+them into a `BooleanQuery` of `TermQuery`s weighted by `tf * idf`. Everything below is the gap
+between that sentence and a feature. The five API facts it is built on are in **Verified Tantivy
+facts** and are not repeated here.
+
+**Where it sits: one more `Occur::Must` clause in `build_query`.** That is the entire integration.
+Nothing downstream learns that a clause came from a document rather than from a word, so the
+collectors, `Count`, the aggregations, `docs_with_value`, `--context turn` and paging all compose
+for free — and `--similar-to X "regression" -p ~/code --since 30d --errors-only` is one
+`BooleanQuery`, which is what makes "more like this, but only in this project, only last month"
+a command rather than a feature request.
+
+**How a reference resolves.** `search::resolve_doc` takes four shapes, disambiguated by arity
+before any index access, so a coordinate can never be mistaken for a uuid:
+
+| shape | example | resolved by |
+| --- | --- | --- |
+| `SESSION:SEQ` | `b20208d8:41` | session prefix + `MustNot(Exists(agent_id))` + `seq` term |
+| `SESSION:AGENT:SEQ` | `b20208d8:a108:41` | as above with an agent prefix; `-` means the main file |
+| a record uuid or `tool_use_id` | `018f2c…` | exact term on `uuid` / `tool_use_id` / `doc_id` |
+| a `doc_id` | `s1:-:7b841ded:2` | the same term query; `doc_id` is four colon-separated parts |
+
+Anything that is not a coordinate goes through the id path, which tries **exact before prefix** —
+mirroring `cli::resolve_id`, so an id that is also the prefix of a longer one resolves to itself.
+Two candidates are fetched, never one: "the first of several" and "the only one" are the same
+result to a collector, and picking the first silently is how a similarity search ends up seeded
+from a document nobody named. An ambiguous prefix names its candidates and stops. This resolves
+index-side rather than through `sessions.json`, which is why it covers uuids and `doc_id`s and not
+just session ids — `cli::resolve_id` is still what expands a session id for `show`'s first
+argument.
+
+`show --around` was rerouted through the same resolver. Two commands disagreeing about what
+`abc123` means would be worse than either behaviour alone, and it retires a linear scan of up to
+50 000 documents in favour of a term query. It also gains the ambiguity error: `--around` used to
+take the *first* document whose uuid started with what was typed, in `seq` order. A reference that
+resolves outside the session named on the command line is refused with both sides named, because
+"no such uuid" would be a lie about a document that plainly exists.
+
+**The source is the whole turn.** A default, not a flag. A turn is the unit a person remembers —
+the prompt, the calls it made, the answer — and each of those alone is a fragment: a tool call on
+its own is a path and an exit code. `context::turn_window` reads it, capped at
+`SIMILAR_SOURCE_DOCS = 200` for the same reason `cli::TURN_WINDOW_LIMIT` exists (a sidechain file
+is one turn by rule 3, so an uncapped seed is a whole subagent transcript), and at
+`SIMILAR_SOURCE_BYTES = 256 KiB` per field so one `cat` of a large file cannot make term
+extraction the slowest part of a query.
+
+A consequence worth writing down, because it contradicts the usual description of MoreLikeThis:
+**the source does not reliably rank first when it is included.** That property holds for a
+single-document seed — the document matches every clause it generated — and fails for a
+turn-shaped one, because no single document of the turn carries the whole union of its terms and
+BM25 length normalisation then lets a short document elsewhere outrank all of them. The eval
+harness measures a case of exactly that. It is also why the source turn is removed by an explicit
+`MustNot` rather than by trusting the ranking to put it somewhere predictable.
+
+**What seeds it.** `--similar-in` selects among `text` (the default), `code`, `tool_output` and
+`thinking`; `thinking` is gated on `--include-thinking` like everywhere else. `text` alone is what
+means *about the same thing*; `code` and `tool_output` mean *built out of the same identifiers*
+and *failed the same way*. `tool_input` and `bash_cmd` are not offered at all — they are JSON
+fields, which Tantivy's term extraction skips in silence, so the flag would do nothing.
+
+**`context_text` is excluded, deliberately.** `with_document_fields` could target it — it only
+checks `is_indexed()` — and that is exactly why the exclusion is a decision rather than a
+side-effect of the field not being stored. The header is near-identical for every document of a
+session by construction (that is what makes it work for retrieval), so its terms would pull the
+whole source session back and call it similarity: the one false positive this feature exists to
+avoid. The interaction runs the other way too, and `SIMILAR_MAX_DOC_FREQUENCY_RATIO` is what
+handles it: the header makes session-wide words *common*, and a term that common is dropped.
+
+**The tuning, and why each number.** "Left at the default" is not an answer for any of these.
+
+| parameter | value | why |
+| --- | --- | --- |
+| `min_doc_frequency` | `3` | Below this a term is a path, a uuid fragment, a blob id or a typo: it can match one or two documents while its idf dominates the score. 3 not Tantivy's 5, because a document here is one message, so a real shared term can live in a handful. Not 1, because `MAX_TOKEN_BYTES = 255` deliberately keeps whole sha256s in the dictionary. |
+| `max_doc_frequency` | `max(N / 4, 50)` | Derived from `searcher.num_docs()` per query, never frozen: Tantivy's bound is an absolute count, so a literal would change meaning as an index grows. Neither analyzer has a stop-word filter, so `the` / `and` / `is` are real terms above 90%; ambient technical words (`test`, `file`, `error`) sit at 10–30%. A quarter cuts the first and keeps the second. The floor of 50 stops a brand-new 80-document index from discarding every ordinary word and returning the empty query. |
+| `min_term_frequency` | `1` | Not Tantivy's 2. The seed is a turn of short documents, and requiring a repeat throws away the single mention of the identifier that is the whole reason the turn is memorable. `tf` remains the multiplier in `tf * idf`, so a term said five times still outranks one said once. |
+| `max_query_terms` | `32` | Every clause is a posting-list walk, so latency is linear in it. Lucene ships 25 and Tantivy copies it; a turn-shaped seed spans more subjects than one document, so the budget is wider. Above ~50 the tail scores are within noise. (Tantivy's cutoff is `>`, so the real cap is 33.) |
+| `min_word_length` | `3` | Bytes on the **analyzed** token. `WordTokenizer` splits on non-word characters, so `-f` arrives as `f`, `2>&1` as `2` and `1`, `&&` as nothing: every flag and redirection becomes a one- or two-character token with an enormous document frequency. Not 4 — that would drop `bug`, `cli`, `sql`, `api`. |
+| `max_word_length` | `32` | `MAX_TOKEN_BYTES` is 255 so a sha256 stays findable by pasting it back. Right for an explicit query, wrong here: two documents sharing a blob id share one build, not a topic. 32 is above every hand-written identifier and below every hash and dash-stripped uuid. |
+| `boost_factor` | `1.0` | `create_query` normalizes each clause by the best term's score, so this is uniform across the similarity clause and only means anything *relative to a co-occurring free-text `Must`*. 1.0 lets an explicit query outvote the similarity, which is right: typed words are evidence, a seed turn is an inference. |
+| `stop_words` | 20 entries | See below. |
+
+The stop-word list is written in **post-analyzer form** — lowercased and English-stemmed — because
+`is_noise_word` runs on the token the analyzer emitted, so `assistant` would be a silent no-op
+where `assist` works. `tool_use` is `toolus`, because the whole-identifier token drops the
+underscore before the stemmer sees it. A unit test feeds every entry back through
+`tokenizer::prose_analyzer()` and requires it to come out unchanged.
+
+It is short on purpose and stops where `max_doc_frequency` starts. It holds only what a
+corpus-relative bound cannot reliably catch: the tool names `parse.rs` writes into the `text` copy
+of every tool call by construction, the role words, and the harness vocabulary. A similarity that
+rides on "both of these are Bash calls" is precisely the false positive the feature must not make,
+and the frequency of those words is a fact about how a corpus was assembled rather than about any
+topic in it. Everything else — English function words included — is left to the frequency bound,
+which adapts as an index grows and cannot go stale. The cost is real: `read`, `write`, `edit` and
+`task` are ordinary English words too, and a turn genuinely *about* writing a file loses them as
+evidence.
+
+**The source document, and what happens to it.** The source *turn* is removed by
+`(Occur::MustNot, context::turn_query(...))` — the whole turn, not just the referenced document,
+because the turn's siblings share its vocabulary by construction and the first page would
+otherwise be the four things already on screen. That is what `show --turn` is for.
+`--include-source` puts it back, for debugging and so an eval can check the construction. The
+exclusion is *announced*, not silent: the human rendering prints
+`similar to <doc_id> · turn #<n> · <k> docs` above the count, so a `--limit 10` that returns nine
+neighbours of a four-document turn is legible rather than a discrepancy. The `MustNot` sets
+`minimum_number_should_match` to 0 on the outer boolean, which is correct because the similarity
+clause is a `Must`.
+
+**Two empty outcomes, two different answers.** An empty `field_to_values` slice makes Tantivy
+return "Cannot create more like this query on empty field values. The document may not have stored
+fields" — a message that would be an outright lie here, since none of this reads a stored field —
+so `resolve_similar` refuses first, with an error naming the turn, the fields it looked in and the
+flag that widens them. A *non-empty* seed whose terms all fall outside the tuning is a zero-clause
+`BooleanQuery` that matches nothing and reports no error at all; that one cannot be caught up
+front, so `search()` logs a warning when a similarity search returns `total == 0` saying which
+knobs decide it. Neither case can panic and neither can silently match the whole corpus.
+
+**Highlighting.** `MoreLikeThisQuery` reports no `query_terms`, so without a second source of
+terms every similarity hit would fall through to an unhighlighted head-of-body excerpt — a search
+tool that quietly stopped saying why anything matched. `snippet_generator` takes the seed text for
+the field and derives terms from it directly, applying the *same* filters the query applied — word
+lengths, the document-frequency band, the stop words — because a highlight is a claim about why a
+document came back, and marking `Bash` when `bash` is on the stop-word list would answer that
+question confidently and wrongly. The one filter not applied is `max_query_terms`, whose choice of
+"best 32" depends on a `tf * idf` ordering there is no reason to recompute; the surplus terms are
+ones the hit genuinely contains and the `1 / (1 + doc_freq)` weighting sorts them last anyway.
+
+**Sorting.** With `ScoredQuery` in place, `--similar-to --sort newest` means "documents similar to
+this one, most recent first", which is a legitimate request. The scores it discards were being
+zeroed anyway (`search()` replaces every hit's score with `0.0` under a time order), so re-enabling
+scoring for those collectors costs a BM25 computation nobody reads and changes no output.
+
+**The HTTP API deliberately does not carry it.** Three reasons. `dto::SearchBody` exists to be
+Elastic Search UI's `RequestState`, and Search UI has no notion of "documents like this one", so a
+`similar_to` key would sit outside the envelope that module exists to satisfy. Resolving a
+reference has its own ambiguity error, which wants its own status shape and, honestly, its own
+route — `GET /api/similar/{ref}` returning the same hit envelope — rather than a smuggled search
+parameter. And the bundled UI has no affordance to trigger it, so it would be dead,
+unauthenticated surface on a local port that already serves every secret in every transcript.
+`Params::reject_unknown(SEARCH_PARAMS)` already turns `?similar_to=…` into a 400 listing what the
+endpoint does take, which is the right answer for free; `similar_to_is_not_a_search_parameter`
+pins it so the decision cannot decay into an oversight. Revisit when the eval numbers justify a
+route.
+
+**`STATE_VERSION` does not move.** Nothing here changes what is written to the index.
+
 ### Retrieval evaluation
 
 `tests/eval/` is a test target, not a module of `src/`: an eval harness is not production code,
 and everything it needs — `build_schema`, `tokenizer::register`, `parse_whole`, `doc_to_json`,
 `search`, `facets` — is already public. Run it with `cargo test --test eval`; add `-- --nocapture`
 to see the tables. Every run also writes `target/eval/report.md`, `target/eval/ablation.md`,
-`target/eval/hits.md` and `target/eval/corpus.md`, which are the artifacts a pull request pastes.
+`target/eval/similar.md`, `target/eval/hits.md`, `target/eval/similar-hits.md` and
+`target/eval/corpus.md`, which are the artifacts a pull request pastes.
 
 **What it is for.** Ranking changes here are argued from first principles — an analyzer that
 splits identifiers, a heading boost, a discounted context header — and until this existed there
@@ -1022,6 +1214,51 @@ corpus roughly two thirds of the header's benefit comes from `sessions.json`'s t
 prompt and one third from the per-document pieces the parser already had. No class regresses,
 which is what the harness asserts rather than merely printing.
 
+**The MoreLikeThis arm (issue #26)**, which is the fourth configuration the closure-shaped metric
+core was built for, and the one that needs its protocol stated before its numbers are read.
+
+A query fixture cannot score a document-seeded search as it stands, so `tests/eval/similar.rs`
+defines a bridge and writes it down rather than hiding it. Every ranked row gets a **seed**: the
+document that row graded highest, ties broken by reference order so the choice is deterministic
+and does not depend on what the comparison arm returned. The similarity arm then discards the
+query string entirely, searches by `--similar-to <seed>`, and keeps the row's filters. The graded
+set is **narrowed** to what that arm could possibly return — the seed and every other document of
+the seed's turn are dropped, because the shipped default excludes the source turn — and a row
+whose graded set was *only* the seed's turn is dropped from the arm and counted. Both arms are
+scored over that same narrowed fixture, so the table compares two answers to one question.
+
+27 of the 39 rows survive that narrowing. At k = 10 (`target/eval/similar.md`):
+
+| class | scored | recall@10 text | recall@10 MLT | Δ | nDCG@10 text | nDCG@10 MLT |
+| --- | --- | --- | --- | --- | --- | --- |
+| identifier | 6 | 1.000 | 0.361 | −0.639 | 0.851 | 0.210 |
+| boundary | 7 | 0.894 | 0.570 | −0.324 | 0.573 | 0.526 |
+| paraphrase | 6 | 0.706 | 0.589 | −0.117 | 0.714 | 0.334 |
+| filtered | 8 | 1.000 | 0.875 | −0.125 | 0.801 | 0.643 |
+| overall | 27 | 0.907 | 0.618 | −0.289 | 0.734 | 0.448 |
+
+**Read that as a baseline, not as a verdict, and read only the recall column.** Three of the four
+classes are asking this arm a question it is not for. `identifier` and `boundary` are analyzer
+tests over a typed query, and there is no typed query here at all: what they measure is "having
+found one document about `open_or_create`, are the others nearby", which is a coincidence rather
+than a design goal, and the −0.639 is exactly what one should expect. `filtered` transfers
+cleanly, and its 0.875 is the property that actually matters — the filters still AND on top of
+the similarity clause. `paraphrase` is the fairest of the four, because it is the class where the
+query words are *not* the transcript's words, which is the situation similarity exists for; MLT
+loses 0.117 recall there against a text query that has the `context_text` header working for it.
+MRR and nDCG are printed for symmetry and mean little: a similarity search has no notion of "the
+answer" that belongs at rank 1.
+
+The number to beat, for anything that proposes to rerank these results, is **paraphrase recall
+0.589 and overall recall 0.618 at k = 10** on this fixture and this protocol — and any proposal
+that changes the protocol has to say so, because the protocol is doing at least as much work as
+the ranker.
+
+One row returns nothing at all (`filtered-lang-python`: a `--lang python` filter ANDed with a
+similarity clause whose seed shares no surviving term with either python fence), which is the
+zero-clause outcome the `total == 0` warning exists for, arriving in the report as an honest 0.000
+rather than as an error.
+
 **What a 65-document synthetic corpus cannot tell you**, stated plainly because the numbers above
 will be quoted:
 
@@ -1042,6 +1279,12 @@ will be quoted:
 - **Only what was planted.** Every mechanism the corpus exercises is one someone deliberately put
   there. A retrieval failure mode nobody thought of is not in it, which is the standing argument
   for adding rows written against real slices as they are redacted.
+- **Almost nothing about the similarity tuning.** `SIMILAR_MAX_DOC_FREQUENCY_FLOOR = 50` means
+  that on 65 documents *nothing* is ever cut for being too common, so the upper document-frequency
+  bound — the parameter that does the most work on a real index, and the one that answers the
+  `context_text` interaction — is entirely inert in these numbers. `min_doc_frequency = 3` is
+  correspondingly harsh at this size. Both are corpus-relative by design and both need a real
+  index to be judged.
 
 ### Optional features: `http-api` and `web-ui`
 
@@ -1101,8 +1344,10 @@ session-search index [--full] [--root DIR]... [--index DIR] [--jobs N] [--includ
 session-search search <QUERY> [FILTERS] [--facets f1,f2] [--context N|turn]
                               [--limit N] [--offset N] [--json] [--no-refresh]
                               [--include-thinking] [--sort relevance|newest|oldest]
+                              [--similar-to REF] [--similar-in text,code,tool_output,thinking]
+                              [--include-source]
 session-search facets <FIELD> [--query Q] [FILTERS] [--top N] [--json] [--no-refresh]
-session-search show <SESSION_ID> [--agent AGENT_ID] [--around UUID|SEQ] [--turn]
+session-search show <SESSION_ID> [--agent AGENT_ID] [--around REF|SEQ] [--turn]
                                  [--before N] [--after N] [--limit N] [--json] [--no-refresh]
 session-search sessions [FILTERS] [--limit N] [--json] [--no-refresh]
 session-search stats [--json]
@@ -1126,6 +1371,13 @@ count — `cli::TURN_WINDOW_LIMIT` for `search`, `show`'s own `--limit` — beca
 unbounded (rule 3 makes a whole sidechain transcript one turn) and `TopDocs` preallocates
 whatever it is handed. What the cap leaves out is always reported, never dropped silently:
 `turn #12 · 200 of 347 docs` in the human rendering, `context_turn` / `turn` in the JSON.
+
+**Document references.** `search --similar-to` and `show --around` take the same four shapes —
+`SESSION:SEQ`, `SESSION:AGENT:SEQ` (`-` for the main transcript), a record uuid or `tool_use_id`,
+or a `doc_id` — each by unambiguous prefix, resolved by one function so the two commands cannot
+disagree about what `abc123` means. An ambiguous prefix names its candidates and stops; it never
+picks the first. See **Similarity** for the grammar table and for what `--similar-to` does with
+what it resolves.
 
 **`FIELD` for `facets`** is any fast field name (`tool_name`, `project`, `model`,
 `git_branch`, `role`, `kind`, `agent_type`, `entrypoint`, `code_lang`) **or any JSON path** such

@@ -15,6 +15,8 @@
 //!   graded relevance and per-row provenance.
 //! * [`metrics`] — recall@k, MRR and nDCG@10 over a closure, so a *different retrieval
 //!   configuration* is scored by the same arithmetic.
+//! * [`similar`] — issue #26's `MoreLikeThisQuery` as a fourth configuration, with the protocol
+//!   that makes a query fixture answerable by a document-seeded search written out in full.
 //! * [`report`] — markdown tables built to be diffed rather than admired.
 //!
 //! The floors below are the point of the whole thing. A query set that returns nothing scores
@@ -27,6 +29,7 @@ mod corpus;
 mod fixture;
 mod metrics;
 mod report;
+mod similar;
 
 use std::collections::BTreeSet;
 use std::path::PathBuf;
@@ -355,5 +358,95 @@ fn aggregation_shaped_queries_are_a_facet_not_a_ranking() -> anyhow::Result<()> 
         checked >= 6,
         "only {checked} aggregation-shaped rows were checked"
     );
+    Ok(())
+}
+
+/// Issue #26's `MoreLikeThisQuery`, scored so that the next proposal for a neural reranker has
+/// a number to beat rather than an intuition to argue with.
+///
+/// Read [`similar`]'s module documentation before reading the table this writes: the fixture
+/// asks "which documents match these words" and this arm answers "which documents look like
+/// this one", so the protocol that bridges the two — seed, discarded query string, kept
+/// filters, narrowed graded set — is what the numbers are actually about.
+///
+/// Two assertions and no floor. A floor would be a claim that a particular similarity quality
+/// is required, which nothing in the product depends on yet. What is asserted is that the
+/// configuration *works*: it answers every query without erroring, it finds something relevant
+/// overall, and with `--include-source` the seed comes back ranked first — the property
+/// `MoreLikeThis` has by construction, and therefore the one whose absence would mean the query
+/// is not being built from the seed at all.
+#[test]
+fn more_like_this_is_scored_as_the_similarity_baseline() -> anyhow::Result<()> {
+    let (fixture, corpus, _) = loaded()?;
+    let (index, fields) = corpus.index(Variant::WithContext)?;
+    let placements = similar::Placements::of(&corpus);
+    let narrowed = similar::narrow(&fixture, &placements);
+
+    let text_run = similar::text_run(&index, &fields, K);
+    let text = evaluate(
+        &narrowed.fixture,
+        "text query, seed's turn ungraded",
+        &text_run,
+        K,
+    )?;
+
+    let run = similar::similar_run(&index, &fields, &placements, &narrowed.seeds, K, false);
+    let mlt = evaluate(
+        &narrowed.fixture,
+        "more like this, seeded from the top-graded document",
+        &run,
+        K,
+    )?;
+
+    assert!(
+        mlt.overall.recall > 0.0,
+        "the similarity arm retrieved nothing relevant on any query. An over-tuned \
+         MoreLikeThis returns an empty BooleanQuery that matches nothing without erroring, so \
+         this is what that failure looks like from the outside."
+    );
+
+    // The construction check: with `--include-source`, the seed's own turn is retrievable.
+    //
+    // Deliberately *not* "the seed ranks first". That is true of `MoreLikeThis` seeded from one
+    // document — it matches every clause it generated, and Tantivy's own test asserts it — and
+    // it is **false** here, measurably, because the seed is a whole turn. The query is built
+    // from the union of the turn's documents, no single one of them carries all of it, and BM25
+    // length normalisation then lets a short document elsewhere that concentrates the surviving
+    // terms outrank every document of the turn the terms came from. `ident-source-path` is that
+    // case on this corpus. It is a fact about turn-shaped seeds worth knowing, and it is the
+    // reason the source turn is excluded by *filtering* rather than by trusting the ranking to
+    // put it somewhere predictable.
+    let with_source = similar::similar_run(&index, &fields, &placements, &narrowed.seeds, K, true);
+    for query in &narrowed.fixture.queries {
+        let hits = with_source(query)?;
+        let seed = &narrowed.seeds[&query.id];
+        let turn = placements.turn_of(seed);
+        assert!(
+            hits.iter().any(|hit| turn.contains(hit)),
+            "query {:?} with --include-source retrieved none of its own seed turn {turn:?}; it \
+             retrieved {hits:?}. The seed matches the terms the seed produced, so this means \
+             the query was not built from the seed.",
+            query.id
+        );
+    }
+
+    let mut out = String::from("# More like this — issue #26\n\n");
+    out.push_str(&similar::preamble(&narrowed, fixture.queries.len()));
+    out.push('\n');
+    out.push_str(&mlt.table());
+    out.push_str("\n\n");
+    out.push_str(&Report::diff(&text, &mlt));
+    if !narrowed.dropped.is_empty() {
+        out.push_str(&format!(
+            "\nDropped from this arm: {}.\n",
+            narrowed.dropped.join(", ")
+        ));
+    }
+    publish("similar.md", &out)?;
+    std::fs::write(
+        artifact_dir().join("similar-hits.md"),
+        report::hits_listing(&mlt),
+    )?;
+    insta::assert_snapshot!(report::class_table_only(&mlt));
     Ok(())
 }

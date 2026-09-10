@@ -26,7 +26,13 @@ const QUERY_W: usize = 32;
 type MetricOf = fn(&ClassMetrics) -> f64;
 
 /// `0.000`-style, so a column of them lines up and a diff shows only what moved.
+///
+/// Negative zero is normalised because it is reachable: `f64`'s `Sum` folds from `-0.0`, so a
+/// configuration that returns an empty ranked list scores an nDCG of `-0.0` and the table prints
+/// `-0.000`. A minus sign in front of a metric reads as a signed quantity, and none of these
+/// three is one.
 fn f3(v: f64) -> String {
+    let v = if v == 0.0 { 0.0 } else { v };
     format!("{v:.3}")
 }
 
