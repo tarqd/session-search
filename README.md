@@ -26,6 +26,17 @@ cargo build --release
 # binary at ./target/release/session-search
 ```
 
+That is the whole tool. Two extra features — a browser UI and the HTTP API under it — are
+**off by default** and have to be asked for, because they bind a port and serve your transcripts
+verbatim:
+
+```bash
+cargo build --release --features web-ui     # UI + API
+cargo build --release --features http-api   # API only
+```
+
+See [The web UI and the HTTP API](#the-web-ui-and-the-http-api).
+
 Or install it onto your `PATH`:
 
 ```bash
@@ -39,8 +50,8 @@ cargo install --path .
    Installed package `session-search v0.1.0 (/home/user/session-search)` (executable `session-search`)
 ```
 
-No configuration, no daemon, no network access. It reads `~/.claude/projects/` (or
-`$CLAUDE_CONFIG_DIR/projects`) and writes one index directory.
+No configuration, no daemon, no network access — a default build has no socket in it at all. It
+reads `~/.claude/projects/` (or `$CLAUDE_CONFIG_DIR/projects`) and writes one index directory.
 
 ---
 
@@ -709,7 +720,7 @@ needed; it costs one full pass, 76 ms for the 193 documents on this machine.
 
 ## CLI reference
 
-Generated from `--help`.
+Generated from `--help`, from a build with all features on.
 
 ```
 Search Claude Code session transcripts
@@ -723,6 +734,7 @@ Commands:
   show      Print a session, or the turns around one hit
   sessions  List indexed sessions, most recent first
   stats     Index statistics, read from the index directory without touching it
+  serve     Serve the index over HTTP (and, with the `web-ui` feature, the browser UI)
   help      Print this message or the help of the given subcommand(s)
 
 Options:
@@ -734,6 +746,11 @@ Options:
   -h, --help         Print help
   -V, --version      Print version
 ```
+
+`serve` is the only line above that a default build does not have: it comes with the `http-api`
+feature, and a binary built without it has six commands, not seven. Everything else on this page
+is in every build. See [The web UI and the HTTP API](#the-web-ui-and-the-http-api) for what
+`serve` does and how to build it in.
 
 ### Filters
 
@@ -834,10 +851,82 @@ Options:
       --json              One JSON object on stdout instead of the human rendering
       --no-refresh        Skip the incremental index refresh that normally runs first
       --include-thinking  Search assistant thinking blocks too
+      --sort <ORDER>      Hit order. Relevance is meaningless without a query, so a filter-only
+                          search is worth ordering by time [default: relevance] [possible values:
+                          relevance, newest, oldest]
   -h, --help              Print help
 ```
 
 Plus the filter block above.
+
+#### `--sort relevance|newest|oldest`
+
+Relevance is the default and is the right answer whenever you typed a query. It is worth nothing
+at all when you did not. A filter-only browse — every `Read` on this branch, say — hands every
+matching document the identical score, and what comes back is whatever order the index happened to
+be in:
+
+```bash
+session-search search "" -t Read --limit 3            # --sort relevance, the default
+```
+
+```
+3 of 20 hits · 7 ms
+
+▌ aa7b6a5b-8ebc-5e23-b445-77c0f55a464a  agent a21eddf59f0012ffe · workflow-subagent  (1 hit)
+▌ /home/user/session-search · claude/index-search-web-ui-ukm1ho · 2026-09-10 01:45
+
+   1. 01:45:10  assistant Read file_path=/home/user/session-search/docs/WEB-UI.md  #7  2.45
+      Read /home/user/session-search/docs/WEB-UI.md
+
+▌ aa7b6a5b-8ebc-5e23-b445-77c0f55a464a  agent a804502e59f2148a1 · workflow-subagent  (1 hit)
+▌ /home/user/session-search · claude/index-search-web-ui-ukm1ho · 2026-09-10 01:58
+
+   2. 01:58:12  assistant Read file_path=/home/user/session-search/docs/DESIGN.md  #8  2.45
+      Read /home/user/session-search/docs/DESIGN.md
+
+▌ aa7b6a5b-8ebc-5e23-b445-77c0f55a464a  agent ac197025e9eb0a521 · workflow-subagent  (1 hit)
+▌ /home/user/session-search · claude/index-search-web-ui-ukm1ho · 2026-09-10 01:30
+
+   3. 01:30:30  assistant Read file_path=/home/user/session-search/docs/WEB-UI.md  #7  2.45
+      Read /home/user/session-search/docs/WEB-UI.md
+```
+
+Three identical `2.45`s, and a first hit from 01:45 sitting above one from 01:58. `--sort newest`
+answers the question that was actually being asked:
+
+```bash
+session-search search "" -t Read --sort newest --limit 3
+```
+
+```
+3 of 20 hits · 7 ms
+
+▌ aa7b6a5b-8ebc-5e23-b445-77c0f55a464a  agent a804502e59f2148a1 · workflow-subagent  (2 hits)
+▌ /home/user/session-search · claude/index-search-web-ui-ukm1ho · 2026-09-10 01:58
+
+   1. 01:58:12  assistant Read file_path=/home/user/session-search/docs/DESIGN.md  #8  0.00
+      Read /home/user/session-search/docs/DESIGN.md
+
+   2. 01:58:12  assistant Read file_path=/home/user/session-search/docs/WEB-UI.md  #7  0.00
+      Read /home/user/session-search/docs/WEB-UI.md
+
+▌ aa7b6a5b-8ebc-5e23-b445-77c0f55a464a  agent a102c9c49bc9ca257 · workflow-subagent  (1 hit)
+▌ /home/user/session-search · claude/index-search-web-ui-ukm1ho · 2026-09-10 01:52
+
+   3. 01:52:53  assistant Read file_path=/home/user/session-search/docs/DESIGN.md  #8  0.00
+      Read /home/user/session-search/docs/DESIGN.md
+```
+
+The score column reads `0.00` under a time order, deliberately: the hits were ranked by a
+timestamp, and printing a relevance number that had no part in choosing them would be a lie you
+could not check. `--sort oldest` is the same thing pointed the other way, which is how you find
+the *first* time you touched something.
+
+The one thing a time order cannot do is order what has no time. Every document built from a
+Claude Code transcript carries a timestamp, but a record that ever reaches disk without one has
+nothing to be sorted by — it still matches, and still counts towards the total, but where it lands
+in a `newest` page means nothing. `--sort relevance` is unaffected.
 
 ### `facets`
 
@@ -1014,6 +1103,276 @@ concatenation.)
 
 ---
 
+## The web UI and the HTTP API
+
+A terminal is the wrong shape for "show me everything that touched `parse.rs` on this branch, then
+let me read what happened either side of the one that failed". That question wants a facet rail you
+can click and a hit you can open into the turns around it. So there is a browser UI, and a JSON API
+underneath it.
+
+**Both are optional cargo features, and neither is in `default`.** That is a safety decision rather
+than a packaging one. This index is a verbatim record of everything you and the model typed — the
+key you pasted into a prompt, the `.env` a tool read back, the customer name in a stack trace — and
+the server has no authentication of any kind. A default build binds no port, links neither `axum`
+nor `tokio`, and does not have `serve` in `--help` at all; you have to ask for it, at build time,
+by name.
+
+```bash
+cargo build --release --features web-ui     # the UI and the API under it
+cargo build --release --features http-api   # the JSON API alone
+```
+
+`web-ui` implies `http-api`. The frontend is `include_str!`'d into the binary rather than read from
+a directory at run time, so a release build is still one file you can copy anywhere — and the UI
+being served cannot drift out of step with the server answering its requests, which produces bugs
+that look like API bugs and are not.
+
+### `session-search serve`
+
+```bash
+session-search serve
+```
+
+```
+session-search serving on http://127.0.0.1:7777
+  index    /root/.local/share/session-search
+  ui       http://127.0.0.1:7777/
+  cors     off
+```
+
+```
+Serve the index over HTTP (and, with the `web-ui` feature, the browser UI)
+
+Usage: session-search serve [OPTIONS]
+
+Options:
+      --host <ADDR>       Interface to bind. Anything but a loopback address publishes every
+                          transcript this index holds to the network, unauthenticated; the server
+                          says so loudly when asked [default: 127.0.0.1]
+      --index <DIR>       Index directory. Defaults to `$XDG_DATA_HOME/session-search` [env:
+                          SESSION_SEARCH_INDEX=]
+      --port <PORT>       [default: 7777]
+  -v, --verbose...        Raise the log level on stderr; repeatable (`-v` info, `-vv` debug, `-vvv`
+                          trace)
+      --cors <ORIGIN>     Allow browser requests from this origin (`*` for any). Repeatable. Off by
+                          default: the bundled UI is same-origin, and only a separately hosted
+                          frontend needs this
+      --no-color          Never colourise. Also honoured: a non-empty `$NO_COLOR`, and a non-tty
+                          stdout
+      --refresh-secs <N>  Re-index every N seconds while the server runs. 0 (the default) never does
+                          [default: 0]
+      --no-refresh        Skip the incremental index refresh that normally runs before the port
+                          opens
+  -h, --help              Print help
+```
+
+The default bind is loopback. Binding anything else is allowed — it is your machine — and it is
+said once, loudly, on the way up, because "I'll just put it on `0.0.0.0` so I can read it from the
+laptop" is a decision worth making on purpose rather than by omission:
+
+```bash
+session-search serve --host 0.0.0.0
+```
+
+```
+2026-09-10T02:08:27.807993Z  WARN bound to a non-loopback address: this server has no authentication and the index holds every prompt, command and tool output verbatim address=0.0.0.0:7777
+session-search serving on http://0.0.0.0:7777
+  index    /root/.local/share/session-search
+  ui       http://0.0.0.0:7777/
+  cors     off
+
+  WARNING: 0.0.0.0 is not a loopback address. This server has no authentication, and
+           the index is a verbatim record of everything you and the model typed,
+           secrets included. Anyone who can reach this port can read all of it.
+```
+
+`--refresh-secs N` re-indexes every N seconds for as long as the server runs, which is what you
+want when the session you are searching is still being written; it is off by default, and
+`POST /api/reindex` does the same thing on demand. `--cors ORIGIN` is only for a frontend you host
+somewhere else — the bundled UI is same-origin and needs nothing.
+
+### What the UI does
+
+`http://127.0.0.1:7777/` is one page, no build step and no CDN, dark and light both first-class,
+usable at 400px wide.
+
+- **Search and facets side by side.** Type in the box (searches settle 180ms after you stop) and
+  the rail on the left counts tool, project, model, role, kind, agent type and git branch over the
+  set you are looking at. Clicking a value adds a filter; active filters become chips above the
+  results, and a chip is how you take one off again. Each facet carries the same honesty line the
+  CLI prints — how many of the matching documents actually carry a value for that field, and how
+  many values are not shown — so fifteen visible rows never read as the whole story. (At 400px the
+  rail becomes a band above the results rather than a column beside them; nothing is hidden.)
+- **Order by relevance, newest or oldest**, the same three the CLI has, for the same reason.
+- **Expand a hit into the conversation.** Every result opens in place into the turns around it —
+  three either side to start, ten more per press — so you can read the prompt that led to a command
+  and the output that came back without losing your result list.
+- **Open the whole session.** "open session" on any card slides in a drawer holding that whole
+  transcript in `seq` order, subagent sidechains included.
+- **Per-tool rendering.** `Bash` is a terminal block, `Read` is numbered source, `Edit` is a
+  red/green diff, `TodoWrite` is a checklist, `Task` links to the sidechain it spawned, an
+  `mcp__server__tool` splits into a server chip and a tool chip. A tool this build has never heard
+  of — and there will be some — falls back to a parameter table rather than a broken card. Any
+  document can be flipped to the raw JSONL line it came from.
+- **The URL is the search.** Query, filters, sort and page all live in it, so the back button works
+  and a search you want to keep is a link you can paste.
+
+The one thing to know about the rendering: the model's prose goes through a deliberately small
+markdown subset that escapes first and only then applies formatting, and the only string on the
+page handed over as HTML is the server's own snippet. Everything the transcript contains is treated
+as text, because a transcript is full of text about HTML.
+
+### The API
+
+Every response is `application/json`; every failure is `{"error":{"status":…,"message":…}}` with
+the matching status. Health first, since it is the one call that does not open the index:
+
+```bash
+curl -s http://127.0.0.1:7777/api/health
+```
+
+```json
+{"index_dir":"/root/.local/share/session-search","ok":true,"version":"0.1.0","web_ui":true}
+```
+
+`GET /api/search` is the whole search surface as a query string — the same parameter names the CLI
+flags use, repeated rather than comma-joined for the repeatable ones (`?tool=Bash&tool=Read`).
+Trimmed with `jq` here because a real hit carries the entire document:
+
+```bash
+curl -s 'http://127.0.0.1:7777/api/search?q=HyperLogLog&tool=Read&size=1' \
+  | jq '{totalResults, sort: .info.sort, elapsedMs: .info.elapsedMs,
+         hit: (.results[0] | {id: .id.raw, snippetField: ._meta.snippetField,
+                              snippet: .tool_output.snippet})}'
+```
+
+```json
+{
+  "totalResults": 2,
+  "sort": "relevance",
+  "elapsedMs": 6,
+  "hit": {
+    "id": "aa7b6a5b-8ebc-5e23-b445-77c0f55a464a:-:700e6900:15",
+    "snippetField": "tool_output",
+    "snippet": "value fell outside the returned buckets (`sum_other_doc_count`).\n140\t    pub other_docs: u64,\n141\t    /// Approximate count of distinct values (<em>HyperLogLog</em>), over the matching set.\n142\t    pub distinct: Option&lt;u64&gt;,\n143\t}\n144\t\n145\timpl"
+  }
+}
+```
+
+Two things in that snippet are worth pointing at. It is **HTML**: escaped first and marked
+afterwards, which is why the match is `<em>HyperLogLog</em>` and the Rust in the same line is
+`Option&lt;u64&gt;`. That is the convention Elastic's own snippets follow and what every Search UI
+template expects to render, and it is the one string on the page a renderer is allowed to trust —
+the `**…**` marking the CLI prints stays on the CLI. Second, it hangs off `tool_output` rather than
+`text`, because that is the field it was cut from, and `_meta.snippetField` says so. One query
+spans a message body, a tool's output and the model's thinking; a UI that labelled all three "text"
+would be telling you something untrue about what matched.
+
+`GET /api/facets/{field}` is the aggregation endpoint, and it returns the honesty numbers spelled
+out rather than leaving you to sum the buckets:
+
+```bash
+curl -s 'http://127.0.0.1:7777/api/facets/tool_input.file_path?top=3' \
+  | jq '{field, matchingDocs, docsWithValue, otherDocs, distinct, hiddenValues,
+         values: [.values[] | "\(.count)  \(.value)"]}'
+```
+
+```json
+{
+  "field": "tool_input.file_path",
+  "matchingDocs": 362,
+  "docsWithValue": 25,
+  "otherDocs": 8,
+  "distinct": 10,
+  "hiddenValues": 7,
+  "values": [
+    "6  /home/user/session-search/docs/WEB-UI.md",
+    "6  /home/user/session-search/docs/DESIGN.md",
+    "5  /home/user/session-search/src/api/dto.rs"
+  ]
+}
+```
+
+362 documents matched, 25 of them carry a `file_path` at all, and the three rows shown are three
+of ten distinct values — summing them answers nothing. The CLI prints the same four numbers; the
+API just names them.
+
+A parameter the endpoint does not know is a `400` that names what it does know, never a silently
+ignored one. A typo that quietly widened your search to the whole corpus would be worse than an
+error, because you would believe the answer:
+
+```bash
+curl -s 'http://127.0.0.1:7777/api/search?toool=Bash'
+```
+
+```json
+{"error":{"message":"unknown query parameter \"toool\"; this endpoint accepts: q, page, size, offset, sort, facets, facet_top, snippet_chars, include_thinking, project, tool, tool_input, tool_output, min_thinking, branch, model, role, kind, session, agent_type, since, until, errors_only, no_sidechains, sidechains_only","status":400}}
+```
+
+The rest: `GET /api/sessions` and `GET /api/sessions/{id}` (plus `/around?seq=`) for listing and
+replaying transcripts — an unambiguous id prefix is enough, exactly as `show` accepts one —
+`GET /api/stats`, and `POST /api/reindex`.
+
+### Search UI compatible, and that is the only path
+
+`POST /api/search` takes an Elastic [Search UI](https://github.com/elastic/search-ui)
+`RequestState` and returns a `ResponseState`. That interface is one function, so pointing a stock
+Search UI frontend at this index is a connector of about twenty lines:
+
+```js
+const connector = {
+  onSearch: (state, queryConfig) =>
+    fetch("http://127.0.0.1:7777/api/search", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ ...state, ...queryConfig }),
+    }).then((r) => r.json()),
+  onAutocomplete: async () => ({}),
+  onResultClick: () => {},
+};
+```
+
+Which is exactly the request the bundled UI makes on every keystroke — there is deliberately no
+second, private endpoint for it. A side door would drift from the documented one and nobody would
+notice until somebody else's connector broke.
+
+```bash
+curl -s http://127.0.0.1:7777/api/search -H 'content-type: application/json' \
+  -d '{"searchTerm":"","filters":[{"field":"tool_name","values":["Write"],"type":"any"}],
+       "sortList":[{"field":"timestamp","direction":"desc"}],"resultsPerPage":2}' \
+  | jq '{totalResults, totalPages, current, sort: .info.sort, ids: [.results[]._meta.id]}'
+```
+
+```json
+{
+  "totalResults": 2,
+  "totalPages": 1,
+  "current": 1,
+  "sort": "newest",
+  "ids": [
+    "aa7b6a5b-8ebc-5e23-b445-77c0f55a464a:a102c9c49bc9ca257:061f7aee:34",
+    "aa7b6a5b-8ebc-5e23-b445-77c0f55a464a:ac197025e9eb0a521:69089df8:21"
+  ]
+}
+```
+
+`filters` also accepts the native object form the CLI flags spell, since that is what the bundled
+UI already has in hand:
+
+```jsonc
+{ "filters": { "tool": ["Bash"], "project": "~/code", "errors_only": true } }
+```
+
+Either way, a filter field the mapping does not cover is a `400` that names it, and a field that
+takes one value given two is a `400` rather than a silent "first one wins". `sortList` accepts
+`timestamp` and nothing else, because the index has no other ordering to offer — asking for one it
+does not have should not quietly get you relevance instead.
+
+Endpoint by endpoint, the request and response shapes, the full filter-field mapping and the
+frontend's DOM and CSS contracts are in [`docs/WEB-UI.md`](docs/WEB-UI.md).
+
+---
+
 ## How the index works
 
 ### Where it lives
@@ -1139,7 +1498,15 @@ in mind — `Filters` derives `clap::Args` and `serde::Deserialize` side by side
 `Option<String>`/`Vec<String>` fields, `SearchRequest` is pure serde data, and `--json` already
 emits the exact payloads the tools will return.
 
-Design note: [`docs/MCP.md`](docs/MCP.md).
+The [`http-api` feature](#the-web-ui-and-the-http-api) is the first instalment of that plan, and
+it worked: `serve` decodes a request into the same `SearchRequest` the CLI builds, hands it to the
+same `search::search`, and renders the same `SearchResponse`. So the MCP server is a third front
+end over one struct rather than a third implementation of search — and the wire shapes the HTTP
+API had to pin down (a hit's document, a facet's honesty numbers, a sort that is not relevance)
+are the ones the tools will return.
+
+Design note: [`docs/MCP.md`](docs/MCP.md). The HTTP one is
+[`docs/WEB-UI.md`](docs/WEB-UI.md).
 
 ---
 
@@ -1228,26 +1595,36 @@ cut. Lower it if you want a `cat` of a minified bundle kept out of the term dict
 `raw` and `tool_input` are stored uncapped regardless, so a large input is always searchable
 through `tool_input.<key>` even when `text` did not copy all of it.
 
+**The server, if you build it, trusts whoever can reach the port.** `session-search serve` has no
+authentication, no accounts and no rate limit, and it is not going to grow them: an index of your
+own transcripts on your own loopback interface does not need a login, and anything that does need
+one needs more than a flag. That is why the features are off by default, why the bind is loopback
+by default, why `--cors` is off by default, and why a non-loopback `--host` prints a warning
+rather than a shrug. The one thing it does serialise is writing: `POST /api/reindex` holds a lock
+and a second concurrent call gets a `409` instead of two writers racing for the same `IndexWriter`.
+
 **Everything is local and single-user.** No daemon, no watch mode, no incremental commit while a
 session is in flight; the index is refreshed at query time. There is no cross-machine sync, and
 the ranking tuning amounts to one field boost on markdown headings. Language handling is English
 only: prose is stemmed by an English stemmer, and the `code` analyzer described above splits
 identifiers and stems nothing.
+`serve --refresh-secs N` is the closest thing to a watch mode, and it is a timer rather
+than a file watcher — it re-runs the ordinary incremental index every N seconds.
 
 ---
 
 ## Development
 
 ```bash
-cargo build --all-targets
-cargo clippy --all-targets
 cargo fmt --check
-cargo test
+cargo clippy --all-targets --all-features
+cargo build --all-targets                  # default features: the binary people install
+cargo test --all-features
 ```
 
 ```
-running 317 tests
-test result: ok. 313 passed; 0 failed; 4 ignored; 0 measured; 0 filtered out; finished in 3.07s
+running 373 tests
+test result: ok. 369 passed; 0 failed; 4 ignored; 0 measured; 0 filtered out; finished in 4.11s
 ```
 
 The compiler is pinned: [`rust-toolchain.toml`](rust-toolchain.toml) names the version and the
@@ -1278,7 +1655,9 @@ by-hand check.
 The crate resolves `~/.claude` through `$HOME`, which Windows does not set, so Windows is neither
 built nor tested. macOS is: `cargo test` runs there weekly (Mondays 07:00 UTC) and on demand via
 **Actions → CI → Run workflow**, rather than on every pull request, because macOS runners bill at
-ten times the Linux rate on a private repository.
+ten times the Linux rate on a private repository. It runs `--all-features` too: the server is the
+one part of this crate that binds a socket and spawns a runtime, which is exactly the sort of
+thing that works on Linux and not on macOS.
 
 [`.github/dependabot.yml`](.github/dependabot.yml) proposes dependency bumps weekly and action
 bumps monthly. `Cargo.lock` is committed and every CI command passes `--locked`, so a dependency
@@ -1302,16 +1681,23 @@ into its own directory holding the binary, the README and the LICENSE.
 The Linux binary is built on `ubuntu-22.04` rather than the newest image so that it needs only
 glibc 2.35 and runs on distributions older than the runner.
 
+Released binaries are **default-feature** builds, so they have no `serve` and no UI in them. The
+release job type-checks both feature sets (its `clippy` step passes `--all-features`) but ships the
+binary everyone gets from `cargo install`; wanting the web UI still means building it yourself.
+
 **Actions → Release → Run workflow** does everything except publish: the archives land on the
 workflow run as artifacts, which is the way to check a packaging change without spending a tag.
 
-Two documents are worth reading before changing anything:
+Three documents are worth reading before changing anything:
 
 - [`docs/DESIGN.md`](docs/DESIGN.md) — the module contract: pinned type signatures, the Tantivy
   schema and the verified 0.26 API facts, the CLI surface.
 - [`docs/TRANSCRIPT-FORMAT.md`](docs/TRANSCRIPT-FORMAT.md) — the input format, reverse-engineered
   from Claude Code v2.1.266: record families, the sidechain layout, the DAG, compaction, and the
   file-level hazards a reader must survive.
+- [`docs/WEB-UI.md`](docs/WEB-UI.md) — the wire contract for `http-api` and `web-ui`: every
+  endpoint, the Search UI envelope, the filter-field mapping, and the DOM and CSS contracts the
+  `web/` modules hold each other to.
 
 ## License
 

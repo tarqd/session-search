@@ -1,0 +1,182 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>session-search</title>
+    <!-- A data: icon rather than /favicon.ico: the server only serves the six files listed in
+         assets.rs, so any real icon URL would be a guaranteed 404 on every page load. -->
+    <link
+      rel="icon"
+      href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Cpath d='M11 11 15 15M7 12.5A5.5 5.5 0 1 0 7 1.5a5.5 5.5 0 0 0 0 11Z' fill='none' stroke='%234a7fe0' stroke-width='1.8' stroke-linecap='round'/%3E%3C/svg%3E"
+    />
+    <script>
+      // The only script in this file, and it runs before the stylesheet so the palette is
+      // decided before the first paint: app.js loads as a module, which is deferred, so a
+      // dark-mode user would otherwise get a full white page for the length of a fetch on
+      // every reload. Absent key means "follow the OS", which is what the media query does.
+      try {
+        var ssTheme = localStorage.getItem("ss-theme");
+        if (ssTheme === "dark" || ssTheme === "light") {
+          document.documentElement.dataset.theme = ssTheme;
+        }
+      } catch (e) {
+        // Storage can be denied outright (private mode, site-data blocked). The OS preference
+        // is then the whole answer, and a theme button that does not persist is still useful.
+      }
+    </script>
+    <link rel="stylesheet" href="/styles.css" />
+  </head>
+  <body>
+    <a class="ss-skip" href="#results">Skip to results</a>
+
+    <header class="ss-header">
+      <div class="ss-header-main">
+        <div class="ss-brand" title="session-search">
+          <svg class="ss-icon" viewBox="0 0 16 16" aria-hidden="true">
+            <path
+              d="M11 11 15 15M7 12.5A5.5 5.5 0 1 0 7 1.5a5.5 5.5 0 0 0 0 11Z"
+              fill="none"
+              stroke="currentColor"
+              stroke-width="1.5"
+              stroke-linecap="round"
+              stroke-linejoin="round"
+            />
+          </svg>
+          <span class="ss-brand-name">session<span class="ss-brand-sep">-</span>search</span>
+        </div>
+
+        <!-- Deliberately not a <form>: with no action, Enter would submit to the current URL
+             and reload the whole page, throwing away the state app.js keeps. -->
+        <div class="ss-search" role="search">
+          <svg class="ss-icon ss-search-icon" viewBox="0 0 16 16" aria-hidden="true">
+            <path
+              d="M11 11 15 15M7 12.5A5.5 5.5 0 1 0 7 1.5a5.5 5.5 0 0 0 0 11Z"
+              fill="none"
+              stroke="currentColor"
+              stroke-width="1.5"
+              stroke-linecap="round"
+              stroke-linejoin="round"
+            />
+          </svg>
+          <input
+            id="q"
+            type="search"
+            class="ss-search-input"
+            placeholder="words, &quot;phrases&quot;, AND/OR/NOT, tool_output:&quot;No such file&quot;"
+            aria-label="Search transcripts"
+            autocomplete="off"
+            autocapitalize="off"
+            autocorrect="off"
+            spellcheck="false"
+            enterkeyhint="search"
+          />
+        </div>
+
+        <div class="ss-controls">
+          <label class="ss-select" for="sort">
+            <span class="ss-select-label">sort</span>
+            <!-- Values are the spellings dto.rs accepts for `sort`; anything else is a 400. -->
+            <select id="sort">
+              <option value="relevance">relevance</option>
+              <option value="newest">newest first</option>
+              <option value="oldest">oldest first</option>
+            </select>
+          </label>
+
+          <button id="refresh" class="ss-btn" type="button" title="Re-scan transcripts and index what changed">
+            <svg class="ss-icon" viewBox="0 0 16 16" aria-hidden="true">
+              <path
+                d="M13.5 8a5.5 5.5 0 1 1-1.7-3.9M13.5 2v3h-3"
+                fill="none"
+                stroke="currentColor"
+                stroke-width="1.5"
+                stroke-linecap="round"
+                stroke-linejoin="round"
+              />
+            </svg>
+            <span class="ss-btn-label">reindex</span>
+          </button>
+
+          <!-- Both glyphs ship in the markup and CSS shows the one that matches the palette in
+               force, so the button never disagrees with the page it is sitting on. -->
+          <button id="theme" class="ss-btn ss-btn-icon" type="button" title="Light / dark" aria-label="Switch light or dark theme">
+            <svg class="ss-icon ss-glyph-light" viewBox="0 0 16 16" aria-hidden="true">
+              <path
+                d="M8 11a3 3 0 1 0 0-6 3 3 0 0 0 0 6ZM8 1v1.5M8 13.5V15M1 8h1.5M13.5 8H15M3 3l1 1M12 12l1 1M13 3l-1 1M4 12l-1 1"
+                fill="none"
+                stroke="currentColor"
+                stroke-width="1.5"
+                stroke-linecap="round"
+              />
+            </svg>
+            <svg class="ss-icon ss-glyph-dark" viewBox="0 0 16 16" aria-hidden="true">
+              <path
+                d="M13.5 9.6A5.8 5.8 0 0 1 6.4 2.5a5.8 5.8 0 1 0 7.1 7.1Z"
+                fill="none"
+                stroke="currentColor"
+                stroke-width="1.5"
+                stroke-linecap="round"
+                stroke-linejoin="round"
+              />
+            </svg>
+          </button>
+        </div>
+      </div>
+
+      <!-- Index size and age, filled from /api/stats. aria-live because the reindex button
+           changes it, and a count that silently jumps is the one thing a reader will miss. -->
+      <p id="stats" class="ss-stats" aria-live="polite"></p>
+    </header>
+
+    <div class="ss-shell">
+      <aside class="ss-rail" aria-label="Filters and facets">
+        <div id="chips" class="ss-chips" aria-label="Active filters"></div>
+        <div id="facets" class="ss-facets"></div>
+      </aside>
+
+      <main class="ss-main">
+        <div id="error" class="ss-err" role="alert" hidden></div>
+
+        <div class="ss-summary-row">
+          <p id="summary" class="ss-summary" aria-live="polite"></p>
+          <div id="loading" class="ss-loading" hidden>
+            <span class="ss-spinner" aria-hidden="true"></span>
+            <span>searching…</span>
+          </div>
+        </div>
+
+        <div id="results" class="ss-results" tabindex="-1"></div>
+
+        <div id="empty" class="ss-empty" hidden>
+          <p class="ss-empty-title">No documents matched.</p>
+          <p class="ss-empty-body">
+            Every filter is ANDed on top of the query, so a chip in the rail can be the reason
+            rather than the words. There is no fuzzy operator — <code>term~1</code> is phrase
+            slop, not a typo forgiver.
+          </p>
+        </div>
+
+        <nav id="pager" class="ss-pager" aria-label="Result pages"></nav>
+      </main>
+    </div>
+
+    <!-- A <dialog> so Escape, the backdrop and focus containment come from the browser rather
+         than from a hand-rolled trap that has to be right on every keyboard path. It ships
+         `hidden` as well as closed: styles.css reveals it for `[open]`, for a cleared `hidden`
+         and for `.ss-open`, so app.js may drive it with showModal() or with the attribute. -->
+    <dialog id="drawer" class="ss-drawer" hidden aria-labelledby="drawer-title">
+      <header class="ss-drawer-head">
+        <h2 id="drawer-title" class="ss-drawer-title"></h2>
+        <button id="drawer-close" class="ss-btn ss-btn-icon" type="button" aria-label="Close transcript">
+          <svg class="ss-icon" viewBox="0 0 16 16" aria-hidden="true">
+            <path d="M4 4l8 8M12 4l-8 8" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" />
+          </svg>
+        </button>
+      </header>
+      <div id="drawer-body" class="ss-drawer-body"></div>
+    </dialog>
+
+    <script type="module" src="/app.js"></script>
+  </body>
+</html>
