@@ -4,53 +4,55 @@ expression: table
 ---
 ## Retrieval eval — context_text on
 
-| class       | queries | scored | recall@10 |       MRR |   nDCG@10 |
-| ----------- | ------- | ------ | --------- | --------- | --------- |
-| identifier  |       8 |      8 |     1.000 |     1.000 |     0.928 |
-| boundary    |       8 |      8 |     0.913 |     1.000 |     0.774 |
-| paraphrase  |       7 |      7 |     0.844 |     1.000 |     0.782 |
-| filtered    |      10 |     10 |     1.000 |     1.000 |     0.981 |
-| aggregation |       6 |      0 |         — |         — |         — |
-| overall     |      39 |     33 |     0.946 |     1.000 |     0.876 |
+| class       | queries | scored | ceiling | recall@10 |       MRR |   nDCG@10 |
+| ----------- | ------- | ------ | ------- | --------- | --------- | --------- |
+| identifier  |       8 |      8 |       7 |     1.000 |     1.000 |     0.928 |
+| boundary    |       8 |      8 |       2 |     0.913 |     1.000 |     0.774 |
+| paraphrase  |       7 |      7 |       1 |     0.844 |     1.000 |     0.782 |
+| filtered    |      10 |     10 |       7 |     1.000 |     1.000 |     0.981 |
+| aggregation |       6 |      0 |       0 |         — |         — |         — |
+| overall     |      39 |     33 |      17 |     0.946 |     1.000 |     0.876 |
 
 6 of 39 queries are aggregation-shaped: recorded, never scored. Top-k is the wrong answer shape for them, and scoring one as a ranking would book a modelling mistake as a retrieval miss.
+
+`ceiling` counts scored queries whose recall was forced to 1.000 by the fixture rather than earned by the ranker: the query matched fewer documents than the cutoff and every one of them is graded relevant, so `found == relevant == the whole match set` and no ranking could have scored it differently. 17 of 33 scored queries are in that state, marked † in the per-query table. Their recall cannot rise, cannot fall except by a document leaving the matched set entirely, and says nothing about ordering. A class whose `ceiling` equals its `scored` has a recall column that measures the corpus, not retrieval.
 
 ### Per query
 
 | query                            | class       | hits |  rel | recall@10 |       MRR |   nDCG@10 |
 | -------------------------------- | ----------- | ---- | ---- | --------- | --------- | --------- |
 | ident-snippet-half-a-name        | identifier  |   10 |    4 |     1.000 |     1.000 |     0.990 |
-| ident-iserror-no-underscore      | identifier  |    5 |    5 |     1.000 |     1.000 |     0.852 |
-| ident-pascal-finds-snake         | identifier  |    7 |    7 |     1.000 |     1.000 |     0.944 |
-| ident-snake-finds-pascal         | identifier  |    7 |    7 |     1.000 |     1.000 |     0.944 |
-| ident-sha256-pasted-whole        | identifier  |    1 |    1 |     1.000 |     1.000 |     1.000 |
-| ident-uuid-first-chunk           | identifier  |    2 |    2 |     1.000 |     1.000 |     0.834 |
-| ident-release-flag-phrase        | identifier  |    1 |    1 |     1.000 |     1.000 |     1.000 |
-| ident-source-path                | identifier  |    4 |    4 |     1.000 |     1.000 |     0.860 |
+| ident-iserror-no-underscore      | identifier  |    5 |    5 |    1.000† |     1.000 |     0.852 |
+| ident-pascal-finds-snake         | identifier  |    7 |    7 |    1.000† |     1.000 |     0.944 |
+| ident-snake-finds-pascal         | identifier  |    7 |    7 |    1.000† |     1.000 |     0.944 |
+| ident-sha256-pasted-whole        | identifier  |    1 |    1 |    1.000† |     1.000 |     1.000 |
+| ident-uuid-first-chunk           | identifier  |    2 |    2 |    1.000† |     1.000 |     0.834 |
+| ident-release-flag-phrase        | identifier  |    1 |    1 |    1.000† |     1.000 |     1.000 |
+| ident-source-path                | identifier  |    4 |    4 |    1.000† |     1.000 |     0.860 |
 | boundary-tokenizer-both-halves   | boundary    |   10 |    6 |     1.000 |     1.000 |     0.762 |
 | boundary-tokenizers-plural       | boundary    |   10 |    6 |     0.833 |     1.000 |     0.621 |
 | boundary-index-both-halves       | boundary    |   10 |    8 |     0.875 |     1.000 |     0.715 |
 | boundary-indexes-plural          | boundary    |   10 |    8 |     0.875 |     1.000 |     0.585 |
 | boundary-parse-verb-and-function | boundary    |    8 |    9 |     0.889 |     1.000 |     0.672 |
 | boundary-compiling-stems         | boundary    |    5 |    6 |     0.833 |     1.000 |     0.964 |
-| boundary-fenced-identifier-only  | boundary    |    1 |    1 |     1.000 |     1.000 |     1.000 |
-| boundary-filter-prose-and-fence  | boundary    |    7 |    7 |     1.000 |     1.000 |     0.875 |
+| boundary-fenced-identifier-only  | boundary    |    1 |    1 |    1.000† |     1.000 |     1.000 |
+| boundary-filter-prose-and-fence  | boundary    |    7 |    7 |    1.000† |     1.000 |     0.875 |
 | para-build-fails                 | paraphrase  |   10 |    8 |     0.750 |     1.000 |     0.697 |
 | para-retrieval-notes             | paraphrase  |    9 |    8 |     1.000 |     1.000 |     0.858 |
 | para-split-identifiers           | paraphrase  |   10 |    7 |     0.857 |     1.000 |     0.695 |
 | para-incremental-indexing        | paraphrase  |   10 |    6 |     0.667 |     1.000 |     0.886 |
-| para-hash-rule-subagent          | paraphrase  |    6 |    6 |     1.000 |     1.000 |     0.863 |
+| para-hash-rule-subagent          | paraphrase  |    6 |    6 |    1.000† |     1.000 |     0.863 |
 | para-error-log                   | paraphrase  |   10 |    6 |     0.833 |     1.000 |     0.712 |
 | para-release-artifact            | paraphrase  |   10 |    5 |     0.800 |     1.000 |     0.761 |
 | filtered-project-other-tool      | filtered    |   10 |    4 |     1.000 |     1.000 |     1.000 |
-| filtered-lang-rust               | filtered    |    2 |    2 |     1.000 |     1.000 |     1.000 |
-| filtered-lang-python             | filtered    |    2 |    2 |     1.000 |     1.000 |     1.000 |
-| filtered-program-cargo           | filtered    |    4 |    4 |     1.000 |     1.000 |     1.000 |
-| filtered-errors-only-exit-101    | filtered    |    3 |    3 |     1.000 |     1.000 |     1.000 |
-| filtered-date-window             | filtered    |    3 |    3 |     1.000 |     1.000 |     1.000 |
+| filtered-lang-rust               | filtered    |    2 |    2 |    1.000† |     1.000 |     1.000 |
+| filtered-lang-python             | filtered    |    2 |    2 |    1.000† |     1.000 |     1.000 |
+| filtered-program-cargo           | filtered    |    4 |    4 |    1.000† |     1.000 |     1.000 |
+| filtered-errors-only-exit-101    | filtered    |    3 |    3 |    1.000† |     1.000 |     1.000 |
+| filtered-date-window             | filtered    |    3 |    3 |    1.000† |     1.000 |     1.000 |
 | filtered-sidechains-only         | filtered    |    6 |    3 |     1.000 |     1.000 |     0.808 |
-| filtered-agent-type              | filtered    |    3 |    3 |     1.000 |     1.000 |     1.000 |
-| filtered-session-prefix          | filtered    |    3 |    3 |     1.000 |     1.000 |     1.000 |
+| filtered-agent-type              | filtered    |    3 |    3 |    1.000† |     1.000 |     1.000 |
+| filtered-session-prefix          | filtered    |    3 |    3 |    1.000† |     1.000 |     1.000 |
 | filtered-branch                  | filtered    |   10 |    2 |     1.000 |     1.000 |     1.000 |
 | agg-which-tools-errored          | aggregation |    9 |    0 | wrong shape |         — |         — |
 | agg-which-projects-errored       | aggregation |    9 |    0 | wrong shape |         — |         — |

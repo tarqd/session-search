@@ -21,3 +21,5 @@ expression: "Report::diff(&without, &with)"
 | overall     | recall    |     0.801 |     0.946 |    +0.145 |
 | overall     | MRR       |     0.970 |     1.000 |    +0.030 |
 | overall     | nDCG      |     0.761 |     0.876 |    +0.114 |
+
+Recall ceiling: 18 of 33 scored queries before and 17 of 33 after had their recall forced to 1.000 by the fixture — the query matched fewer documents than the cutoff and every one of them is graded relevant. A delta of 0.000 on a class made mostly of those rows means the class could not have moved, which is a different claim from the change being neutral.

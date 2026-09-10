@@ -56,6 +56,9 @@ pub struct QueryRow {
     pub relevant: usize,
     /// Of those, how many came back.
     pub found: usize,
+    /// This query's recall@k was arithmetically forced to `1.000` by the fixture rather than
+    /// earned by the ranker. See [`at_recall_ceiling`] for exactly what that means.
+    pub ceiling: bool,
     pub recall: f64,
     pub mrr: f64,
     pub ndcg: f64,
@@ -74,6 +77,9 @@ pub struct ClassMetrics {
     pub queries: usize,
     /// The ones the three metrics were averaged over.
     pub scored: usize,
+    /// Of those, how many could not have scored anything but `recall = 1.000`. A class whose
+    /// `ceiling` equals its `scored` has a recall column that measures the fixture.
+    pub ceiling: usize,
     pub recall: f64,
     pub mrr: f64,
     pub ndcg: f64,
@@ -98,7 +104,7 @@ pub fn evaluate(fixture: &Fixture, label: &str, run: Run<'_>, k: usize) -> anyho
         // deliberately not scored: the point of the class is that a ranking *does* come back
         // and is the wrong answer shape, which is only visible if the run happens.
         let hits: Vec<String> = run(query)?.into_iter().take(k).collect();
-        rows.push(score(query, &hits));
+        rows.push(score(query, &hits, k));
     }
 
     let mut by_class: BTreeMap<Class, Vec<&QueryRow>> = BTreeMap::new();
@@ -119,7 +125,7 @@ pub fn evaluate(fixture: &Fixture, label: &str, run: Run<'_>, k: usize) -> anyho
 }
 
 /// The three metrics for one query against one ranked list.
-fn score(query: &EvalQuery, hits: &[String]) -> QueryRow {
+fn score(query: &EvalQuery, hits: &[String], k: usize) -> QueryRow {
     let relevant: Vec<&String> = query
         .relevant
         .iter()
@@ -149,6 +155,7 @@ fn score(query: &EvalQuery, hits: &[String]) -> QueryRow {
         retrieved: hits.len(),
         relevant: relevant.len(),
         found,
+        ceiling: scored && at_recall_ceiling(hits.len(), found, relevant.len(), k),
         recall: if scored { recall } else { 0.0 },
         mrr: if scored { mrr } else { 0.0 },
         ndcg: if scored { ndcg(query, hits) } else { 0.0 },
@@ -158,6 +165,38 @@ fn score(query: &EvalQuery, hits: &[String]) -> QueryRow {
             .map(|hit| (hit.clone(), query.relevant.get(hit).copied().unwrap_or(0)))
             .collect(),
     }
+}
+
+/// Was this query's `recall = 1.000` a result, or arithmetic?
+///
+/// This is the harness auditing its own fixture, and it exists because of the failure mode
+/// issue #21 was opened about. A class that prints `recall@10  1.000` reads as "retrieval is
+/// perfect here". On a corpus of 65 documents it very often means something much weaker: the
+/// query matched fewer documents than the cutoff, and the fixture author graded *every single
+/// one of them* as relevant. Recall is then `found / relevant` where `found == relevant ==
+/// the entire match set`, and no ranker could have scored it differently. The number is a
+/// restatement of "the matcher matched", and it cannot fall except by a document dropping out
+/// of the matched set entirely — which means it also cannot detect a reordering regression.
+///
+/// The three conditions, all required:
+///
+/// * `retrieved < k` — the list was not truncated, so what came back *is* the whole match set.
+///   A query that filled the cutoff may have had relevant documents pushed off the end, and its
+///   `1.000` is then a real statement about ranking.
+/// * `found == retrieved` — nothing ungraded came back, so the graded set covers the match set.
+/// * `found == relevant` — and nothing graded was missed, so the graded set is *exactly* the
+///   match set. Without this, a query like `boundary-parse-verb-and-function` (eight retrieved,
+///   all graded, nine graded in total) would be counted as a ceiling when its recall is 0.889
+///   precisely because one graded document is unreachable. That row is measuring something.
+///
+/// Reported as a count per class rather than asserted on. A ceiling row is not a bug in the
+/// harness and not always a bug in the fixture — `ident-sha256-pasted-whole` matches exactly
+/// one document because a pasted hash *should* match exactly one document, and grading that one
+/// document is the only thing to do. It is a bug in the *reading* of the table, and the count is
+/// what stops someone quoting `identifier recall 1.000` as evidence that identifier retrieval is
+/// solved.
+fn at_recall_ceiling(retrieved: usize, found: usize, relevant: usize, k: usize) -> bool {
+    retrieved < k && found == retrieved && found == relevant && relevant > 0
 }
 
 /// nDCG@[`NDCG_K`]: `sum((2^g - 1) / log2(i + 2))` over the returned order, divided by the same
@@ -210,6 +249,7 @@ fn mean(rows: &[&QueryRow]) -> ClassMetrics {
     ClassMetrics {
         queries: rows.len(),
         scored: n,
+        ceiling: scored.iter().filter(|r| r.ceiling).count(),
         recall: avg(|r| r.recall),
         mrr: avg(|r| r.mrr),
         ndcg: avg(|r| r.ndcg),

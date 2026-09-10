@@ -4,10 +4,12 @@ expression: "report::class_table_only(&mlt)"
 ---
 ## Retrieval eval — more like this, seeded from the top-graded document
 
-| class       | queries | scored | recall@10 |       MRR |   nDCG@10 |
-| ----------- | ------- | ------ | --------- | --------- | --------- |
-| identifier  |       6 |      6 |     0.361 |     0.333 |     0.210 |
-| boundary    |       7 |      7 |     0.570 |     0.571 |     0.526 |
-| paraphrase  |       6 |      6 |     0.589 |     0.297 |     0.334 |
-| filtered    |       8 |      8 |     0.875 |     0.547 |     0.643 |
-| overall     |      27 |     27 |     0.618 |     0.450 |     0.448 |
+| class       | queries | scored | ceiling | recall@10 |       MRR |   nDCG@10 |
+| ----------- | ------- | ------ | ------- | --------- | --------- | --------- |
+| identifier  |       6 |      6 |       0 |     0.361 |     0.333 |     0.210 |
+| boundary    |       7 |      7 |       0 |     0.570 |     0.571 |     0.526 |
+| paraphrase  |       6 |      6 |       0 |     0.589 |     0.297 |     0.334 |
+| filtered    |       8 |      8 |       1 |     0.875 |     0.547 |     0.643 |
+| overall     |      27 |     27 |       1 |     0.618 |     0.450 |     0.448 |
+
+`ceiling` counts scored queries whose recall was forced to 1.000 by the fixture rather than earned by the ranker: the query matched fewer documents than the cutoff and every one of them is graded relevant, so `found == relevant == the whole match set` and no ranking could have scored it differently. 1 of 27 scored queries are in that state, marked † in the per-query table. Their recall cannot rise, cannot fall except by a document leaving the matched set entirely, and says nothing about ordering. A class whose `ceiling` equals its `scored` has a recall column that measures the corpus, not retrieval.

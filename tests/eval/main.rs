@@ -1,8 +1,12 @@
 //! The retrieval evaluation harness (issue #21).
 //!
 //! `cargo test --test eval` asserts; `cargo test --test eval -- --nocapture` prints the tables.
-//! Every run also writes `target/eval/report.md`, `target/eval/ablation.md` and
-//! `target/eval/corpus.md`, which are the artifacts a pull request pastes.
+//! Every run also writes `target/eval/report.md`, `target/eval/ablation.md`,
+//! `target/eval/similar.md`, `target/eval/facets.md`, `target/eval/corpus.md`,
+//! `target/eval/hits.md` and `target/eval/similar-hits.md`, which are the artifacts a pull
+//! request pastes. [`docs/EVAL.md`](../../docs/EVAL.md) is the committed record: it splices
+//! those files in verbatim at a named commit, so an issue can cite a number without retyping
+//! it, and it is what should be regenerated when any of these numbers move.
 //!
 //! **This target measures. It never changes ranking.** A finding about `search.rs` belongs in an
 //! issue, not in a patch smuggled in beside a number that improves because of it.
@@ -223,7 +227,19 @@ fn the_context_header_is_what_answers_a_paraphrase() -> anyhow::Result<()> {
         );
     }
 
-    let mut out = Report::diff(&without, &with);
+    // The two class tables come first and the diff second, deliberately. The diff is the
+    // claim — "the header bought this much" — and the class tables are what makes it readable:
+    // they carry the `ceiling` count per class, which is the difference between "identifier did
+    // not regress" and "seven of identifier's eight rows could not have moved in either
+    // direction". A before/after pasted without them invites the first reading.
+    let mut out = String::from("# The `context_text` header — issue #23\n\n");
+    out.push_str(&report::class_table_only(&without));
+    out.push('\n');
+    out.push_str(&report::class_table_only(&with));
+    out.push('\n');
+    out.push_str(&Report::diff(&without, &with));
+    out.push('\n');
+    out.push_str(&report::query_delta_table(&without, &with));
     out.push_str("\n\n");
     out.push_str(&Report::diff(&without, &session_row_only));
     out.push_str(
@@ -322,6 +338,26 @@ fn aggregation_shaped_queries_are_a_facet_not_a_ranking() -> anyhow::Result<()> 
     let (fixture, corpus, _) = loaded()?;
     let (index, fields) = corpus.index(Variant::WithContext)?;
 
+    // What this class reports *instead of* a retrieval score. The three metric columns are em
+    // dashes for these rows on purpose, and an em dash is not an answer — so the answer gets
+    // written out here, in the same run, as the artifact issue #21's "per class" box needs for
+    // the one class that has no per-class score.
+    let mut table = String::from(
+        "# Aggregation-shaped queries — what they report instead of a ranking\n\n\
+         These six rows are recorded and never scored. Recall, MRR and nDCG are undefined for \
+         them, not zero: the answer to \"what errors did we see\" is a distribution, and any \
+         top-k over it is an arbitrary sample whose contents change with whatever `k` the \
+         caller happened to pass. What is checked instead is `search::facets` — every bucket \
+         the fixture names must come back non-empty — and what is reported is the bucket table \
+         itself.\n\n\
+         `docs matched` is the query's whole matching set, which is the denominator a \
+         distribution is read against; `buckets returned` is how many distinct values the facet \
+         found, which is the number a ranked list can never express, because one document can \
+         increment several buckets and ten documents can be one.\n\n\
+         | query | facet field | docs matched | buckets returned | expected buckets, with the counts that came back |\n\
+         | --- | --- | --- | --- | --- |\n",
+    );
+
     let mut checked = 0;
     for query in fixture.facet_queries() {
         let field = query
@@ -329,6 +365,25 @@ fn aggregation_shaped_queries_are_a_facet_not_a_ranking() -> anyhow::Result<()> 
             .as_deref()
             .expect("validate() requires a facet_field on a facet row");
         let result = facets(&index, &fields, field, &request_from(query))?;
+        let expected: Vec<String> = query
+            .expect_facet_values
+            .iter()
+            .map(|value| {
+                let count = result
+                    .values
+                    .iter()
+                    .find(|v| v.value == *value)
+                    .map_or(0, |v| v.count);
+                format!("`{value}` {count}")
+            })
+            .collect();
+        table.push_str(&format!(
+            "| `{}` | `{field}` | {} | {} | {} |\n",
+            query.id,
+            result.matching_docs,
+            result.values.len(),
+            expected.join(", "),
+        ));
         assert!(
             result.matching_docs > 0,
             "facet query {:?} matched no documents at all, so its buckets say nothing",
@@ -358,6 +413,7 @@ fn aggregation_shaped_queries_are_a_facet_not_a_ranking() -> anyhow::Result<()> 
         checked >= 6,
         "only {checked} aggregation-shaped rows were checked"
     );
+    publish("facets.md", &table)?;
     Ok(())
 }
 

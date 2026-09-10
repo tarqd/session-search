@@ -54,6 +54,7 @@ impl Report {
              a modelling mistake as a retrieval miss.\n",
             self.overall.queries
         ));
+        out.push_str(&ceiling_footnote(&self.overall));
         out.push_str(&self.appendix());
         out
     }
@@ -83,7 +84,15 @@ impl Report {
         ));
         for r in &self.rows {
             let (recall, mrr, ndcg) = if r.scored {
-                (f3(r.recall), f3(r.mrr), f3(r.ndcg))
+                // The dagger is the whole reason the column is worth reading: without it, a row
+                // whose recall could not have been anything but `1.000` looks exactly like a
+                // row that earned it.
+                let recall = if r.ceiling {
+                    format!("{}\u{2020}", f3(r.recall))
+                } else {
+                    f3(r.recall)
+                };
+                (recall, f3(r.mrr), f3(r.ndcg))
             } else {
                 // Spelled out rather than left blank: a blank cell reads as zero.
                 ("wrong shape".into(), "—".into(), "—".into())
@@ -181,6 +190,25 @@ impl Report {
                 get(&after.overall),
             ));
         }
+
+        // The diff table has no room for a `ceiling` column — it is already five columns of
+        // three-decimal numbers — but it is the table that gets pasted into an issue as a
+        // before/after claim, so the count follows it as a line of prose. A `+0.000` on a class
+        // where every scored query is at the ceiling is not "the change was neutral here"; it
+        // is "this class could not have moved", and the two read identically without this.
+        if before.overall.ceiling > 0 || after.overall.ceiling > 0 {
+            out.push_str(&format!(
+                "\nRecall ceiling: {} of {} scored queries before and {} of {} after had their \
+                 recall forced to 1.000 by the fixture — the query matched fewer documents than \
+                 the cutoff and every one of them is graded relevant. A delta of 0.000 on a \
+                 class made mostly of those rows means the class could not have moved, which is \
+                 a different claim from the change being neutral.\n",
+                before.overall.ceiling,
+                before.overall.scored,
+                after.overall.ceiling,
+                after.overall.scored,
+            ));
+        }
         out
     }
 }
@@ -188,17 +216,19 @@ impl Report {
 /// The class table's header and rule, shared by [`Report::table`] and [`class_table_only`].
 fn header(k: usize) -> String {
     format!(
-        "| {:<CLASS_W$} | {:>7} | {:>6} | {:>NUM_W$} | {:>NUM_W$} | {:>NUM_W$} |\n\
-         | {} | {} | {} | {} | {} | {} |\n",
+        "| {:<CLASS_W$} | {:>7} | {:>6} | {:>7} | {:>NUM_W$} | {:>NUM_W$} | {:>NUM_W$} |\n\
+         | {} | {} | {} | {} | {} | {} | {} |\n",
         "class",
         "queries",
         "scored",
+        "ceiling",
         format!("recall@{k}"),
         "MRR",
         format!("nDCG@{NDCG_K}"),
         "-".repeat(CLASS_W),
         "-".repeat(7),
         "-".repeat(6),
+        "-".repeat(7),
         "-".repeat(NUM_W),
         "-".repeat(NUM_W),
         "-".repeat(NUM_W),
@@ -219,8 +249,8 @@ fn row(label: &str, m: &ClassMetrics) -> String {
         (f3(m.recall), f3(m.mrr), f3(m.ndcg))
     };
     format!(
-        "| {:<CLASS_W$} | {:>7} | {:>6} | {:>NUM_W$} | {:>NUM_W$} | {:>NUM_W$} |\n",
-        label, m.queries, m.scored, recall, mrr, ndcg,
+        "| {:<CLASS_W$} | {:>7} | {:>6} | {:>7} | {:>NUM_W$} | {:>NUM_W$} | {:>NUM_W$} |\n",
+        label, m.queries, m.scored, m.ceiling, recall, mrr, ndcg,
     )
 }
 
@@ -248,7 +278,32 @@ pub fn class_table_only(report: &Report) -> String {
         out.push_str(&row(class.as_str(), m));
     }
     out.push_str(&row("overall", &report.overall));
+    out.push_str(&ceiling_footnote(&report.overall));
     out
+}
+
+/// The sentence that has to travel with every table carrying a `ceiling` column.
+///
+/// Written into the artifact rather than left to whoever pastes it, because the tables in this
+/// harness exist precisely to be pasted into issues and pull requests, and a caveat that lives
+/// only in a design document is a caveat that will be separated from its number on the first
+/// copy. If the count is zero the sentence is omitted: a footnote about a phenomenon that did
+/// not occur is noise, and its absence is itself the signal that the recall column is honest.
+fn ceiling_footnote(overall: &ClassMetrics) -> String {
+    if overall.ceiling == 0 {
+        return String::new();
+    }
+    format!(
+        "\n`ceiling` counts scored queries whose recall was forced to 1.000 by the fixture \
+         rather than earned by the ranker: the query matched fewer documents than the cutoff \
+         and every one of them is graded relevant, so `found == relevant == the whole match \
+         set` and no ranking could have scored it differently. {} of {} scored queries are in \
+         that state, marked \u{2020} in the per-query table. Their recall cannot rise, cannot \
+         fall except by a document leaving the matched set entirely, and says nothing about \
+         ordering. A class whose `ceiling` equals its `scored` has a recall column that measures \
+         the corpus, not retrieval.\n",
+        overall.ceiling, overall.scored,
+    )
 }
 
 /// Every query's ranked list, with the grade the fixture gave each hit.
@@ -276,5 +331,76 @@ pub fn hits_listing(report: &Report) -> String {
         }
         out.push('\n');
     }
+    out
+}
+
+/// Every scored query whose recall or nDCG moved between two configurations, with both values.
+///
+/// The class tables are means, and a mean over seven queries hides the shape of what happened.
+/// `paraphrase recall 0.206 -> 0.844` could be seven rows each gaining a little or two rows going
+/// from nothing to everything, and those are different findings: the first is a tuning result and
+/// the second is "documents that were unreachable became reachable". Only this table can tell
+/// them apart, and it exists so that whoever writes the second sentence into an issue is reading
+/// it off the harness rather than reconstructing it.
+///
+/// Rows that did not move are omitted rather than printed as zeroes. A before/after listing where
+/// most lines are `0.000 → 0.000` trains the eye to skip it, and the class table already carries
+/// the fact that the rest of the fixture held still. The count of what was left out is printed
+/// instead, so "nothing else moved" is a statement in the artifact and not an inference from a
+/// table that might simply have been truncated.
+pub fn query_delta_table(before: &Report, after: &Report) -> String {
+    assert_eq!(
+        before.rows.len(),
+        after.rows.len(),
+        "a per-query before/after listing needs the same fixture on both sides"
+    );
+
+    let mut out = format!(
+        "### Per query, where it moved — {} → {}\n\n\
+         | {:<QUERY_W$} | {:<CLASS_W$} | {:>NUM_W$} | {:>NUM_W$} | {:>NUM_W$} | {:>NUM_W$} |\n\
+         | {} | {} | {} | {} | {} | {} |\n",
+        before.label,
+        after.label,
+        "query",
+        "class",
+        "recall b",
+        "recall a",
+        "nDCG b",
+        "nDCG a",
+        "-".repeat(QUERY_W),
+        "-".repeat(CLASS_W),
+        "-".repeat(NUM_W),
+        "-".repeat(NUM_W),
+        "-".repeat(NUM_W),
+        "-".repeat(NUM_W),
+    );
+
+    let mut held = 0;
+    for (b, a) in before.rows.iter().zip(after.rows.iter()) {
+        assert_eq!(b.id, a.id, "the two arms disagree about fixture order");
+        if !a.scored {
+            continue;
+        }
+        // 5e-4 is the width of the printed column: a movement smaller than that would render as
+        // two identical cells, and a row of two identical cells in a table of movements is a
+        // reader's bug report rather than a finding.
+        if (a.recall - b.recall).abs() < 5e-4 && (a.ndcg - b.ndcg).abs() < 5e-4 {
+            held += 1;
+            continue;
+        }
+        out.push_str(&format!(
+            "| {:<QUERY_W$} | {:<CLASS_W$} | {:>NUM_W$} | {:>NUM_W$} | {:>NUM_W$} | {:>NUM_W$} |\n",
+            a.id,
+            a.class.as_str(),
+            f3(b.recall),
+            f3(a.recall),
+            f3(b.ndcg),
+            f3(a.ndcg),
+        ));
+    }
+    out.push_str(&format!(
+        "\n{held} further scored queries were unchanged on both recall and nDCG to three \
+         decimals and are omitted.\n"
+    ));
     out
 }
