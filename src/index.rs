@@ -62,11 +62,14 @@ const SESSIONS_FILE: &str = "sessions.json";
 ///         blocks with `body`, `code`, `headings` and `code_lang` beside it, so a state file
 ///         written by an older version cannot be read back into one; and the schema gained
 ///         those fields with two new analyzers besides.
-/// 4 -> 5: `turn_seq` on every document and `open_turn_seq` in the carry, and the
-///         `context_text` header built on top of them. Without the bump an index built by an
-///         older binary would report `turn_seq = 0` for every document and carry no header at
-///         all on the documents it had already written — a corpus half of which is findable by
-///         its context and half of which is not, which is worse than a rebuild.
+/// 4 -> 5: `turn_seq` on every document, `open_turn_seq` and `open_turn_prompt` in the carry,
+///         and the `context_text` header built on top of them. The schema gained two fields in
+///         the same change, so `open_or_create` already discards a version-4 index on sight;
+///         the bump is the other half of that — it covers a `state.json` that outlives its
+///         Tantivy directory, and `index::meta`, which reads the state file without opening
+///         the index at all. Without it a carry from the old layout would be read back with
+///         every turn open at `seq_base` and no prompt, and the next tail parse would stop
+///         agreeing with a whole-file one.
 const STATE_VERSION: u32 = 5;
 
 /// Tantivy refuses a per-thread arena below this (`MEMORY_BUDGET_NUM_BYTES_MIN`).

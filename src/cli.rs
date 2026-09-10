@@ -48,7 +48,7 @@ const TURN_WINDOW_LIMIT: usize = 200;
 pub enum ContextWindow {
     /// N documents either side of the hit, as `context::around` returns them.
     Docs(usize),
-    /// The hit's whole enclosing turn, capped at [`TURN_WINDOW_LIMIT`].
+    /// The hit's whole enclosing turn, capped at `TURN_WINDOW_LIMIT`.
     Turn,
 }
 
@@ -123,8 +123,8 @@ pub enum Command {
         /// Comma-separated facet fields, e.g. `tool_name,code_lang,tool_input.file_path`.
         #[arg(long, value_delimiter = ',', value_name = "FIELD")]
         facets: Vec<String>,
-        /// Also show N turns either side of each hit, or `turn` for the hit's whole enclosing
-        /// turn — the prompt that opened it, what was tried, and what came back.
+        /// Also show N documents either side of each hit, or `turn` for the hit's whole
+        /// enclosing turn — the prompt that opened it, what was tried, and what came back.
         #[arg(long, default_value = "0", value_name = "N|turn")]
         context: ContextWindow,
         #[arg(long, default_value_t = 20, value_name = "N")]
@@ -424,7 +424,12 @@ fn dispatch(
             let source = source.as_deref();
             let (docs, span) = match around {
                 Some(spec) => {
-                    let seq = resolve_seq(&index, &fields, &session_id, agent, source, &spec)?;
+                    let anchor = resolve_seq(&index, &fields, &session_id, agent, source, &spec)?;
+                    // A uuid names one record in one file. When the session id alone did not
+                    // narrow to a file, the file the uuid was found in is the only one the
+                    // window can honestly be scoped to.
+                    let source = anchor.source_path.as_deref().or(source);
+                    let seq = anchor.seq;
                     if turn {
                         let window =
                             turn_at(&index, &fields, &session_id, agent, source, seq, limit)?;
@@ -670,6 +675,17 @@ pub(crate) fn source_path_for(
     matching.next().is_none().then(|| first.source_path.clone())
 }
 
+/// What `--around` resolved to: a `seq`, and the file it belongs to when the spec said.
+///
+/// A bare number carries no file: `seq` is a per-file ordinal, and when a session id names two
+/// files (§9) the caller has nothing to pick one by. A uuid does — it was found by scanning
+/// the session, in exactly one document of exactly one file — and throwing that away would
+/// let the window that follows re-fetch "some document at that seq" from the *other* file.
+struct Anchor {
+    seq: u64,
+    source_path: Option<String>,
+}
+
 fn resolve_seq(
     index: &tantivy::Index,
     fields: &crate::schema::Fields,
@@ -677,9 +693,12 @@ fn resolve_seq(
     agent_id: Option<&str>,
     source_path: Option<&str>,
     spec: &str,
-) -> Result<u64> {
+) -> Result<Anchor> {
     if let Ok(seq) = spec.trim().parse::<u64>() {
-        return Ok(seq);
+        return Ok(Anchor {
+            seq,
+            source_path: None,
+        });
     }
     let docs = context::session(
         index,
@@ -695,7 +714,10 @@ fn resolve_seq(
                 || doc.doc_id == spec
                 || doc.tool_use_id.as_deref() == Some(spec)
         })
-        .map(|doc| doc.seq)
+        .map(|doc| Anchor {
+            seq: doc.seq,
+            source_path: Some(doc.source_path.clone()),
+        })
         .ok_or_else(|| anyhow!("no document with uuid {spec:?} in session {session_id}"))
 }
 
@@ -1608,5 +1630,56 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(err.contains("--around"), "{err}");
+    }
+
+    /// A session id can name two files (§9), and `seq` restarts in each. A uuid is found in
+    /// exactly one of them, and the window that follows has to be scoped to that one: fetched
+    /// by `seq` alone it can come back from the other file, and `--turn` would then print a
+    /// turn the uuid was never in.
+    #[test]
+    fn a_uuid_anchor_names_the_file_it_was_found_in() {
+        use crate::search::testkit::{blank_doc, index_docs};
+        let mut docs = Vec::new();
+        for seq in 0..4u64 {
+            let mut d = blank_doc(seq);
+            d.turn_seq = 0;
+            d.body = format!("original {seq}");
+            docs.push(d);
+        }
+        for seq in 0..4u64 {
+            let mut d = blank_doc(seq);
+            d.doc_id = format!("s1:-:relocated:{seq}");
+            d.uuid = Some(format!("r-{seq}"));
+            d.source_path = "/tmp/relocated/s1.jsonl".into();
+            d.turn_seq = 2 * (seq / 2);
+            d.body = format!("relocated {seq}");
+            docs.push(d);
+        }
+        let (index, fields) = index_docs(&docs);
+
+        let anchor = resolve_seq(&index, &fields, "s1", None, None, "r-3").unwrap();
+        assert_eq!(anchor.seq, 3);
+        assert_eq!(
+            anchor.source_path.as_deref(),
+            Some("/tmp/relocated/s1.jsonl")
+        );
+        let window = turn_at(
+            &index,
+            &fields,
+            "s1",
+            None,
+            anchor.source_path.as_deref(),
+            anchor.seq,
+            10,
+        )
+        .unwrap();
+        assert_eq!(window.turn_seq, 2);
+        let bodies: Vec<&str> = window.docs.iter().map(|d| d.body.as_str()).collect();
+        assert_eq!(bodies, ["relocated 2", "relocated 3"]);
+
+        // A bare number says nothing about the file, and the caller's own scoping stands.
+        let bare = resolve_seq(&index, &fields, "s1", None, None, "3").unwrap();
+        assert_eq!(bare.seq, 3);
+        assert!(bare.source_path.is_none());
     }
 }

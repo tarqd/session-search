@@ -269,9 +269,12 @@ short **context header** beside its body — the session's title and opening pro
 the branch, and the prompt that opened the document's own turn — so a message that reads "yes"
 and a `cargo build --release` that says nothing about what it was building are findable by what
 they were *for*. The header is scaffolding, not content: it is never stored, so it is never
-shown, never highlighted in a snippet, and never appears in `--json`. It is also weighted well
-below the body, so a document that genuinely discusses your term always outranks the ones that
-merely happened in the same session.
+shown, never highlighted in a snippet, and never appears in `--json`. Under the default
+relevance order it is weighted well below the body, so a document that genuinely discusses your
+term outranks the ones that merely happened in the same session. The header does widen what
+*matches*, though: the total, the facet counts and a `--sort newest` page all cover every
+document of a turn or session about your term, not only the ones that mention it. Qualify the
+query (`text:tokenizer`) to ask about bodies alone.
 
 ### 5. Read the conversation around a hit
 
@@ -341,6 +344,10 @@ session-search show b20208d8 --agent a10845 --around 7 --turn --limit 3
 ▌ b20208d8-fbdb-5918-ba69-d203de6ed6dc  wild-spinning-puppy  agent a10845c5ff9c7d4ec · Explore
 ▌ /home/user/session-search · claude/rust-mcp-session-indexing-67tza2 · 2026-09-09 19:09
 ▌ turn #0 · 3 of 11 docs
+
+#0     19:09:19  user
+      Read-only investigation. Goal: exhaustively characterize the on-disk Claude Code session…
+…
 ```
 
 **A turn is not a bounded thing, so the window is capped.** One prompt can spawn hundreds of
@@ -771,10 +778,11 @@ point: `tool_input` is for finding text, `bash_cmd` is for counting facts.
 
 ### One rebuild on upgrade
 
-`bash_cmd` changed the shape of a document, so `state.json`'s `version` went from 2 to 3. The
-first run of a build that has this field sees the mismatch, throws the watermarks away and
-reindexes every transcript from byte zero. Nothing is asked of you and `index --full` is not
-needed; it costs one full pass, 76 ms for the 193 documents on this machine.
+`bash_cmd` changed the shape of a document, so `state.json`'s `version` went from 2 to 3; the
+markdown split took it to 4, and `turn_seq` with the context header to 5. The first run of a
+build whose version differs sees the mismatch, throws the watermarks away and reindexes every
+transcript from byte zero. Nothing is asked of you and `index --full` is not needed; it costs
+one full pass, 76 ms for the 193 documents on this machine.
 
 ---
 
@@ -901,9 +909,9 @@ Options:
                           `tool_name,code_lang,tool_input.file_path`
       --index <DIR>       Index directory. Defaults to `$XDG_DATA_HOME/session-search` [env:
                           SESSION_SEARCH_INDEX=]
-      --context <N|turn>  Also show N turns either side of each hit, or `turn` for the hit's whole
-                          enclosing turn — the prompt that opened it, what was tried, and what came
-                          back [default: 0]
+      --context <N|turn>  Also show N documents either side of each hit, or `turn` for the hit's
+                          whole enclosing turn — the prompt that opened it, what was tried, and what
+                          came back [default: 0]
   -v, --verbose...        Raise the log level on stderr; repeatable (`-v` info, `-vv` debug, `-vvv`
                           trace)
       --limit <N>         [default: 20]
@@ -1508,7 +1516,7 @@ role  4 values · 978 of 978 matching docs have a value
 
 ```json
 {
-  "version": 3,
+  "version": 5,
   "files": {
     "/root/.claude/projects/-home-user-session-search/b20208d8-….jsonl": {
       "size": 1029179,

@@ -83,7 +83,7 @@ pub struct Doc {
     #[serde(default)]
     pub turn_seq: u64,
     /// The text of the human prompt that opened this doc's turn, capped at
-    /// [`TURN_PROMPT_BYTES`]. It is the one piece of a document's context only the parser can
+    /// `TURN_PROMPT_BYTES`. It is the one piece of a document's context only the parser can
     /// know: on a tail parse the opening record is nearly always on the far side of the
     /// incremental boundary, so it travels in [`ParseCarry::open_turn_prompt`] the same way
     /// `turn_seq` does. `schema::context_header` prepends it to the indexed-only
@@ -3682,7 +3682,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("live.jsonl");
 
-        // Ten lines end on the second turn's `tool_use`; its result is the eleventh.
+        // Nine lines end on the second turn's `tool_use`; its result is the tenth.
         std::fs::write(&path, lines[..9].concat()).unwrap();
         let (head, offset) = parse_file(
             &path,
@@ -3770,7 +3770,7 @@ mod tests {
         for max in 0..text.len() + 4 {
             let cut = truncate_words(text, max);
             assert!(text.starts_with(&cut), "{max}: {cut:?} is not a prefix");
-            assert!(cut.len() <= max.max(text.len()), "{max}: {cut:?}");
+            assert!(cut.len() <= max, "{max}: {cut:?} overspends the budget");
         }
     }
 

@@ -3377,41 +3377,107 @@ mod tests {
         assert!(!hit.doc.text.join(" ").contains("analyzer"));
     }
 
-    /// The IDF worry, settled by measurement rather than argument: every document of a session
-    /// shares its header, so those terms approach 100% document frequency *within* the session.
-    /// A term that is genuinely in one document's body must still beat the crowd that only
-    /// carries it as scaffolding — which is what the sub-1.0 field boost buys.
+    /// The discount, pinned by a corpus where it decides the order.
+    ///
+    /// Within one session the IDF collapse already makes a shared header cheap — every document
+    /// carries it, so the term is common — and a body match wins at any boost. The case that
+    /// needs the discount is the opposite one: a *small* session whose title names the term,
+    /// beside larger sessions where the term is written in a document's body. Across the
+    /// corpus the header term is then the rarer one, and at a boost of 1.0 BM25 ranks the two
+    /// documents that merely happened in a session *about* tokenizers above the two that
+    /// discuss one. The body wins below roughly 0.8; 0.3 leaves a margin, and this corpus
+    /// fails the assertion at 1.0.
     #[test]
     fn a_body_term_outranks_the_same_term_in_a_header() {
-        let session = crate::parse::SessionInfo {
-            title: Some("Tuning the markdown tokenizer".into()),
-            first_prompt: Some("make the tokenizer faster".into()),
+        let doc = |seq: u64, session: &str, text: &str| {
+            let mut d = blank_doc(seq);
+            d.doc_id = format!("{session}:-:{seq}");
+            d.session_id = session.into();
+            d.source_path = format!("/tmp/{session}.jsonl");
+            d.project = None;
+            d.git_branch = None;
+            d.text = vec![text.into()];
+            d.body = text.into();
+            d
+        };
+        let titled = |title: &str| crate::parse::SessionInfo {
+            title: Some(title.into()),
             ..crate::parse::SessionInfo::default()
         };
-        let mut docs = one_turn();
-        let mut about = blank_doc(3);
-        about.text = vec!["the tokenizer splits identifiers at a case boundary".into()];
-        about.body = about.text[0].clone();
-        about.turn_seq = 3;
-        about.turn_prompt = Some("how does splitting work".into());
-        docs.push(about);
+        // Two documents in a session titled by the term, with bodies that never say it.
+        let about = titled("tokenizer");
+        // Six documents in two other sessions, two of which say the term in their bodies.
+        let facets = titled("adding facets to the cli");
+        let windows = titled("snapping context windows to turns");
+        let corpus = [
+            (
+                doc(0, "a", "yes please do exactly that and nothing more"),
+                &about,
+            ),
+            (
+                doc(1, "a", "the parts of a name share one position now"),
+                &about,
+            ),
+            (
+                doc(
+                    0,
+                    "b",
+                    "the tokenizer splits identifiers at a case boundary",
+                ),
+                &facets,
+            ),
+            (
+                doc(1, "b", "facets count the values of one fast field"),
+                &facets,
+            ),
+            (
+                doc(2, "b", "a bucket is a value and not a document"),
+                &facets,
+            ),
+            (
+                doc(0, "c", "the tokenizer keeps a hash whole and alone"),
+                &windows,
+            ),
+            (
+                doc(1, "c", "a window snaps to the prompt that opened it"),
+                &windows,
+            ),
+            (
+                doc(2, "c", "the cap keeps the head of a long turn"),
+                &windows,
+            ),
+        ];
 
-        let (index, f) = index_with_session(&docs, &session);
+        let (schema, f) = crate::schema::build_schema();
+        let index = crate::tokenizer::create_in_ram(schema.clone());
+        let mut writer = index.writer_with_num_threads(1, 15_000_000).unwrap();
+        for (doc, session) in &corpus {
+            let json = crate::schema::doc_to_json(doc, Some(session), true).to_string();
+            writer
+                .add_document(TantivyDocument::parse_json(&schema, &json).unwrap())
+                .unwrap();
+        }
+        writer.commit().unwrap();
+
         let r = search(&index, &f, &req("tokenizer")).unwrap();
-        let scored: Vec<(u64, Score)> = r.hits.iter().map(|h| (h.doc.seq, h.score)).collect();
+        let scored: Vec<(String, Score)> = r
+            .hits
+            .iter()
+            .map(|h| (h.doc.doc_id.clone(), h.score))
+            .collect();
         assert_eq!(
             r.total, 4,
-            "the header pulls in the whole session: {scored:?}"
+            "two bodies and one two-document header: {scored:?}"
         );
 
-        // Seqs 0 and 3 hold the term in their bodies; 1 (`yes`) and 2 (a `cargo build`) hold it
-        // only in the header every document of the session carries.
-        let score_of = |seq: u64| scored.iter().find(|(s, _)| *s == seq).unwrap().1;
-        let body_floor = score_of(0).min(score_of(3));
-        let header_ceiling = score_of(1).max(score_of(2));
+        let score_of = |id: &str| scored.iter().find(|(d, _)| d == id).unwrap().1;
+        let body_floor = score_of("b:-:0").min(score_of("c:-:0"));
+        let header_ceiling = score_of("a:-:0").max(score_of("a:-:1"));
         assert!(
-            body_floor > header_ceiling * 2.0,
+            body_floor > header_ceiling,
             "scaffolding must not outrank content: {scored:?}"
         );
+        let ids: Vec<&str> = scored.iter().map(|(d, _)| d.as_str()).collect();
+        assert_eq!(&ids[..2], ["b:-:0", "c:-:0"], "{scored:?}");
     }
 }

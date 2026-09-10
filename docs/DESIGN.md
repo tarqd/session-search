@@ -344,7 +344,10 @@ pub struct Doc {
     /// (240) on a word boundary. Only the parser can know it and only the carry can move it
     /// across an incremental boundary; `schema::context_header` prepends it to `context_text`.
     /// See "Contextual BM25" below. `#[serde(default)]`: travels in the carry.
-    #[serde(default)]
+    /// `skip_serializing_if`: never stored, so a `Doc` read back from the index has nothing
+    /// here, and a consumer that serializes the struct whole (the HTTP API) must not report
+    /// `null` on every document as if the turn had no prompt.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub turn_prompt: Option<String>,
     pub session_id: String,
     pub agent_id: Option<String>,
@@ -826,7 +829,18 @@ title crowds out. Every cut is on a word boundary as well as a char one
 (`parse::truncate_words`): a header is fed to the `prose` analyzer, so a cut through the middle
 of a word invents a term nobody types and still charges the document for it.
 
-**What it does to scoring.** Two effects, both deliberate.
+**What it does to scoring and matching.** Three effects, all deliberate.
+
+- *The matched set widens.* `context_text` is a default query field, so a bare query matches
+  every document whose header carries the term, not only the documents whose bodies do — that
+  is what makes `yes` retrievable at all. It follows that `total`, paging, `facets --query` and
+  the `--facets` counts all describe the widened set: `facets tool_name --query tokenizer`
+  answers "which tools ran in turns and sessions *about* tokenizers", which is a different and
+  usually more useful question than the one the body-only query asked. It also follows that
+  under `--sort newest|oldest`, where no score is computed, the discount below has nothing to
+  act on and a header-only match is as good as a body match: a time-ordered page of a query
+  that names a session's title *is* that session, in time order. A field-qualified query
+  (`text:tokenizer`) still asks about bodies only.
 
 - *Fieldnorms.* A near-constant prefix on every document shifts `avgdl` and so changes BM25
   length normalisation corpus-wide. Capping the header is what bounds the shift; the eval

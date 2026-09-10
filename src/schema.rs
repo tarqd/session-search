@@ -313,7 +313,7 @@ const CONTEXT_PROSE_BYTES: usize = 100;
 const CONTEXT_NAME_BYTES: usize = 40;
 
 /// Hard ceiling on the assembled header. The per-piece budgets above already sum below it
-/// (3 × 100 + 2 × 40 + three separators = 396), so this is a backstop rather than a knife: it
+/// (3 × 100 + 2 × 40 + four separators = 396), so this is a backstop rather than a knife: it
 /// exists so that adding a piece later cannot silently unbound the field, and so the
 /// most document-specific piece — the turn's own prompt, composed last — is never the one a
 /// long session title crowds out.
@@ -333,13 +333,23 @@ fn basename(path: &str) -> Option<&str> {
         .filter(|s| !s.is_empty())
 }
 
+/// One header piece as it would be indexed: whitespace collapsed, then capped on a word
+/// boundary. Whitespace is not a term — a prompt wrapped over ten lines would otherwise spend
+/// most of its budget on the gaps between its words.
+fn piece_of(raw: &str, budget: usize) -> String {
+    let collapsed = raw.split_whitespace().collect::<Vec<_>>().join(" ");
+    truncate_words(&collapsed, budget)
+}
+
+/// `raw`, unless it would index as the same piece the document's own body does.
+fn unless_own<'a>(raw: Option<&'a str>, own_words: &str) -> Option<&'a str> {
+    raw.filter(|r| piece_of(r, CONTEXT_PROSE_BYTES) != own_words)
+}
+
 /// Append one header piece, collapsed, capped and deduplicated.
 fn push_piece(pieces: &mut Vec<String>, raw: Option<&str>, budget: usize) {
     let Some(raw) = raw else { return };
-    // Whitespace is not a term: a prompt wrapped over ten lines would otherwise spend most of
-    // its budget on the gaps between its words.
-    let collapsed = raw.split_whitespace().collect::<Vec<_>>().join(" ");
-    let piece = truncate_words(&collapsed, budget);
+    let piece = piece_of(raw, budget);
     // A session whose title *is* its opening prompt, or whose first turn is the one being
     // indexed, would otherwise index the same sentence two and three times over and hand it a
     // term frequency it did not earn.
@@ -368,10 +378,17 @@ fn push_piece(pieces: &mut Vec<String>, raw: Option<&str>, budget: usize) {
 /// * the turn's opening prompt rides on the document as [`Doc::turn_prompt`], because only the
 ///   parser can know it and only [`crate::parse::ParseCarry`] can carry it across a boundary.
 ///
-/// The document that *is* its turn's opening prompt gets no turn piece: it would be indexing
-/// its own words a second time, inflating their frequency in the one document where they need
-/// no help.
+/// A prompt piece that is this document's own text is not context and is left out: the
+/// document that *is* its turn's opening prompt, or the session's, would otherwise index its
+/// own words a second time, inflating their frequency in the one document where they need no
+/// help. The turn's opener is recognised by `seq == turn_seq`; the session's is recognised by
+/// its text, because it is not reliably the first document of its file — a compaction summary
+/// or a `system` record can precede it, and a tail parse numbers from `seq_base` — and in a
+/// subagent file it never passed `is_human_turn()` at all.
 pub fn context_header(doc: &Doc, session: Option<&SessionInfo>) -> Option<String> {
+    let own_words = piece_of(&doc.body, CONTEXT_PROSE_BYTES);
+    let not_own = |raw| unless_own(raw, &own_words);
+
     let mut pieces: Vec<String> = Vec::new();
     push_piece(
         &mut pieces,
@@ -380,7 +397,7 @@ pub fn context_header(doc: &Doc, session: Option<&SessionInfo>) -> Option<String
     );
     push_piece(
         &mut pieces,
-        session.and_then(|s| s.first_prompt.as_deref()),
+        not_own(session.and_then(|s| s.first_prompt.as_deref())),
         CONTEXT_PROSE_BYTES,
     );
     push_piece(
@@ -389,8 +406,15 @@ pub fn context_header(doc: &Doc, session: Option<&SessionInfo>) -> Option<String
         CONTEXT_NAME_BYTES,
     );
     push_piece(&mut pieces, doc.git_branch.as_deref(), CONTEXT_NAME_BYTES);
+    // The opener is known by number as well as by text: `seq == turn_seq` is exact for the
+    // document a human prompt was emitted as, and the text check covers the session's opening
+    // prompt and a prompt whose record emitted something else first.
     if doc.seq != doc.turn_seq {
-        push_piece(&mut pieces, doc.turn_prompt.as_deref(), CONTEXT_PROSE_BYTES);
+        push_piece(
+            &mut pieces,
+            not_own(doc.turn_prompt.as_deref()),
+            CONTEXT_PROSE_BYTES,
+        );
     }
     if pieces.is_empty() {
         return None;
@@ -1005,15 +1029,17 @@ mod tests {
     /// a one-line tool call would out-mass the body it was meant to describe.
     #[test]
     fn the_header_is_capped_and_cut_on_a_word_boundary() {
+        // Five oversized pieces, each with its own leading word so that none of them is
+        // deduplicated away and every one really is cut by its own budget.
         let long = "tokenizer ".repeat(200);
         let mut d = sample();
         d.seq = 7;
         d.turn_seq = 5;
-        d.turn_prompt = Some(long.clone());
-        d.git_branch = Some(long.clone());
+        d.turn_prompt = Some(format!("turnprompt {long}"));
+        d.git_branch = Some(format!("branch-{long}"));
         let info = SessionInfo {
-            title: Some(long.clone()),
-            first_prompt: Some(format!("different {long}")),
+            title: Some(format!("title {long}")),
+            first_prompt: Some(format!("first {long}")),
             ..SessionInfo::default()
         };
         let header = context_header(&d, Some(&info)).expect("a header");
@@ -1023,18 +1049,63 @@ mod tests {
             header.len()
         );
         // Word boundaries, so no piece ends in a fragment like `tokeni` that matches nothing
-        // anybody would type.
-        for piece in header.split(CONTEXT_SEP) {
-            assert!(!piece.is_empty());
+        // anybody would type — and each piece spent its whole budget short of one word, so the
+        // per-piece caps really were what stood between these inputs and an unbounded field.
+        let pieces: Vec<&str> = header.split(CONTEXT_SEP).collect();
+        assert_eq!(pieces.len(), 5, "{header}");
+        let word = "tokenizer ".len();
+        for (i, piece) in pieces.iter().enumerate() {
+            let budget = match i {
+                2 => "session-search".len(),
+                3 => CONTEXT_NAME_BYTES,
+                _ => CONTEXT_PROSE_BYTES,
+            };
             assert!(
                 piece.ends_with("tokenizer") || piece.ends_with("session-search"),
                 "cut mid-word: {piece:?}"
             );
+            assert!(
+                piece.len() <= budget && piece.len() + word > budget,
+                "piece {i} is {} bytes against a budget of {budget}: {piece:?}",
+                piece.len()
+            );
         }
+        assert!(pieces[0].starts_with("title "));
+        assert!(pieces[1].starts_with("first "));
+        assert!(pieces[3].starts_with("branch-"));
         // The per-piece budgets are what keep the total under the ceiling, so the last piece —
         // the document's own turn prompt, the most specific thing in the header — survives a
         // session whose every other piece is oversized.
-        assert!(header.ends_with("tokenizer"), "{header}");
+        assert!(pieces[4].starts_with("turnprompt "), "{header}");
+    }
+
+    /// The session's opening prompt is not context for the document that *is* that prompt,
+    /// wherever it sits in the file: a compaction summary or a `system` record can precede it,
+    /// so `seq == 0` says nothing, and in a subagent file it never opened a turn at all.
+    #[test]
+    fn the_session_opening_prompt_is_not_repeated_in_its_own_header() {
+        let mut d = sample();
+        d.kind = DocKind::Message;
+        d.role = "user".into();
+        d.seq = 3;
+        d.turn_seq = 3;
+        d.body = "Please characterize   the transcript\nformat".into();
+        d.turn_prompt = None;
+        let info = SessionInfo {
+            title: Some("Transcript format study".into()),
+            first_prompt: Some("Please characterize the transcript format".into()),
+            ..SessionInfo::default()
+        };
+        let header = context_header(&d, Some(&info)).expect("a header");
+        assert!(!header.contains("characterize"), "{header}");
+        assert!(header.contains("Transcript format study"), "{header}");
+
+        // The same prompt is context for every other document of the session.
+        let mut other = sample();
+        other.seq = 4;
+        other.turn_seq = 3;
+        let header = context_header(&other, Some(&info)).expect("a header");
+        assert!(header.contains("characterize the transcript"), "{header}");
     }
 
     /// Multi-byte text is cut where the chars allow, at every budget: a header is assembled
