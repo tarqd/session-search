@@ -773,8 +773,12 @@ impl<'a> Parser<'a> {
                 continue;
             };
             let mut doc = doc.clone();
-            let remaining = self.opts.max_text_bytes.saturating_sub(doc.text.len());
-            doc.text.push_str(&truncate(&outcome.text, remaining));
+            doc.text = self.tool_call_body(
+                doc.tool_name.as_deref(),
+                doc.tool_input.as_ref(),
+                &outcome.text,
+                outcome.is_error,
+            );
             doc.is_error = outcome.is_error;
             out.push(doc);
         }
@@ -1083,6 +1087,49 @@ impl<'a> Parser<'a> {
         }
     }
 
+    /// The indexed body of a tool-call document: the tool name, the input's own strings, and
+    /// the result text.
+    ///
+    /// When the call FAILED the result leads, because then it is the answer and the input is
+    /// only context. A failed `Bash` document is otherwise a heredoc followed — a couple of
+    /// thousand characters later — by the one line saying what went wrong, so every preview of
+    /// it shows the command and never the error.
+    ///
+    /// Shared with [`Parser::build_replacements`]: a document completed across an incremental
+    /// boundary must come out byte-identical to one a whole-file parse produced, and it cannot
+    /// get there by appending, since a failed call needs its result inserted *before* the input.
+    fn tool_call_body(
+        &self,
+        name: Option<&str>,
+        input: Option<&serde_json::Value>,
+        result_text: &str,
+        is_error: bool,
+    ) -> String {
+        let input_budget = self.opts.max_text_bytes / 4;
+        let name = name.unwrap_or_default();
+        let input = input
+            .map(|i| truncate(&string_leaves(i).join("\n"), input_budget))
+            .unwrap_or_default();
+        let result_budget = self
+            .opts
+            .max_text_bytes
+            .saturating_sub(name.len() + input.len() + 2);
+        let result = truncate(result_text, result_budget);
+
+        let ordered = if is_error {
+            [result.as_str(), input.as_str()]
+        } else {
+            [input.as_str(), result.as_str()]
+        };
+        let mut body = String::with_capacity(name.len() + input.len() + result.len() + 2);
+        body.push_str(name);
+        for part in ordered {
+            body.push('\n');
+            body.push_str(part);
+        }
+        body
+    }
+
     fn tool_call_doc(&self, tu: &ToolUseBlock) -> PartialDoc {
         let outcome = tu
             .id
@@ -1091,20 +1138,12 @@ impl<'a> Parser<'a> {
             .cloned()
             .unwrap_or_default();
 
-        // Index the input's own strings alongside the result, so `Bash cargo build` matches
-        // on `text` as well as through `tool_input.command`.
-        let input_budget = self.opts.max_text_bytes / 4;
-        let mut body = String::new();
-        if let Some(name) = &tu.name {
-            body.push_str(name);
-            body.push('\n');
-        }
-        if let Some(input) = &tu.input {
-            body.push_str(&truncate(&string_leaves(input).join("\n"), input_budget));
-            body.push('\n');
-        }
-        let remaining = self.opts.max_text_bytes.saturating_sub(body.len());
-        body.push_str(&truncate(&outcome.text, remaining));
+        let body = self.tool_call_body(
+            tu.name.as_deref(),
+            tu.input.as_ref(),
+            &outcome.text,
+            outcome.is_error,
+        );
 
         PartialDoc::tool_call(
             tu.name.clone(),
@@ -1559,6 +1598,109 @@ mod tests {
 
         let charged: Vec<u64> = out.docs.iter().filter_map(|d| d.thinking_tokens).collect();
         assert_eq!(charged, [300], "one message, one charge, on the carrier");
+    }
+
+    /// A failed call's document must lead with the error. `--errors-only` otherwise retrieves
+    /// exactly the right documents and then shows the command: on a real corpus the error text
+    /// sat 1,000-2,400 characters in, past a heredoc, so every preview was the thing that ran
+    /// rather than the reason it broke.
+    #[test]
+    fn a_failed_tool_call_leads_with_the_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let long_input = "x".repeat(600);
+        let body = format!(
+            concat!(
+                r#"{{"type":"assistant","uuid":"a1","sessionId":"s","cwd":"/p","message":{{"role":"assistant","id":"m1","content":[{{"type":"tool_use","id":"t1","name":"Bash","input":{{"command":"cat > f <<'PY'\n{long_input}"}}}}]}}}}"#,
+                "\n",
+                r#"{{"type":"user","uuid":"u1","sessionId":"s","cwd":"/p","message":{{"role":"user","content":[{{"type":"tool_result","tool_use_id":"t1","is_error":true,"content":"InputValidationError: JSON parse failed"}}]}},"toolUseResult":"InputValidationError: JSON parse failed"}}"#,
+                "\n",
+            ),
+            long_input = long_input
+        );
+        let out = parse_body(dir.path(), "e.jsonl", &body);
+
+        let doc = out
+            .docs
+            .iter()
+            .find(|d| d.kind == DocKind::ToolCall)
+            .expect("a tool call");
+        assert!(doc.is_error);
+        let err_at = doc
+            .text
+            .find("InputValidationError")
+            .expect("error indexed");
+        let cmd_at = doc.text.find("cat > f").expect("input still indexed");
+        assert!(
+            err_at < cmd_at,
+            "the error must precede the command, got error@{err_at} command@{cmd_at}"
+        );
+        assert!(
+            err_at < 40,
+            "the error must be near the top so a preview shows it, got {err_at}"
+        );
+    }
+
+    /// The reorder is only safe if the incremental path rebuilds the body rather than appending
+    /// to it — a failed call needs its result inserted *before* the input, which no append can
+    /// do. This is the byte-identity invariant, for the error case specifically.
+    #[test]
+    fn a_failed_call_completed_across_a_boundary_matches_a_whole_file_parse() {
+        let dir = tempfile::tempdir().unwrap();
+        let head = concat!(
+            r#"{"type":"assistant","uuid":"a1","sessionId":"s","cwd":"/p","message":{"role":"assistant","id":"m1","content":[{"type":"tool_use","id":"t1","name":"Bash","input":{"command":"set -e\nbroken"}}]}}"#,
+            "\n",
+        );
+        let tail = concat!(
+            r#"{"type":"user","uuid":"u1","sessionId":"s","cwd":"/p","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"t1","is_error":true,"content":"Error: exit 1"}]},"toolUseResult":"Error: exit 1"}"#,
+            "\n",
+        );
+        let path = dir.path().join("split-err.jsonl");
+
+        // Split parse: the tool_use in one run, its failure in the next.
+        std::fs::write(&path, head).unwrap();
+        let (first, offset) = parse_file(
+            &path,
+            0,
+            0,
+            &ParseOptions::default(),
+            &FileContext::default(),
+        )
+        .unwrap();
+        std::fs::write(&path, format!("{head}{tail}")).unwrap();
+        let ctx = FileContext {
+            carry: first.carry.clone(),
+            ..FileContext::default()
+        };
+        let (second, _) = parse_file(
+            &path,
+            offset,
+            first.docs.len() as u64,
+            &ParseOptions::default(),
+            &ctx,
+        )
+        .unwrap();
+
+        let completed = second
+            .replacements
+            .iter()
+            .find(|d| d.tool_use_id.as_deref() == Some("t1"))
+            .expect("the pending document is completed, not duplicated");
+
+        // Whole-file parse of the same bytes.
+        let whole = parse_body(dir.path(), "whole-err.jsonl", &format!("{head}{tail}"));
+        let expected = whole
+            .docs
+            .iter()
+            .find(|d| d.tool_use_id.as_deref() == Some("t1"))
+            .expect("a tool call");
+
+        assert_eq!(completed.text, expected.text, "body must be byte-identical");
+        assert_eq!(completed.is_error, expected.is_error);
+        assert!(
+            completed.text.starts_with("Bash\nError: exit 1"),
+            "error leads even when it arrived across a boundary: {:?}",
+            completed.text
+        );
     }
 
     // -- file-level hazards -------------------------------------------------

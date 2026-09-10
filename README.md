@@ -896,6 +896,11 @@ the index holds none of them. What *does* survive is the cost: `thinking_tokens`
 fast field, so `--min-thinking N` and `facets thinking_tokens` still find the turns where the
 model stopped to reason, even when you cannot read what it reasoned about.
 
+**Changing what is indexed needs `index --full`.** The watermarks say a file is unchanged, so
+they will not re-read it. This applies to `--no-thinking`, `--no-spilled-results`, and to any
+release that changes how a document body is built — for instance the one that made a failed tool
+call lead with its error instead of its command.
+
 **Snippet markers can collide with the text.** Matches are wrapped in `**…**`; if the indexed text
 already contains `**` (this tool's own Markdown output, for instance) you will see `****term****`.
 Colour output makes it unambiguous; `--no-color` does not.

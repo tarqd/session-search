@@ -333,6 +333,12 @@ first to emit — repeated with the same value on up to four of them, so it is c
 `message.id` on a record that actually carries it (`ParseCarry::charged_message_ids` keeps that
 true across an incremental boundary). Filter with `--min-thinking N`.
 
+A tool-call document's body is `name`, the input's own strings, and the result text — but when
+the call **failed** the result leads, since then it is the answer and the input is only context.
+`Parser::tool_call_body` is shared with the incremental completion path: a document finished
+across a boundary must be byte-identical to one a whole-file parse produced, and for a failed call
+that cannot be reached by appending, because the result belongs *before* the input.
+
 Incremental rules:
 - Watermark per file: `{size, mtime_ms, byte_offset, docs, carry}`.
 - Unchanged `size` **and** `mtime_ms` → skip entirely.
