@@ -1203,9 +1203,9 @@ impl<'a> Parser<'a> {
     /// `tool_output`, which is neither: it is what the tool returned, not what it was asked
     /// to do.
     ///
-    /// The input copy does not scale with the cap: the input strings get a quarter of the
-    /// budget but never more than `INPUT_LEAVES_CAP`, because `tool_input` already carries a
-    /// `Write` payload whole. `tool_output` is capped separately at the full
+    /// The input copy does not scale with the cap: `text` and `code` share a quarter of the
+    /// budget between them, and never more than `INPUT_LEAVES_CAP`, because `tool_input`
+    /// already carries a `Write` payload whole. `tool_output` is capped separately at the full
     /// `max_text_bytes`, since it is a field of its own rather than a share of one body.
     fn tool_call_doc(&self, tu: &ToolUseBlock) -> PartialDoc {
         let outcome = tu
@@ -1225,9 +1225,13 @@ impl<'a> Parser<'a> {
         }
         if let Some(input) = &tu.input {
             let (words, contents) = input_leaves(input);
-            body.push_str(&truncate(&words.join("\n"), input_budget));
+            // Both halves of the copy share the one `input_budget`. Routing the file contents
+            // to `code` instead of into the same string must not double what the cap allows.
+            let words = truncate(&words.join("\n"), input_budget);
+            let contents_budget = input_budget.saturating_sub(words.len());
+            body.push_str(&words);
             body.push('\n');
-            code.extend(entry(&contents.join("\n"), cap.saturating_sub(body.len())));
+            code.extend(entry(&contents.join("\n"), contents_budget));
         }
 
         // `bash_cmd` is a Bash-only structured view of the command line, so `--program cargo`
@@ -2091,9 +2095,9 @@ mod tests {
             .find(|d| d.kind == DocKind::ToolCall)
             .unwrap();
         assert!(
-            call.text.len() <= INPUT_LEAVES_CAP + 16,
+            text_of(call).len() + code_of(call).len() <= INPUT_LEAVES_CAP + 16,
             "input copy grew to {} bytes",
-            call.text.len()
+            text_of(call).len() + code_of(call).len()
         );
         // ...and nothing was actually lost: `tool_input` still carries the whole payload.
         assert_eq!(
@@ -2720,7 +2724,10 @@ mod tests {
         };
         let out = parse_whole(&fixture("union_types.jsonl"), &opts).unwrap();
         assert!(
-            out.docs.iter().all(|d| d.text.len() <= 16),
+            out.docs
+                .iter()
+                .all(|d| d.text.iter().all(|t| t.len() <= 16)
+                    && d.code.iter().all(|c| c.len() <= 16)),
             "cap not applied"
         );
     }

@@ -243,6 +243,9 @@ pub fn doc_json(d: &Doc) -> Value {
         "code_lang": d.code_langs,
         "tool_output": d.tool_output,
         "thinking": d.thinking,
+        // Stored and filterable through `--min-thinking`, and on a machine that strips
+        // thinking text before it reaches disk it is the only measure of the turn left.
+        "thinking_tokens": d.thinking_tokens,
         "source_path": d.source_path,
     })
 }
@@ -1695,12 +1698,14 @@ mod tests {
         d.code = vec!["pub fn open_or_create(dir: &Path) {}".into()];
         d.headings = vec!["The fix".into()];
         d.code_langs = vec!["rust".into()];
+        d.thinking_tokens = Some(300);
         let v = doc_json(&d);
         assert_eq!(v["body"], "Use the helper:");
         assert_eq!(v["text"][0], "Use the helper:");
         assert_eq!(v["code"][0], "pub fn open_or_create(dir: &Path) {}");
         assert_eq!(v["headings"][0], "The fix");
         assert_eq!(v["code_lang"][0], "rust");
+        assert_eq!(v["thinking_tokens"], 300);
     }
 
     #[test]

@@ -242,8 +242,9 @@ cap a body *before* splitting it.
   unsplit. They are not markdown, and the `prose` analyzer splits identifiers, so a rendered
   file, a diagnostic or a hook's output is still searchable by the parts of the names in it;
 - `max_text_bytes` bounds one document's body: a message is truncated *before* the split, and a
-  tool call spends one budget across `text` then `code` — with the input strings capped at a
-  quarter of it and never more than `INPUT_LEAVES_CAP`, so the copy does not scale with the cap.
+  tool call's input copy spends one budget across `text` then `code` — a quarter of the cap and
+  never more than `INPUT_LEAVES_CAP`, so the copy does not scale with the cap and a `Write`
+  payload `tool_input` already holds whole is not duplicated at length.
   `tool_output` is capped separately at the same number, because it is a field of its own rather
   than a share of one body. `ParseOutput::replacements` only fills in `tool_output`, so a
   completed tail parse stays byte-identical to a whole-file one without rebuilding anything;
