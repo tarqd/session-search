@@ -17,7 +17,7 @@ use serde_json::Value;
 use crate::format::{self, OutputOpts};
 use crate::index::{self, IndexOptions, IndexStats};
 use crate::parse::SessionInfo;
-use crate::search::{self, Filters, SearchRequest};
+use crate::search::{self, Filters, SearchRequest, SortBy};
 use crate::{context, discovery};
 
 /// Facet buckets returned alongside `search --facets`. `facets` has `--top` for the same knob;
@@ -100,6 +100,10 @@ pub enum Command {
         /// Search assistant thinking blocks too.
         #[arg(long)]
         include_thinking: bool,
+        /// Hit order. Relevance is meaningless without a query, so a filter-only search is
+        /// worth ordering by time.
+        #[arg(long, value_enum, default_value_t = SortBy::Relevance, value_name = "ORDER")]
+        sort: SortBy,
         #[command(flatten, next_help_heading = "Filters")]
         filters: Filters,
     },
@@ -156,6 +160,26 @@ pub enum Command {
         #[arg(long)]
         json: bool,
     },
+    /// Serve the index over HTTP (and, with the `web-ui` feature, the browser UI).
+    #[cfg(feature = "http-api")]
+    Serve {
+        /// Interface to bind. Anything but a loopback address publishes every transcript this
+        /// index holds to the network, unauthenticated; the server says so loudly when asked.
+        #[arg(long, default_value = "127.0.0.1", value_name = "ADDR")]
+        host: String,
+        #[arg(long, default_value_t = 7777, value_name = "PORT")]
+        port: u16,
+        /// Allow browser requests from this origin (`*` for any). Repeatable. Off by default:
+        /// the bundled UI is same-origin, and only a separately hosted frontend needs this.
+        #[arg(long = "cors", value_name = "ORIGIN")]
+        cors: Vec<String>,
+        /// Re-index every N seconds while the server runs. 0 (the default) never does.
+        #[arg(long = "refresh-secs", default_value_t = 0, value_name = "N")]
+        refresh_secs: u64,
+        /// Skip the incremental index refresh that normally runs before the port opens.
+        #[arg(long)]
+        no_refresh: bool,
+    },
 }
 
 impl Command {
@@ -167,6 +191,8 @@ impl Command {
             | Command::Show { json, .. }
             | Command::Sessions { json, .. }
             | Command::Stats { json } => *json,
+            #[cfg(feature = "http-api")]
+            Command::Serve { .. } => false,
         }
     }
 }
@@ -263,6 +289,7 @@ fn dispatch(
             json: _,
             no_refresh,
             include_thinking,
+            sort,
         } => {
             refresh(index_dir, no_refresh, include_thinking);
             let (index, fields) = index::open_or_create(index_dir)?;
@@ -275,6 +302,7 @@ fn dispatch(
                 facet_top: SEARCH_FACET_TOP,
                 snippet_chars: SNIPPET_CHARS,
                 include_thinking,
+                sort,
             };
             let response = search::search(&index, &fields, &request)?;
             opts.context = window;
@@ -398,6 +426,27 @@ fn dispatch(
             let stats = index_stats(index_dir)?;
             format::stats_scoped(out, &stats, &roots, &opts)
         }
+
+        #[cfg(feature = "http-api")]
+        Command::Serve {
+            host,
+            port,
+            cors,
+            refresh_secs,
+            no_refresh,
+        } => {
+            refresh(index_dir, no_refresh, false);
+            crate::api::serve(
+                index_dir,
+                crate::api::ServeOptions {
+                    host,
+                    port,
+                    cors,
+                    refresh_secs,
+                },
+                out,
+            )
+        }
     }
 }
 
@@ -506,7 +555,7 @@ fn context_windows(
 /// resolved by scanning the session, which is one targeted term query, not an index scan.
 /// Expand an unambiguous id prefix to the full id. An unknown id is passed through
 /// unchanged so the caller can report "nothing indexed" rather than "no such session".
-fn resolve_id<'a>(
+pub(crate) fn resolve_id<'a>(
     what: &str,
     given: &str,
     known: impl Iterator<Item = &'a str>,
@@ -529,7 +578,7 @@ fn resolve_id<'a>(
 /// The one transcript file a `(session_id, agent_id)` pair lives in, when there is exactly one.
 /// Two files sharing a session id (`resetSessionFile()`, `relocated` — §9) is ambiguous, and
 /// `None` there means "do not constrain", which is the old, id-only behaviour.
-fn source_path_for(
+pub(crate) fn source_path_for(
     known: &std::collections::BTreeMap<String, SessionInfo>,
     session_id: &str,
     agent_id: Option<&str>,
@@ -573,7 +622,7 @@ fn resolve_seq(
 /// Index statistics without opening (or creating) the Tantivy index: everything shown is
 /// already recorded in `state.json` and `sessions.json`, whose shapes are pinned in
 /// `docs/DESIGN.md`. `docs_added` is the document count those watermarks account for.
-fn index_stats(index_dir: &Path) -> Result<IndexStats> {
+pub(crate) fn index_stats(index_dir: &Path) -> Result<IndexStats> {
     let started = Instant::now();
     let mut stats = IndexStats::default();
 
@@ -872,6 +921,8 @@ mod tests {
             "--json",
             "--no-refresh",
             "--include-thinking",
+            "--sort",
+            "newest",
         ]);
         assert_eq!(cli.verbose, 2);
         assert_eq!(cli.index.as_deref(), Some(Path::new("/tmp/idx")));
@@ -887,10 +938,12 @@ mod tests {
             json,
             no_refresh,
             include_thinking,
+            sort,
         } = cli.command
         else {
             panic!("expected the search subcommand");
         };
+        assert_eq!(sort, SortBy::Newest);
         assert_eq!(query.as_deref(), Some("cargo build"));
         assert_eq!(filters.project.as_deref(), Some("~/code"));
         assert_eq!(filters.tool, ["Bash", "Edit"]);
@@ -926,6 +979,7 @@ mod tests {
             json,
             no_refresh,
             include_thinking,
+            sort,
             filters,
         } = parse(&["session-search", "search", "tantivy"]).command
         else {
@@ -935,6 +989,7 @@ mod tests {
         assert_eq!((limit, offset, context), (20, 0, 0));
         assert!(facets.is_empty());
         assert!(!json && !no_refresh && !include_thinking);
+        assert_eq!(sort, SortBy::Relevance);
         assert!(filters.project.is_none() && filters.tool.is_empty());
     }
 

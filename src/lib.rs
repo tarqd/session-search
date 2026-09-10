@@ -3,6 +3,8 @@
 //! Module boundaries are pinned in `docs/DESIGN.md`; the input format is described in
 //! `docs/TRANSCRIPT-FORMAT.md`.
 
+#[cfg(feature = "http-api")]
+pub mod api;
 pub mod cli;
 pub mod context;
 pub mod discovery;
@@ -20,4 +22,4 @@ pub use parse::{
     parse_file, parse_whole,
 };
 pub use schema::{Fields, build_schema, doc_to_json};
-pub use search::{FacetCount, Filters, Hit, SearchRequest, SearchResponse};
+pub use search::{FacetCount, Filters, Hit, SearchRequest, SearchResponse, SnippetSource, SortBy};

@@ -29,7 +29,7 @@ use crate::search::{FacetResult, Hit, SearchResponse};
 
 /// The marker `search.rs` wraps matched spans in. Identical on both sides, so splitting on it
 /// yields alternating plain/highlighted segments.
-const HL: &str = "**";
+const HL: &str = crate::search::HIGHLIGHT;
 
 /// Per-document text budget in the session view. Tool results reach the parser's 32 KiB cap;
 /// pasting that into a transcript view buries the conversation.
@@ -1089,6 +1089,7 @@ mod tests {
             doc,
             score,
             snippet: snippet.into(),
+            snippet_field: crate::search::SnippetSource::Text,
         }
     }
 

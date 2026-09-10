@@ -37,8 +37,17 @@ use crate::schema::Fields;
 
 /// Wraps the matched span inside a snippet. Plain text on purpose: the snippet travels through
 /// JSON output and MCP responses as well as the terminal, so HTML would be wrong everywhere.
-const HL_PREFIX: &str = "**";
-const HL_SUFFIX: &str = "**";
+///
+/// Public because every consumer that re-marks a snippet — the terminal renderer in `format.rs`,
+/// the HTML one in `api` — has to agree with this on what a mark looks like. It is the same
+/// string either side of the span, so a consumer splits on it rather than matching a pair.
+pub const HIGHLIGHT: &str = "**";
+const HL_PREFIX: &str = HIGHLIGHT;
+const HL_SUFFIX: &str = HIGHLIGHT;
+
+/// The schema name of the date field. `TopDocs::order_by_fast_field` takes a *name*, not the
+/// `Field` handle the rest of this module passes around.
+const TIMESTAMP_FIELD: &str = "timestamp";
 
 #[derive(Debug, Clone, Default, clap::Args, serde::Serialize, serde::Deserialize)]
 #[serde(default)]
@@ -87,6 +96,36 @@ pub struct Filters {
     pub sidechains_only: bool,
 }
 
+/// What orders the hits.
+///
+/// Relevance is the default and the only order that means anything for a text query. The two
+/// time orders exist for the case a text query does not cover: browsing a filter on its own
+/// ("every Bash call in this project"), where BM25 scores every document identically and the
+/// resulting order is whatever the segments happened to hold.
+///
+/// **A time order can only return documents that carry a timestamp.** Every record a
+/// transcript writes has one, so in practice this is the whole corpus; but `total` counts
+/// matches, and a document with no timestamp is counted there and unreachable by paging.
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    Default,
+    PartialEq,
+    Eq,
+    serde::Serialize,
+    serde::Deserialize,
+    clap::ValueEnum,
+)]
+#[serde(rename_all = "snake_case")]
+#[clap(rename_all = "kebab-case")]
+pub enum SortBy {
+    #[default]
+    Relevance,
+    Newest,
+    Oldest,
+}
+
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 #[serde(default)]
 pub struct SearchRequest {
@@ -99,6 +138,7 @@ pub struct SearchRequest {
     pub facet_top: usize,
     pub snippet_chars: usize,
     pub include_thinking: bool,
+    pub sort: SortBy,
 }
 
 impl Default for SearchRequest {
@@ -112,6 +152,7 @@ impl Default for SearchRequest {
             facet_top: 20,
             snippet_chars: 240,
             include_thinking: false,
+            sort: SortBy::Relevance,
         }
     }
 }
@@ -166,11 +207,41 @@ impl FacetResult {
     }
 }
 
+/// Which stored body a [`Hit`]'s snippet was cut from.
+///
+/// A search over `text`, `tool_output` and `thinking` at once can attribute a hit to any of the
+/// three, and the three read completely differently — a message, a command's output, the
+/// model's reasoning. A caller that renders them the same way (or labels the snippet with the
+/// wrong field, which is what a single opaque string invites) tells the reader something untrue
+/// about what matched.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SnippetSource {
+    Text,
+    ToolOutput,
+    Thinking,
+}
+
+impl SnippetSource {
+    /// The schema field name, which is also the JSON key the API reports it under.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            SnippetSource::Text => "text",
+            SnippetSource::ToolOutput => "tool_output",
+            SnippetSource::Thinking => "thinking",
+        }
+    }
+}
+
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct Hit {
     pub doc: Doc,
     pub score: f32,
     pub snippet: String,
+    /// The body [`Hit::snippet`] came from. Not always the field the query matched: with
+    /// nothing to highlight the snippet falls back to the head of whichever body the document
+    /// has, and this reports that one.
+    pub snippet_field: SnippetSource,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -200,8 +271,7 @@ pub fn search(
     // document is read. No request can return, or skip past, more documents than the index
     // holds, so that is the ceiling for both.
     let top = TopDocs::with_limit(collector_limit(&searcher, req.limit))
-        .and_offset(req.offset.min(searcher.num_docs() as usize))
-        .order_by_score();
+        .and_offset(req.offset.min(searcher.num_docs() as usize));
 
     // Facet fields are validated up front so a typo is a clear error rather than a
     // Tantivy-internal one, and so the aggregation rides along in the same pass as the hits.
@@ -210,13 +280,41 @@ pub fn search(
         validate_agg_field(&schema, name)?;
     }
 
-    let (top_hits, total, agg) = if facet_fields.is_empty() {
-        let (hits, total) = searcher.search(&query, &(top, Count))?;
-        (hits, total, None)
-    } else {
-        let collector = agg_collector(&facet_fields, req.facet_top);
-        let (hits, total, agg) = searcher.search(&query, &(top, Count, collector))?;
-        (hits, total, Some(agg))
+    // Four arms rather than two: the aggregation has to ride in the *same* searcher pass as
+    // the hits, and the two orderings are different collector types, so neither choice can be
+    // hoisted out of the other.
+    let (top_hits, total, agg) = match req.sort {
+        SortBy::Relevance => {
+            let top = top.order_by_score();
+            if facet_fields.is_empty() {
+                let (hits, total) = searcher.search(&query, &(top, Count))?;
+                (hits, total, None)
+            } else {
+                let collector = agg_collector(&facet_fields, req.facet_top);
+                let (hits, total, agg) = searcher.search(&query, &(top, Count, collector))?;
+                (hits, total, Some(agg))
+            }
+        }
+        SortBy::Newest | SortBy::Oldest => {
+            let order = if req.sort == SortBy::Newest {
+                tantivy::Order::Desc
+            } else {
+                tantivy::Order::Asc
+            };
+            let top = top.order_by_fast_field::<DateTime>(TIMESTAMP_FIELD, order);
+            let (hits, total, agg) = if facet_fields.is_empty() {
+                let (hits, total) = searcher.search(&query, &(top, Count))?;
+                (hits, total, None)
+            } else {
+                let collector = agg_collector(&facet_fields, req.facet_top);
+                let (hits, total, agg) = searcher.search(&query, &(top, Count, collector))?;
+                (hits, total, Some(agg))
+            };
+            // A timestamp is not a relevance score and must not be reported as one; every hit
+            // in a time-ordered page scores the same, which is exactly what it means.
+            let hits = hits.into_iter().map(|(_, addr)| (0.0, addr)).collect();
+            (hits, total, agg)
+        }
     };
 
     let mut facets = BTreeMap::new();
@@ -261,35 +359,47 @@ pub fn search(
     for (score, address) in top_hits {
         let stored: TantivyDocument = searcher.doc(address)?;
         let doc = doc_from_stored(f, &stored);
-        let highlighted = |g: &Option<SnippetGenerator>| {
+        let highlighted = |g: &Option<SnippetGenerator>, from: SnippetSource| {
             g.as_ref()
                 .map(|g| render_snippet(&g.snippet_from_doc(&stored)))
                 .filter(|s| !s.trim().is_empty())
+                .map(|s| (s, from))
         };
-        let snippet = highlighted(&snippets)
-            .or_else(|| highlighted(&output_snippets))
-            .or_else(|| highlighted(&thinking_snippets))
+        let (snippet, snippet_field) = highlighted(&snippets, SnippetSource::Text)
+            .or_else(|| highlighted(&output_snippets, SnippetSource::ToolOutput))
+            .or_else(|| highlighted(&thinking_snippets, SnippetSource::Thinking))
             .unwrap_or_else(|| {
                 // Nothing highlighted: fall back to whichever body this document actually has.
                 // A failed call leads with its result — on `--errors-only`, which carries no
                 // free-text query and so lands here every time, the error is the answer and
                 // the command that failed is only context.
                 let (first, second) = if doc.is_error {
-                    (doc.tool_output.as_deref(), Some(doc.text.as_str()))
+                    (
+                        (doc.tool_output.as_deref(), SnippetSource::ToolOutput),
+                        (Some(doc.text.as_str()), SnippetSource::Text),
+                    )
                 } else {
-                    (Some(doc.text.as_str()), doc.tool_output.as_deref())
+                    (
+                        (Some(doc.text.as_str()), SnippetSource::Text),
+                        (doc.tool_output.as_deref(), SnippetSource::ToolOutput),
+                    )
                 };
-                let body = [first, second, doc.thinking.as_deref()]
-                    .into_iter()
-                    .flatten()
-                    .find(|b| !b.trim().is_empty())
-                    .unwrap_or("");
-                excerpt(body, req.snippet_chars)
+                let (body, from) = [
+                    first,
+                    second,
+                    (doc.thinking.as_deref(), SnippetSource::Thinking),
+                ]
+                .into_iter()
+                .filter_map(|(body, from)| Some((body?, from)))
+                .find(|(body, _)| !body.trim().is_empty())
+                .unwrap_or(("", SnippetSource::Text));
+                (excerpt(body, req.snippet_chars), from)
             });
         hits.push(Hit {
             doc,
             score,
             snippet,
+            snippet_field,
         });
     }
 
