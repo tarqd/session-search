@@ -1038,7 +1038,13 @@ session-search facets tool_input.file_path --top 3 --json
 ```
 
 A search hit carries the full document — every field, the parsed `tool_input` object, and the
-marked-up snippet (`raw`, the original JSONL line, is stored but withheld from the payload):
+marked-up snippet (`raw`, the original JSONL line, is stored but withheld from the payload).
+`seq` is the document's ordinal within its transcript file; `turn_seq` is the `seq` of the
+document that opened its conversational **turn** — the human prompt the whole exchange answers —
+so every message, tool call and result of one turn shares it, and the prompt itself is the
+document whose `seq == turn_seq`. The hit below comes from a subagent transcript, whose `user`
+records are written by the parent rather than typed by a person, so the whole file is one turn
+and `turn_seq` is 0:
 
 ```bash
 session-search search "aggregation" -t Bash --limit 1 --json --facets tool_name
@@ -1084,6 +1090,7 @@ session-search search "aggregation" -t Bash --limit 1 --json --facets tool_name
       "tool_name": "Bash",
       "tool_output": "192:pub mod aggregation;\n193:pub mod collector;…",
       "tool_use_id": "toolu_01QtnP3F5Y8o8sPGoePwD6Ug",
+      "turn_seq": 0,
       "uuid": "cfbf460d-4921-4c09-b9f2-ff341c7141d6",
       "version": "2.1.266"
     }
@@ -1580,6 +1587,10 @@ Colour output makes it unambiguous; `--no-color` does not.
 
 **Context windows assume dense `seq`.** `show --around` and `search --context` walk `seq` numbers
 within a file. If a re-index ever leaves a hole, the window comes back short rather than erroring.
+`turn_seq` inherits that assumption — a turn is a contiguous range of `seq` in one file, not a
+list of the documents in it — and it inherits one more: a transcript that opens mid-conversation
+after a `resetSessionFile()`, and a subagent transcript whose prompts were written by the parent,
+have no human prompt to bound a turn with, so their leading documents all share turn zero.
 
 **Spilled tool results are read from a path found in transcript text.** Oversized tool output is
 written to `tool-results/<id>.txt` and the transcript carries a `Full output saved to: <path>`
