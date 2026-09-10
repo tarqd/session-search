@@ -1,0 +1,302 @@
+//! Filtering the session list — the one matcher every front end uses.
+//!
+//! A session listing does not come from Tantivy. It comes from `sessions.json` (see
+//! [`crate::index::load_sessions`]), one row per transcript file, and a [`SessionInfo`] carries
+//! none of the per-message fields the index does. So every front end that offers `sessions` has
+//! to answer two questions of its own: which of the [`Filters`] this row satisfies, and which of
+//! them could never have been asked here at all.
+//!
+//! Both answers used to be written once per front end — `cli.rs` and `api/mod.rs` each held a
+//! private `SessionMatcher`, the second with a comment defending the copy — and the two had
+//! already drifted on the second question: one warned about `--program` and `--lang` and said
+//! nothing about `--min-thinking`, the other the reverse. That is the failure mode this module
+//! exists to end: a filter silently dropped on one surface and reported on another is invisible
+//! to a reader of either one, and a third front end would have made it a three-way disagreement.
+//!
+//! What stays with each front end is only how it *reports*: the CLI logs a `tracing::warn!`, the
+//! HTTP API returns the sentences in the response body. The list itself is
+//! [`unanswerable_filters`], here, once.
+
+use crate::parse::SessionInfo;
+use crate::search::{self, Edge, Filters, when_ms};
+
+/// The subset of [`Filters`] that `sessions.json` can answer, pre-resolved once.
+///
+/// Pre-resolved because the dates are the expensive and the fallible part: `--since 7d` is
+/// relative to *now*, and resolving it inside [`Self::matches`] would both re-parse it per row
+/// and let `now` move underneath a listing, so the first row and the last would be measured
+/// against different windows. Parsing once in [`Self::new`] also makes an unreadable date fail
+/// the command instead of quietly matching nothing.
+#[derive(Debug, Clone)]
+pub struct SessionMatcher {
+    project: Option<String>,
+    branch: Option<String>,
+    session: Option<String>,
+    agent_type: Option<String>,
+    since_ms: Option<i64>,
+    until_ms: Option<i64>,
+    no_sidechains: bool,
+    sidechains_only: bool,
+}
+
+/// A `--since` / `--until` value that could not be read.
+///
+/// `field` is the plain name (`"since"`), never a flag: this matcher serves a CLI that spells it
+/// `--since`, an HTTP API that spells it `since=`, and whatever comes next. Baking either
+/// spelling in here would put a flag that does not exist into an HTTP 400 — a caller told to fix
+/// something they cannot type. Each front end renders `field` in its own dialect;
+/// `api::tests::a_malformed_date_is_a_400_wherever_it_arrives` pins that the HTTP side never
+/// says `--since`.
+#[derive(Debug, thiserror::Error)]
+#[error("parsing {field}: {source:#}")]
+pub struct FilterError {
+    pub field: &'static str,
+    #[source]
+    pub source: anyhow::Error,
+}
+
+impl SessionMatcher {
+    pub fn new(f: &Filters) -> Result<SessionMatcher, FilterError> {
+        // One `now` for both ends and every row, for the reason in the type's doc comment.
+        let now = chrono::Utc::now();
+        let at = |raw: &Option<String>, field: &'static str, edge: Edge| {
+            raw.as_deref()
+                .map(|s| when_ms(s, now, edge))
+                .transpose()
+                .map_err(|source| FilterError { field, source })
+        };
+        Ok(SessionMatcher {
+            project: f.project.as_deref().map(search::expand_tilde),
+            branch: f.branch.clone(),
+            session: f.session.clone(),
+            agent_type: f.agent_type.clone(),
+            since_ms: at(&f.since, "since", Edge::Lower)?,
+            until_ms: at(&f.until, "until", Edge::Upper)?,
+            no_sidechains: f.no_sidechains,
+            sidechains_only: f.sidechains_only,
+        })
+    }
+
+    pub fn matches(&self, info: &SessionInfo) -> bool {
+        // Path-aware, exactly as the index-side filter is: `-p /home/user/alpha` must not drag
+        // in the sibling `/home/user/alpha-beta`.
+        if let Some(prefix) = &self.project
+            && !info
+                .project
+                .as_deref()
+                .is_some_and(|p| search::path_has_prefix(p, prefix))
+        {
+            return false;
+        }
+        if let Some(branch) = &self.branch
+            && info.git_branch.as_deref() != Some(branch.as_str())
+        {
+            return false;
+        }
+        // A session id is long enough that a prefix is a convenience, not an ambiguity.
+        if let Some(session) = &self.session
+            && !info.session_id.starts_with(session.as_str())
+        {
+            return false;
+        }
+        if let Some(kind) = &self.agent_type
+            && info.agent_type.as_deref() != Some(kind.as_str())
+        {
+            return false;
+        }
+        if self.no_sidechains && info.agent_id.is_some() {
+            return false;
+        }
+        if self.sidechains_only && info.agent_id.is_none() {
+            return false;
+        }
+        // A session overlaps the window if it ended after `since` and started before `until`.
+        if let Some(since) = self.since_ms
+            && info
+                .last_ts_ms
+                .or(info.first_ts_ms)
+                .is_some_and(|t| t < since)
+        {
+            return false;
+        }
+        if let Some(until) = self.until_ms
+            && info
+                .first_ts_ms
+                .or(info.last_ts_ms)
+                .is_some_and(|t| t > until)
+        {
+            return false;
+        }
+        true
+    }
+}
+
+/// The filters that arrived and that a session listing cannot answer, in [`Filters`] declaration
+/// order.
+///
+/// Ten of them, and the list is the *complement* of what [`SessionMatcher`] reads rather than a
+/// remembered subset — that is the whole point of it living beside the matcher. A
+/// [`SessionInfo`] is a per-transcript row: it holds a project, a branch, a session id, an agent
+/// type and two timestamps, and nothing about any individual message. So `tool`, `tool_input`,
+/// `tool_output`, `lang`, `min_thinking`, `program`, `model`, `role`, `kind` and `errors_only`
+/// have no column to be compared against, at any cost — they are not slow here, they are
+/// unanswerable.
+///
+/// Silently dropping one is the outcome this refuses. A listing filtered by nine of ten filters
+/// looks exactly like a listing filtered by ten, and the caller reads "no session used that
+/// model" out of a result that means "that question cannot be asked here".
+///
+/// Names are the plain field names, not flags: `cli.rs` renders `--tool-input` and the HTTP API
+/// renders `tool_input`, and the spelling is the front end's business (see [`FilterError`]).
+pub fn unanswerable_filters(f: &Filters) -> Vec<&'static str> {
+    [
+        ("tool", !f.tool.is_empty()),
+        ("tool_input", !f.tool_input.is_empty()),
+        ("tool_output", !f.tool_output.is_empty()),
+        ("lang", !f.lang.is_empty()),
+        ("min_thinking", f.min_thinking.is_some()),
+        ("program", !f.program.is_empty()),
+        ("model", f.model.is_some()),
+        ("role", f.role.is_some()),
+        ("kind", f.kind.is_some()),
+        ("errors_only", f.errors_only),
+    ]
+    .into_iter()
+    .filter_map(|(name, present)| present.then_some(name))
+    .collect()
+}
+
+/// [`unanswerable_filters`] as sentences a caller can be handed verbatim.
+///
+/// For any front end that answers in data rather than on stderr — the HTTP API's
+/// `warnings` array, and an agent reading a tool result, which has no stderr at all. Each names
+/// the filter, says why the listing could not apply it, and points at the surface that can.
+///
+/// That pointer is spelled `/api/search` because the sentence is the one `GET /api/sessions`
+/// has always returned and its text is part of that response. A front end whose search
+/// operation is not an HTTP route wants the same sentence with its own name for it; parameterise
+/// the pointer then, rather than writing a second list of filters to go with a second sentence.
+pub fn unanswerable_filter_notes(f: &Filters) -> Vec<String> {
+    unanswerable_filters(f)
+        .into_iter()
+        .map(|name| {
+            format!(
+                "`{name}` was ignored: a session listing reads sessions.json, which records one \
+                 row per transcript and carries no per-message fields. Use /api/search for it."
+            )
+        })
+        .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn filters_with(mutate: impl FnOnce(&mut Filters)) -> Filters {
+        let mut f = Filters::default();
+        mutate(&mut f);
+        f
+    }
+
+    #[test]
+    fn the_unanswerable_filter_list_is_the_same_on_both_front_ends() {
+        // Everything a `Filters` can carry, set at once: the answer is the complement of what
+        // `SessionMatcher` reads, so this is the list both front ends must report.
+        let f = filters_with(|f| {
+            f.project = Some("/home/user".into());
+            f.tool = vec!["Bash".into()];
+            f.tool_input = vec!["command=cargo".into()];
+            f.tool_output = vec!["No such file".into()];
+            f.lang = vec!["rust".into()];
+            f.min_thinking = Some(500);
+            f.program = vec!["cargo".into()];
+            f.branch = Some("main".into());
+            f.model = Some("claude-opus-5".into());
+            f.role = Some("assistant".into());
+            f.kind = Some("tool_call".into());
+            f.session = Some("b20208d8".into());
+            f.agent_type = Some("Explore".into());
+            f.since = Some("7d".into());
+            f.until = Some("now".into());
+            f.errors_only = true;
+            f.no_sidechains = true;
+        });
+        let expected = [
+            "tool",
+            "tool_input",
+            "tool_output",
+            "lang",
+            "min_thinking",
+            "program",
+            "model",
+            "role",
+            "kind",
+            "errors_only",
+        ];
+        assert_eq!(unanswerable_filters(&f), expected);
+
+        // The prose the HTTP API returns is the same list, one sentence each — so the surface
+        // that answers in data and the surface that answers on stderr cannot report different
+        // sets. `cli::tests::the_sessions_command_names_every_filter_it_cannot_apply_as_a_flag`
+        // pins the other rendering.
+        let notes = unanswerable_filter_notes(&f);
+        assert_eq!(notes.len(), expected.len());
+        for (note, name) in notes.iter().zip(expected) {
+            assert!(note.starts_with(&format!("`{name}` was ignored")), "{note}");
+        }
+    }
+
+    #[test]
+    fn a_filter_the_matcher_reads_is_never_called_unanswerable() {
+        // The other half of the same contract: everything `SessionMatcher::matches` consults
+        // must be absent from the list, or a working filter would be reported as ignored.
+        for f in [
+            filters_with(|f| f.project = Some("/home/user".into())),
+            filters_with(|f| f.branch = Some("main".into())),
+            filters_with(|f| f.session = Some("b20208d8".into())),
+            filters_with(|f| f.agent_type = Some("Explore".into())),
+            filters_with(|f| f.since = Some("7d".into())),
+            filters_with(|f| f.until = Some("now".into())),
+            filters_with(|f| f.no_sidechains = true),
+            filters_with(|f| f.sidechains_only = true),
+        ] {
+            assert!(
+                unanswerable_filters(&f).is_empty(),
+                "answerable filters must not be reported as ignored"
+            );
+        }
+        assert!(unanswerable_filters(&Filters::default()).is_empty());
+    }
+
+    #[test]
+    fn a_bare_day_covers_the_whole_day_at_both_ends_of_a_session_window() {
+        // The `Edge` decision, seen through the matcher that depends on it: a session that ran
+        // late on 2026-09-09 is inside `--until 2026-09-09`, which an upper bound of midnight
+        // would have dropped without saying so.
+        let late = SessionInfo {
+            session_id: "s1".into(),
+            first_ts_ms: Some(1_788_980_839_000), // 2026-09-09T19:07:19Z
+            last_ts_ms: Some(1_788_980_899_000),
+            ..SessionInfo::default()
+        };
+        let matcher = SessionMatcher::new(&filters_with(|f| {
+            f.since = Some("2026-09-09".into());
+            f.until = Some("2026-09-09".into());
+        }))
+        .expect("both dates parse");
+        assert!(matcher.matches(&late));
+    }
+
+    #[test]
+    fn an_unreadable_date_names_the_field_without_naming_a_flag() {
+        let err = SessionMatcher::new(&filters_with(|f| f.since = Some("yesterday-ish".into())))
+            .expect_err("an unreadable date must fail the listing, not match nothing");
+        assert_eq!(err.field, "since");
+        let rendered = format!("{err:#}");
+        assert!(rendered.contains("since"), "{rendered}");
+        assert!(
+            !rendered.contains("--since"),
+            "the flag spelling belongs to the CLI, not to the shared matcher: {rendered}"
+        );
+    }
+}

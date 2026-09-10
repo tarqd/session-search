@@ -301,7 +301,13 @@ fn hit_json(hit: &Hit, context: &HitContext) -> Value {
 
 /// The turn a window snapped to. `truncated` is the point of it: a consumer that pages through
 /// `context` has no other way to tell a short turn from a capped one.
-fn turn_json(span: TurnSpan, shown: usize) -> Value {
+///
+/// `pub` alongside [`skeleton_json`], and for the same reason: the two caps a turn-shaped answer
+/// has to report are separate — the *document* cap is this one, the *byte* cap is the
+/// skeleton's `dropped` — and a front end that builds a skeleton-shaped hit out of a
+/// [`HitContext`] needs both keys or it silently reports a capped turn as the whole turn.
+/// [`TurnSpan::truncated`] stays private because this is the only shape it is ever read in.
+pub fn turn_json(span: TurnSpan, shown: usize) -> Value {
     json!({
         "turn_seq": span.turn_seq,
         "shown": shown,
@@ -745,7 +751,16 @@ fn first_line(text: &str, max: usize) -> String {
     one_line(first, max)
 }
 
-fn skeleton_json(skeleton: &Skeleton) -> Value {
+/// The `{lines, dropped, bytes}` envelope a skeleton travels in, and the only definition of it.
+///
+/// `pub` because it is a wire shape, not a rendering detail. `--json`, `GET /api/…` and any
+/// front end after them hand the same three keys to the same kind of consumer, and the two that
+/// are not `lines` are the ones a reimplementation gets wrong: `dropped` is what the byte cap
+/// left out, `bytes` is [`Skeleton::bytes`] — the rendered size with the newlines counted, which
+/// is what `SKELETON_BUDGET` is actually spent in and is not `lines.join("\n").len()` at a
+/// glance. A caller that omits `dropped` publishes a truncated turn as a whole one, which is the
+/// single claim a skeleton must never make.
+pub fn skeleton_json(skeleton: &Skeleton) -> Value {
     json!({
         "lines": skeleton.lines,
         "dropped": skeleton.dropped,
@@ -1565,6 +1580,7 @@ mod tests {
             facets: BTreeMap::new(),
             elapsed_ms: 7,
             grouped: false,
+            warnings: Vec::new(),
         }
     }
 
@@ -2676,6 +2692,50 @@ mod tests {
                 .into(),
         );
         docs
+    }
+
+    /// The `{lines, dropped, bytes}` envelope has exactly one definition, and it is public so a
+    /// third front end uses it instead of writing a fourth. The two keys that are not `lines`
+    /// are the ones a reimplementation drops: `bytes` counts the newlines, and `dropped` is the
+    /// only thing standing between a truncated turn and a claim that the turn ended there.
+    #[test]
+    fn the_skeleton_envelope_is_the_only_definition_of_lines_dropped_and_bytes() {
+        let whole = turn_skeleton(&build_turn(10), SKELETON_BUDGET);
+        let json = skeleton_json(&whole);
+        assert_eq!(
+            json.as_object().unwrap().keys().collect::<Vec<_>>(),
+            ["bytes", "dropped", "lines"],
+            "three keys, and no more: this shape is a wire contract"
+        );
+        assert_eq!(json["lines"], json!(whole.lines));
+        assert_eq!(json["dropped"], json!(0));
+        assert_eq!(
+            json["bytes"],
+            json!(whole.lines.iter().map(|l| l.len() + 1).sum::<usize>()),
+            "the rendered size, newlines included — not `lines.join(\"\\n\").len()`"
+        );
+
+        // A budget that bites reports what it left out rather than ending the turn quietly.
+        let clipped = turn_skeleton(&build_turn(10), 1);
+        let json = skeleton_json(&clipped);
+        assert_eq!(json["lines"].as_array().unwrap().len(), 1, "{json}");
+        assert!(json["dropped"].as_u64().unwrap() > 0, "{json}");
+    }
+
+    /// The *other* cap a turn-shaped answer has to report: `turn_json` is the document cap,
+    /// `skeleton_json`'s `dropped` is the byte cap, and a caller needs both keys or it publishes
+    /// a capped turn as a whole one. Public for that reason, so both travel together.
+    #[test]
+    fn a_turn_window_reports_the_document_cap_beside_the_skeletons_byte_cap() {
+        let span = TurnSpan {
+            turn_seq: 12,
+            total: 347,
+        };
+        assert_eq!(
+            turn_json(span, 200),
+            json!({ "turn_seq": 12, "shown": 200, "docs_in_turn": 347, "truncated": true })
+        );
+        assert_eq!(turn_json(span, 347)["truncated"], json!(false));
     }
 
     #[test]

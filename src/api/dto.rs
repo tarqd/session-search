@@ -958,6 +958,18 @@ pub fn search_ui_response(prepared: &PreparedSearch, resp: &SearchResponse) -> V
         facets.insert(field.clone(), json!([facet_envelope(facet)]));
     }
 
+    // One warnings channel, not two. `PreparedSearch::warnings` says what this envelope did with
+    // the *request* (an unknown key, a facet size it had to widen); `SearchResponse::warnings`
+    // says what the search noticed about the *answer* (a zero-hit page that is a misread colon
+    // rather than an empty corpus). A caller reads them the same way and has one place to look;
+    // a second key beside it would be a channel every client has to learn about separately, and
+    // the newer one is the one they would miss.
+    let warnings: Vec<&String> = prepared
+        .warnings
+        .iter()
+        .chain(resp.warnings.iter())
+        .collect();
+
     json!({
         "results": results,
         "totalResults": resp.total,
@@ -979,7 +991,7 @@ pub fn search_ui_response(prepared: &PreparedSearch, resp: &SearchResponse) -> V
             },
             "limit": req.limit,
             "offset": req.offset,
-            "warnings": prepared.warnings,
+            "warnings": warnings,
         },
     })
 }
@@ -1751,6 +1763,7 @@ mod tests {
             facets: Default::default(),
             elapsed_ms: 7,
             grouped: false,
+            warnings: Vec::new(),
         };
 
         let prep = prepared(json!({ "current": 22, "resultsPerPage": 20 })).unwrap();
@@ -1815,6 +1828,42 @@ mod tests {
         assert_eq!(undated["timestamp"], Value::Null);
     }
 
+    /// `info.warnings` is one channel, not two. What the envelope did with the request and what
+    /// the search noticed about the answer are both things the caller has to act on, and a
+    /// second key beside the first is one every client would have to be told about — so the one
+    /// nobody reads is the newer one.
+    #[test]
+    fn a_search_warning_joins_the_request_warnings_on_one_channel() {
+        let resp = SearchResponse {
+            hits: Vec::new(),
+            total: 0,
+            facets: Default::default(),
+            elapsed_ms: 1,
+            grouped: false,
+            warnings: vec!["no matches: a `word:value` term here was read as a subpath".into()],
+        };
+        // An unknown body key is the request-side warning; both must arrive together.
+        let prep = prepared(json!({ "searchTerm": "zzz:qqq", "nonesuch": 1 })).unwrap();
+        assert_eq!(prep.warnings.len(), 1, "{:?}", prep.warnings);
+
+        let out = search_ui_response(&prep, &resp);
+        let warnings = out["info"]["warnings"].as_array().unwrap();
+        assert_eq!(warnings.len(), 2, "{warnings:?}");
+        assert!(
+            warnings[0].as_str().unwrap().contains("nonesuch"),
+            "the request-side warning stays first: {warnings:?}"
+        );
+        assert_eq!(warnings[1], json!(resp.warnings[0]));
+
+        // Nothing to say, nothing said — an empty array, never a null or a missing key.
+        let quiet = SearchResponse {
+            warnings: Vec::new(),
+            ..resp
+        };
+        let out = search_ui_response(&prepared(json!({})).unwrap(), &quiet);
+        assert_eq!(out["info"]["warnings"], json!([]));
+    }
+
     #[test]
     fn a_result_carries_flat_raw_fields_the_snippet_and_meta() {
         let hit = Hit {
@@ -1831,6 +1880,7 @@ mod tests {
             facets: Default::default(),
             elapsed_ms: 7,
             grouped: false,
+            warnings: Vec::new(),
         };
         let prep = prepared(json!({ "searchTerm": "memmap" })).unwrap();
         let out = search_ui_response(&prep, &resp);
@@ -1918,6 +1968,7 @@ mod tests {
             facets,
             elapsed_ms: 1,
             grouped: false,
+            warnings: Vec::new(),
         };
         let out = search_ui_response(&prepared(json!({})).unwrap(), &resp);
         let facet = &out["facets"]["tool_name"][0];

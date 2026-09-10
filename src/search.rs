@@ -336,7 +336,46 @@ pub struct SearchResponse {
     /// and `total` is still a document count.
     #[serde(default)]
     pub grouped: bool,
+    /// What the search noticed about this request that the numbers above cannot say.
+    ///
+    /// Three outcomes of this index look exactly like an empty corpus from the outside: a
+    /// `word:value` term whose root is not a schema field (read as a `tool_input` JSON subpath,
+    /// which cannot fail to parse and simply matches nothing), a similarity seed whose every
+    /// term fell outside the tuning, and a grouped page that came back short because the
+    /// collapse window never reached `limit` distinct turns. Each was logged at WARN and
+    /// nothing else, which reaches whoever is reading stderr — never the caller who drew the
+    /// wrong conclusion. A zero-hit answer must not read as an authoritative "no".
+    ///
+    /// `Vec<String>` rather than a typed enum because these are prose advice, not a condition a
+    /// caller branches on: every consumer — `info.warnings` on the HTTP envelope, an agent
+    /// reading a tool result — renders them as text, so a typed variant would be flattened to a
+    /// sentence at the only place it is used. The sentences themselves are the `WARN_*`
+    /// constants below, shared verbatim with the `tracing` call that logs them so the two
+    /// cannot drift.
+    ///
+    /// `#[serde(default)]` for the same reason [`SearchResponse::grouped`] carries it: a
+    /// response deserialized from an older writer has no such key, and a missing warning list
+    /// means "none", not a parse failure.
+    #[serde(default)]
+    pub warnings: Vec<String>,
 }
+
+/// A grouped page that ran out of collapse window before it ran out of turns.
+///
+/// Kept as a constant, not written inline, because it is both logged and returned: the caller
+/// that has to act on it (raise `limit`, narrow the query) is not the one reading stderr, and
+/// two spellings of the same advice is exactly the drift this crate keeps pinning down.
+const WARN_GROUPED_PAGE_SHORT: &str = "grouped page is short: the matched documents cluster into fewer turns than the collapse \
+     window reached. Raise --limit, or narrow the query.";
+
+/// Zero hits from a query carrying an unqualified `word:value`. See [`has_unqualified_field_term`].
+const WARN_UNQUALIFIED_FIELD_TERM: &str = "no matches: a `word:value` term here was read as a tool_input JSON subpath. \
+     If you meant it as text, quote it.";
+
+/// Zero hits from a `--similar-to` seed. See the call site for which knobs decide it.
+const WARN_EMPTY_SIMILARITY_SEED: &str = "no matches: every term of the seed turn may have fallen outside the similarity \
+     tuning (too rare, too common, too short or too long). Widen the seed with \
+     --similar-in text,code,tool_output, or check the filters.";
 
 // ---------------------------------------------------------------------------
 // entry points
@@ -560,6 +599,12 @@ pub fn search(
         }
     }
 
+    // Every warning below is both logged and carried on the response: the structured fields are
+    // for whoever is reading stderr, the sentence is for the caller who would otherwise read a
+    // zero-hit page as an authoritative "no". `"{}"` over the shared constant is what keeps the
+    // two texts one text.
+    let mut warnings: Vec<String> = Vec::new();
+
     // A turn the fetch window never reached cannot anchor a hit, and with grouping on that is
     // the one way a page comes back short of `--limit` while documents are still matching.
     if req.group_by_turn
@@ -571,9 +616,10 @@ pub fn search(
             turns = anchored.len(),
             docs_scanned = collector_limit(&searcher, wanted),
             matching_docs = total,
-            "grouped page is short: the matched documents cluster into fewer turns than the \
-             collapse window reached. Raise --limit, or narrow the query."
+            "{}",
+            WARN_GROUPED_PAGE_SHORT
         );
+        warnings.push(WARN_GROUPED_PAGE_SHORT.to_string());
     }
 
     // An unqualified `word:value` is a JSON-subpath lookup, so it cannot fail to parse — it
@@ -584,11 +630,8 @@ pub fn search(
         && let Some(text) = non_empty(req.query.as_deref())
         && has_unqualified_field_term(&schema, text)
     {
-        tracing::warn!(
-            query = %text,
-            "no matches: a `word:value` term here was read as a tool_input JSON subpath. \
-             If you meant it as text, quote it."
-        );
+        tracing::warn!(query = %text, "{}", WARN_UNQUALIFIED_FIELD_TERM);
+        warnings.push(WARN_UNQUALIFIED_FIELD_TERM.to_string());
     }
 
     // The second silent-nothing outcome of `MoreLikeThisQuery` (the first is refused in
@@ -602,10 +645,10 @@ pub fn search(
         tracing::warn!(
             doc = %source.doc_id,
             turn = source.turn_seq,
-            "no matches: every term of the seed turn may have fallen outside the similarity \
-             tuning (too rare, too common, too short or too long). Widen the seed with \
-             --similar-in text,code,tool_output, or check the filters."
+            "{}",
+            WARN_EMPTY_SIMILARITY_SEED
         );
+        warnings.push(WARN_EMPTY_SIMILARITY_SEED.to_string());
     }
 
     Ok(SearchResponse {
@@ -614,6 +657,7 @@ pub fn search(
         facets,
         elapsed_ms: started.elapsed().as_millis(),
         grouped: req.group_by_turn,
+        warnings,
     })
 }
 
@@ -1105,7 +1149,14 @@ fn regex_escape(s: &str) -> String {
     out
 }
 
-fn expand_tilde(path: &str) -> String {
+/// `~` / `~/rest` against `$HOME`, for a `project` filter typed by a human.
+///
+/// `pub(crate)` because the shell is not the only front door: the CLI expands it on the way
+/// into the index-side filter, and `sessions.json` is filtered by the same `Filters::project`
+/// through a different code path (`sessions::SessionMatcher`). A project that matches under
+/// `session-search search` and not under `session-search sessions` is a difference nobody would
+/// think to look for, so there is one expansion rather than one per surface.
+pub(crate) fn expand_tilde(path: &str) -> String {
     let home = std::env::var("HOME").ok();
     match (path, home) {
         ("~", Some(home)) => home,
@@ -1259,6 +1310,44 @@ pub(crate) fn parse_when(raw: &str, now: chrono::DateTime<chrono::Utc>) -> anyho
         "cannot read {raw:?} as a date: expected RFC3339, YYYY-MM-DD, `now`, \
          or a relative span such as 7d / 24h / 30m"
     )
+}
+
+/// Which end of a `--since` / `--until` range a [`When`] is being resolved for.
+///
+/// Only a bare `YYYY-MM-DD` needs it — `When::Day` names a whole day, and which instant of that
+/// day is meant depends entirely on the end it sits at.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Edge {
+    Lower,
+    Upper,
+}
+
+/// [`parse_when`] resolved to a single instant at the requested end of the range.
+///
+/// The index side never needs this: `date_range` hands Tantivy a `Bound`, so a whole day is
+/// `Included(midnight) .. Excluded(midnight + DAY_MS)` and no instant has to stand for the day.
+/// Everything that filters `sessions.json` instead of the index — `session-search sessions`,
+/// `GET /api/sessions`, and any front end after them — compares two `i64` timestamps and needs
+/// one number, so the day has to collapse to an edge: midnight as a lower bound, the last
+/// millisecond of the day (`+ DAY_MS - 1`) as an upper one. Both ends are inclusive, which is
+/// what makes `--since 2026-09-09 --until 2026-09-09` mean that day rather than nothing.
+///
+/// It lives here, beside [`parse_when`] and [`DAY_MS`], because a second front end that
+/// re-derived the edge is how `--until 2026-09-09` starts meaning "up to midnight" on one
+/// surface and "up to 23:59:59.999" on another — a filter silently dropping a day of results
+/// with nothing on screen to say so.
+pub(crate) fn when_ms(
+    raw: &str,
+    now: chrono::DateTime<chrono::Utc>,
+    edge: Edge,
+) -> anyhow::Result<i64> {
+    Ok(match parse_when(raw, now)? {
+        When::Instant(ms) => ms,
+        When::Day(ms) => match edge {
+            Edge::Lower => ms,
+            Edge::Upper => ms + DAY_MS - 1,
+        },
+    })
 }
 
 /// `7d` -> milliseconds. `None` when the shape does not match.
@@ -3236,6 +3325,32 @@ mod tests {
         assert!(parse_when("last tuesday", now).is_err());
     }
 
+    /// Hoisted here from `cli.rs` when `Edge`/`when_ms` were: two front ends had their own
+    /// resolution of a bare day to an instant, and this is the one place the answer is decided.
+    #[test]
+    fn dates_parse_in_every_documented_form() {
+        let now = chrono::DateTime::parse_from_rfc3339("2026-09-09T12:00:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        let ms = |s: &str, edge| when_ms(s, now, edge).unwrap();
+
+        assert_eq!(ms("now", Edge::Lower), now.timestamp_millis());
+        assert_eq!(ms("7d", Edge::Lower), now.timestamp_millis() - 7 * DAY_MS);
+        assert_eq!(ms("30m", Edge::Lower), now.timestamp_millis() - 30 * 60_000);
+        assert_eq!(
+            ms("2026-09-09T19:07:19Z", Edge::Lower),
+            1_788_980_839_000,
+            "RFC3339"
+        );
+        // A bare day is inclusive at both ends.
+        let midnight = ms("2026-09-09", Edge::Lower);
+        assert_eq!(ms("2026-09-09", Edge::Upper), midnight + DAY_MS - 1);
+        assert_eq!(ms("2026-09-09T19:07", Edge::Lower), midnight + 68_820_000);
+
+        let err = when_ms("last tuesday", now, Edge::Lower).unwrap_err();
+        assert!(format!("{err}").contains("cannot read"), "{err}");
+    }
+
     #[test]
     fn facets_on_a_plain_fast_field() {
         let (index, f) = index_docs(&corpus());
@@ -4661,6 +4776,20 @@ mod tests {
         r.hits.iter().map(|h| h.doc.seq).collect()
     }
 
+    /// `MoreLikeThisQuery` returning nothing is indistinguishable from "nothing here is
+    /// similar", and it reports no error at all. The advice about which knobs decide it has to
+    /// travel with the empty answer.
+    #[test]
+    fn an_empty_similarity_result_names_the_knobs_on_the_response() {
+        let (index, f) = index_docs(&similar_docs());
+        let mut request = similar_req(seeded(&index, &f, "s1:3"));
+        // Nothing is indexed under this project, so the similarity query cannot answer at all.
+        request.filters.project = Some("/nowhere".into());
+        let empty = search(&index, &f, &request).unwrap();
+        assert_eq!(empty.total, 0);
+        assert_eq!(empty.warnings, vec![WARN_EMPTY_SIMILARITY_SEED.to_string()]);
+    }
+
     /// Every spelling of a reference names the same document, and so does an unambiguous prefix
     /// of each. This is the acceptance box: `--similar-to` must resolve a reference the way
     /// `show` resolves an id.
@@ -5267,6 +5396,69 @@ mod tests {
             vec![1, 1],
             "neither file's count leaks into the other"
         );
+    }
+
+    /// The zero-hit outcomes this index can produce that look exactly like an empty corpus.
+    /// Logging them reaches whoever is watching stderr; the caller who drew the wrong conclusion
+    /// reads the response, so the response is where the sentence has to be.
+    #[test]
+    fn a_zero_hit_page_carries_its_warning_to_the_caller_not_only_to_stderr() {
+        let (index, f) = index_docs(&identifier_docs());
+
+        // `zzz:` is no field of this schema, so the term became a `tool_input.zzz` subpath
+        // lookup that cannot fail and cannot match. That is a misread colon, not an empty index.
+        let misread = search(&index, &f, &req("zzz:qqq")).unwrap();
+        assert_eq!(misread.total, 0);
+        assert_eq!(
+            misread.warnings,
+            vec![WARN_UNQUALIFIED_FIELD_TERM.to_string()],
+            "the carried sentence is the logged one, verbatim"
+        );
+
+        // A real field that simply matched nothing is an honest zero: no warning to give.
+        let honest = search(&index, &f, &req("tool_name:NoSuchTool")).unwrap();
+        assert_eq!(honest.total, 0);
+        assert!(honest.warnings.is_empty(), "{:?}", honest.warnings);
+
+        // And a page that found something says nothing at all.
+        let found = search(&index, &f, &req("create")).unwrap();
+        assert!(found.total > 0 && found.warnings.is_empty());
+    }
+
+    /// `GROUP_FANOUT * (limit + offset)` documents were scanned and they all belonged to one
+    /// turn, so the page is short of `--limit` while documents are still matching. Silence here
+    /// reads as the end of the results.
+    #[test]
+    fn a_grouped_page_that_came_up_short_says_so_on_the_response() {
+        // One turn of 20 matching documents: at `limit` 2 the collapse window reaches 16 of
+        // them and still finds only one turn to anchor.
+        let (index, f) = index_docs(&turns_about("memmap", &[20]));
+        let short = search(
+            &index,
+            &f,
+            &SearchRequest {
+                group_by_turn: true,
+                limit: 2,
+                ..req("memmap")
+            },
+        )
+        .unwrap();
+        assert_eq!(short.hits.len(), 1);
+        assert_eq!(short.total, 20, "`total` still counts documents");
+        assert_eq!(short.warnings, vec![WARN_GROUPED_PAGE_SHORT.to_string()]);
+
+        // A window wide enough to see the whole match set has nothing to report.
+        let whole = search(
+            &index,
+            &f,
+            &SearchRequest {
+                group_by_turn: true,
+                limit: 3,
+                ..req("memmap")
+            },
+        )
+        .unwrap();
+        assert!(whole.warnings.is_empty(), "{:?}", whole.warnings);
     }
 
     /// Paging a grouped search pages turns. An offset in documents would skip *into* the first

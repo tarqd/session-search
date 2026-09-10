@@ -18,6 +18,7 @@ use crate::format::{self, OutputOpts};
 use crate::index::{self, IndexOptions, IndexStats};
 use crate::parse::SessionInfo;
 use crate::search::{self, Filters, SearchRequest, SimilarField, SortBy};
+use crate::sessions::{self, SessionMatcher};
 use crate::{context, discovery};
 
 /// Facet buckets returned alongside `search --facets`. `facets` has `--top` for the same knob;
@@ -541,7 +542,7 @@ fn dispatch(
         } => {
             refresh(index_dir, no_refresh, false);
             warn_unused_session_filters(&filters);
-            let matcher = SessionMatcher::new(&filters)?;
+            let matcher = session_matcher(&filters)?;
             let mut sessions: Vec<SessionInfo> = index::load_sessions(index_dir)?
                 .into_values()
                 .filter(|info| matcher.matches(info))
@@ -922,173 +923,35 @@ pub(crate) fn index_stats(index_dir: &Path) -> Result<IndexStats> {
 // session filtering
 // ---------------------------------------------------------------------------
 
-/// The subset of [`Filters`] that `sessions.json` can answer, pre-resolved once.
+/// [`SessionMatcher::new`] with an unreadable date named the way the reader typed it.
 ///
-/// Session records carry no tool, model, role or kind, so those filters are meaningless here
-/// and are reported (see [`warn_unused_session_filters`]) rather than silently ignored.
-struct SessionMatcher {
-    project: Option<String>,
-    branch: Option<String>,
-    session: Option<String>,
-    agent_type: Option<String>,
-    since_ms: Option<i64>,
-    until_ms: Option<i64>,
-    no_sidechains: bool,
-    sidechains_only: bool,
+/// The shared matcher reports the plain field (`since`), because the same matcher serves an HTTP
+/// surface where `--since` is a flag nobody can type. Here the flag *is* what was typed, so it
+/// goes back on at the boundary — this is the whole of the CLI's dialect.
+fn session_matcher(f: &Filters) -> Result<SessionMatcher> {
+    SessionMatcher::new(f).map_err(|err| anyhow!("parsing --{}: {:#}", err.field, err.source))
 }
 
-impl SessionMatcher {
-    fn new(f: &Filters) -> Result<Self> {
-        let now = chrono::Utc::now();
-        Ok(SessionMatcher {
-            project: f.project.as_deref().map(expand_tilde),
-            branch: f.branch.clone(),
-            session: f.session.clone(),
-            agent_type: f.agent_type.clone(),
-            since_ms: f
-                .since
-                .as_deref()
-                .map(|s| when_ms(s, now, Edge::Lower))
-                .transpose()
-                .context("parsing --since")?,
-            until_ms: f
-                .until
-                .as_deref()
-                .map(|s| when_ms(s, now, Edge::Upper))
-                .transpose()
-                .context("parsing --until")?,
-            no_sidechains: f.no_sidechains,
-            sidechains_only: f.sidechains_only,
-        })
-    }
-
-    fn matches(&self, info: &SessionInfo) -> bool {
-        // Path-aware, exactly as the index-side filter is: `-p /home/user/alpha` must not drag
-        // in the sibling `/home/user/alpha-beta`.
-        if let Some(prefix) = &self.project
-            && !info
-                .project
-                .as_deref()
-                .is_some_and(|p| search::path_has_prefix(p, prefix))
-        {
-            return false;
-        }
-        if let Some(branch) = &self.branch
-            && info.git_branch.as_deref() != Some(branch.as_str())
-        {
-            return false;
-        }
-        // A session id is long enough that a prefix is a convenience, not an ambiguity.
-        if let Some(session) = &self.session
-            && !info.session_id.starts_with(session.as_str())
-        {
-            return false;
-        }
-        if let Some(kind) = &self.agent_type
-            && info.agent_type.as_deref() != Some(kind.as_str())
-        {
-            return false;
-        }
-        if self.no_sidechains && info.agent_id.is_some() {
-            return false;
-        }
-        if self.sidechains_only && info.agent_id.is_none() {
-            return false;
-        }
-        // A session overlaps the window if it ended after `since` and started before `until`.
-        if let Some(since) = self.since_ms
-            && info
-                .last_ts_ms
-                .or(info.first_ts_ms)
-                .is_some_and(|t| t < since)
-        {
-            return false;
-        }
-        if let Some(until) = self.until_ms
-            && info
-                .first_ts_ms
-                .or(info.last_ts_ms)
-                .is_some_and(|t| t > until)
-        {
-            return false;
-        }
-        true
-    }
-}
-
-fn warn_unused_session_filters(f: &Filters) {
-    let mut ignored: Vec<&str> = Vec::new();
-    if !f.tool.is_empty() {
-        ignored.push("--tool");
-    }
-    if !f.tool_input.is_empty() {
-        ignored.push("--tool-input");
-    }
-    if !f.tool_output.is_empty() {
-        ignored.push("--tool-output");
-    }
-    if !f.program.is_empty() {
-        ignored.push("--program");
-    }
-    if !f.lang.is_empty() {
-        ignored.push("--lang");
-    }
-    if f.model.is_some() {
-        ignored.push("--model");
-    }
-    if f.role.is_some() {
-        ignored.push("--role");
-    }
-    if f.kind.is_some() {
-        ignored.push("--kind");
-    }
-    if f.errors_only {
-        ignored.push("--errors-only");
-    }
-    if !ignored.is_empty() {
+/// The filters `sessions` was handed that a session listing cannot answer, on stderr.
+///
+/// The list is [`sessions::unanswerable_filters`], shared with `GET /api/sessions` so the two
+/// front doors cannot disagree about which questions `sessions.json` can be asked. Only the
+/// rendering is the CLI's: flag spelling, and a warning rather than a field in a response body,
+/// because the CLI's answer is a table a human is looking at and stderr is where it says what it
+/// did not do.
+/// Returns the flags it warned about, so the shared list and this dialect are testable together.
+fn warn_unused_session_filters(f: &Filters) -> Vec<String> {
+    let flags: Vec<String> = sessions::unanswerable_filters(f)
+        .iter()
+        .map(|name| format!("--{}", name.replace('_', "-")))
+        .collect();
+    if !flags.is_empty() {
         tracing::warn!(
-            filters = %ignored.join(", "),
+            filters = %flags.join(", "),
             "not applicable to `sessions` (session metadata has no per-message fields); ignored"
         );
     }
-}
-
-#[derive(Clone, Copy)]
-enum Edge {
-    Lower,
-    Upper,
-}
-
-use search::DAY_MS;
-
-/// RFC3339, `YYYY-MM-DD`, `YYYY-MM-DDTHH:MM[:SS]`, `now`, or a relative span (`90s`, `30m`,
-/// `24h`, `7d`, `2w`). A bare day is inclusive at both ends, matching `search.rs`: as a lower
-/// bound it is midnight, as an upper bound it is the last millisecond of that day.
-/// The `search.rs` date parser, resolved to a single instant at the requested edge of the
-/// range. Shared so `sessions` — which filters `sessions.json`, not the index — cannot drift
-/// from `--since`/`--until` on the index side.
-fn when_ms(raw: &str, now: chrono::DateTime<chrono::Utc>, edge: Edge) -> Result<i64> {
-    Ok(match search::parse_when(raw, now)? {
-        search::When::Instant(ms) => ms,
-        // A bare `YYYY-MM-DD` covers the whole day.
-        search::When::Day(ms) => match edge {
-            Edge::Lower => ms,
-            Edge::Upper => ms + DAY_MS - 1,
-        },
-    })
-}
-
-fn expand_tilde(path: &str) -> String {
-    if (path == "~" || path.starts_with("~/"))
-        && let Some(home) = std::env::var_os("HOME")
-    {
-        let home = PathBuf::from(home);
-        return match path.strip_prefix("~/") {
-            Some(rest) => home.join(rest).to_string_lossy().into_owned(),
-            None => home.to_string_lossy().into_owned(),
-        };
-    }
-    path.to_string()
+    flags
 }
 
 fn non_empty(value: Option<String>) -> Option<String> {
@@ -1454,30 +1317,6 @@ mod tests {
         assert!(!color_enabled(false, true));
     }
 
-    #[test]
-    fn dates_parse_in_every_documented_form() {
-        let now = chrono::DateTime::parse_from_rfc3339("2026-09-09T12:00:00Z")
-            .unwrap()
-            .with_timezone(&chrono::Utc);
-        let ms = |s: &str, edge| when_ms(s, now, edge).unwrap();
-
-        assert_eq!(ms("now", Edge::Lower), now.timestamp_millis());
-        assert_eq!(ms("7d", Edge::Lower), now.timestamp_millis() - 7 * DAY_MS);
-        assert_eq!(ms("30m", Edge::Lower), now.timestamp_millis() - 30 * 60_000);
-        assert_eq!(
-            ms("2026-09-09T19:07:19Z", Edge::Lower),
-            1_788_980_839_000,
-            "RFC3339"
-        );
-        // A bare day is inclusive at both ends.
-        let midnight = ms("2026-09-09", Edge::Lower);
-        assert_eq!(ms("2026-09-09", Edge::Upper), midnight + DAY_MS - 1);
-        assert_eq!(ms("2026-09-09T19:07", Edge::Lower), midnight + 68_820_000);
-
-        let err = when_ms("last tuesday", now, Edge::Lower).unwrap_err();
-        assert!(format!("{err}").contains("cannot read"), "{err}");
-    }
-
     fn session(id: &str, project: &str) -> SessionInfo {
         SessionInfo {
             session_id: id.into(),
@@ -1490,7 +1329,7 @@ mod tests {
     }
 
     fn matches(filters: &Filters, info: &SessionInfo) -> bool {
-        match SessionMatcher::new(filters) {
+        match session_matcher(filters) {
             Ok(matcher) => matcher.matches(info),
             Err(err) => panic!("filters should parse: {err:#}"),
         }
@@ -1649,9 +1488,38 @@ mod tests {
         ));
     }
 
+    /// Same list as `GET /api/sessions` returns, spelled the way it was typed. The list itself
+    /// is pinned in `sessions.rs`; what is the CLI's own is the `--kebab-case`.
+    #[test]
+    fn the_sessions_command_names_every_filter_it_cannot_apply_as_a_flag() {
+        assert!(warn_unused_session_filters(&Filters::default()).is_empty());
+        let flagged = warn_unused_session_filters(&Filters {
+            tool_input: vec!["command=cargo".into()],
+            lang: vec!["rust".into()],
+            min_thinking: Some(500),
+            program: vec!["cargo".into()],
+            errors_only: true,
+            // Answerable, so absent from the warning.
+            project: Some("/home/user".into()),
+            ..Filters::default()
+        });
+        assert_eq!(
+            flagged,
+            [
+                "--tool-input",
+                "--lang",
+                "--min-thinking",
+                "--program",
+                "--errors-only"
+            ]
+        );
+    }
+
+    /// The shared matcher names the field; `session_matcher` is where the CLI puts its own flag
+    /// spelling back on, so that is what this pins.
     #[test]
     fn a_bad_date_fails_the_command_rather_than_matching_nothing() {
-        let err = match SessionMatcher::new(&Filters {
+        let err = match session_matcher(&Filters {
             since: Some("yesterday-ish".into()),
             ..Filters::default()
         }) {

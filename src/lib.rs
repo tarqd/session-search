@@ -17,6 +17,7 @@ pub mod model;
 pub mod parse;
 pub mod schema;
 pub mod search;
+pub mod sessions;
 pub mod tokenizer;
 
 pub use bash::{BashCmd, extract};
@@ -29,4 +30,5 @@ pub use parse::{
 };
 pub use schema::{Fields, build_schema, doc_to_json};
 pub use search::{FacetCount, Filters, Hit, SearchRequest, SearchResponse, SnippetSource, SortBy};
+pub use sessions::{SessionMatcher, unanswerable_filters};
 pub use tokenizer::{CODE_ANALYZER, PROSE_ANALYZER, code_analyzer, prose_analyzer};

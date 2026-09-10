@@ -330,6 +330,7 @@ src/
   index.rs       incremental indexer, watermarks, sessions.json   [Build A]
   search.rs      SearchRequest -> SearchResponse, facets          [Build B]
   context.rs     expand a hit / reconstruct a session             [Build B]
+  sessions.rs    filter sessions.json (not the index)             [Build B]
   format.rs      human + JSON rendering                           [Build C]
   cli.rs         clap definitions                                 [Build C]
   main.rs        wiring only                                      [Build C]
@@ -739,7 +740,27 @@ pub struct Hit { pub doc: Doc, pub score: f32, pub snippet: String,
 pub struct SearchResponse {
     pub hits: Vec<Hit>, pub total: usize,
     pub facets: BTreeMap<String, FacetResult>, pub elapsed_ms: u128,
+    /// What the search noticed that the numbers cannot say. See "Warnings travel with the
+    /// answer" below. `#[serde(default)]`, as `grouped` is.
+    pub warnings: Vec<String>,
 }
+
+/// Which end of a `--since`/`--until` range a `When` is being resolved for, and that
+/// resolution. `pub(crate)`, beside `parse_when`/`When`/`DAY_MS`.
+///
+/// The index side never needs it: `date_range` hands Tantivy a `Bound`, so a bare day is
+/// `Included(midnight) .. Excluded(midnight + DAY_MS)` and no single instant stands for the
+/// day. Everything that filters `sessions.json` instead compares two `i64`s and needs one
+/// number, so the day collapses to an edge — midnight below, `+ DAY_MS - 1` above, both
+/// inclusive. One definition, because a second front end that re-derived it is how
+/// `--until 2026-09-09` starts meaning two different days on two surfaces.
+pub(crate) enum Edge { Lower, Upper }
+pub(crate) fn when_ms(raw: &str, now: chrono::DateTime<chrono::Utc>, edge: Edge)
+    -> anyhow::Result<i64>;
+/// `~` / `~/rest` against `$HOME`. `pub(crate)`: the index-side `project` filter and the
+/// `sessions.json` one are the same typed value down two code paths, and a project that
+/// matches under `search` and not under `sessions` is a difference nobody looks for.
+pub(crate) fn expand_tilde(path: &str) -> String;
 /// The inverse of `schema::doc_to_json` — the one way to read a `Doc` back out of the index.
 pub fn doc_from_stored(f: &Fields, stored: &tantivy::TantivyDocument) -> Doc;
 pub fn search(index: &tantivy::Index, f: &Fields, req: &SearchRequest) -> anyhow::Result<SearchResponse>;
@@ -776,6 +797,30 @@ and the human rendering still prints the total. Every collector limit (`--limit`
 `--context`, `show --before/--after`) is clamped against the number of documents in the index:
 `TopDocs` preallocates whatever it is handed, so an unclamped number aborts the process.
 
+**Warnings travel with the answer.** A zero-hit response must never read as an authoritative
+"no". Three outcomes of this index are indistinguishable from an empty corpus at the call site,
+and all three used to reach only `tracing`:
+
+| when | what it means |
+| --- | --- |
+| `total == 0` and the query holds a `word:value` whose root is not a schema field | the term became a `tool_input.word` subpath lookup, which cannot fail to parse and matches nothing. Far more often a misread colon than an empty corpus |
+| `total == 0` and `--similar-to` was given | every term of the seed fell outside the similarity tuning, so `MoreLikeThisQuery` built a `BooleanQuery` with no clauses. No error is raised anywhere |
+| `--group-by-turn`, a page short of `--limit`, and documents still matching past the collapse window | the matched documents cluster into fewer turns than `GROUP_FANOUT × (limit + offset)` reached |
+
+Each is now **both** logged and pushed onto `SearchResponse::warnings`. The sentence is a
+`WARN_*` constant in `search.rs` shared verbatim by the `tracing::warn!` and the push, so the two
+texts cannot drift; the structured fields stay on the log line only, since a caller already holds
+the query it sent. `Vec<String>` rather than a typed enum because every consumer renders these as
+prose — a variant would be flattened to a sentence at the only place it is read.
+
+The HTTP side joins them into the channel it already has: `dto::search_ui_response` chains
+`SearchResponse::warnings` after `PreparedSearch::warnings` into the single `info.warnings`
+array. Request-side warnings (an unknown body key, a widened facet size) come first, answer-side
+warnings after. A second key beside it would be a channel every client has to be told about
+separately, and the newer one is the one they would miss. `--json` on the CLI does **not** carry
+them, exactly as it does not carry `grouped`: `format::search_json` hand-builds its object, and
+the CLI's warnings already reach the terminal on stderr.
+
 `context.rs`:
 
 ```rust
@@ -802,6 +847,58 @@ pub struct TurnWindow { pub turn_seq: u64, pub docs: Vec<Doc>, pub total: usize 
 pub fn turn_window(index: &tantivy::Index, f: &Fields, source_path: &str, turn_seq: u64,
                    limit: usize) -> anyhow::Result<TurnWindow>;
 ```
+
+`sessions.rs`:
+
+A session listing does not come from Tantivy. It comes from `sessions.json` — one row per
+transcript file — so every front end offering `sessions` answers two questions of its own: which
+`Filters` this row satisfies, and which of them could never have been asked here. Both answers
+used to be written **once per front end**, and the two had already drifted on the second: `cli.rs`
+warned about `program` and `lang` and said nothing about `min_thinking`; `api/mod.rs` reported
+`min_thinking` and said nothing about `program` or `lang`. Neither was right, both were plausible,
+and neither reader could see the other. A third front end would have made it a three-way
+disagreement, so it is one module.
+
+```rust
+/// The subset of `Filters` that `sessions.json` can answer, pre-resolved once — the dates are
+/// the fallible part, and resolving them per row would also let `now` move underneath a
+/// listing, measuring the first row and the last against different windows.
+pub struct SessionMatcher { /* private: project, branch, session, agent_type,
+                              since_ms, until_ms, no_sidechains, sidechains_only */ }
+impl SessionMatcher {
+    pub fn new(f: &Filters) -> Result<SessionMatcher, FilterError>;
+    pub fn matches(&self, info: &SessionInfo) -> bool;
+}
+/// An unreadable `--since`/`--until`. `field` is the plain name (`"since"`), never a flag: the
+/// CLI spells it `--since` and HTTP spells it `since=`, and a shared matcher that baked in
+/// either would put a flag nobody can type into an HTTP 400. Each front end renders `field` in
+/// its own dialect — pinned by `api::tests::a_malformed_date_is_a_400_wherever_it_arrives`.
+pub struct FilterError { pub field: &'static str, pub source: anyhow::Error }
+/// The filters that arrived and that a session listing cannot answer, in `Filters` declaration
+/// order. The *complement* of what `SessionMatcher` reads, which is why it lives beside it.
+pub fn unanswerable_filters(f: &Filters) -> Vec<&'static str>;
+/// The same list as sentences, for a front end that answers in data rather than on stderr.
+pub fn unanswerable_filter_notes(f: &Filters) -> Vec<String>;
+```
+
+**The reconciled list is ten**, and it is the complement of the eight a `SessionInfo` can be
+compared against (`project`, `branch`, `session`, `agent_type`, `since`, `until`,
+`no_sidechains`, `sidechains_only`):
+
+```
+tool  tool_input  tool_output  lang  min_thinking  program  model  role  kind  errors_only
+```
+
+None of them is *slow* against `sessions.json`; there is no column to compare them to at any
+cost. Silently dropping one is what this refuses: a listing filtered by nine of ten looks exactly
+like a listing filtered by ten, and the caller reads "no session used that model" out of a result
+that means "that question cannot be asked here". Pinned by
+`sessions::tests::the_unanswerable_filter_list_is_the_same_on_both_front_ends`.
+
+What stays with each front end is only the **rendering**. `cli.rs` maps the names to flags
+(`--tool-input`) and `tracing::warn!`s them, because its answer is a table a human is looking at.
+`api/mod.rs` returns `unanswerable_filter_notes` in the response body, because that surface has
+no stderr a caller can read — and neither will the next one.
 
 ### Turns
 
@@ -1008,7 +1105,8 @@ pub struct OutputOpts {
 pub struct TurnSpan { pub turn_seq: u64, pub total: usize }
 /// One hit's pre-fetched surroundings. `--context N` fills `docs` alone; `--context turn` fills
 /// `turn` as well, since documents by themselves cannot say whether any were left out.
-pub struct HitContext { pub docs: Vec<Doc>, pub turn: Option<TurnSpan> }
+/// `skeleton` is a rendering choice over the same documents — see "Turn skeletons".
+pub struct HitContext { pub docs: Vec<Doc>, pub turn: Option<TurnSpan>, pub skeleton: bool }
 impl HitContext {
     pub fn around(docs: Vec<Doc>) -> Self;                          // turn: None
     pub fn turn(docs: Vec<Doc>, turn_seq: u64, total: usize) -> Self;
@@ -1029,7 +1127,25 @@ pub fn turn_view(w: &mut impl Write, docs: &[Doc], span: TurnSpan, o: &OutputOpt
     -> anyhow::Result<()>;
 pub fn session_list(w: &mut impl Write, s: &[SessionInfo], o: &OutputOpts) -> anyhow::Result<()>;
 pub fn stats(w: &mut impl Write, s: &IndexStats, o: &OutputOpts) -> anyhow::Result<()>;
+
+// -- the skeleton envelope, public because it is a wire shape ---------------------------------
+/// `{lines, dropped, bytes}`, and the only definition of it. A front end that builds a
+/// skeleton-shaped hit for itself gets the two keys that are not `lines` wrong: `bytes` is
+/// `Skeleton::bytes()` — the rendered size with newlines counted, not `lines.join("\n").len()`
+/// — and `dropped` is what the byte cap left out. A caller that omits `dropped` publishes a
+/// truncated turn as a whole one, the single claim a skeleton must never make.
+pub fn skeleton_json(skeleton: &Skeleton) -> Value;
+/// `{turn_seq, shown, docs_in_turn, truncated}` — the *document* cap, where `skeleton_json`'s
+/// `dropped` is the *byte* cap. Public alongside it because a turn-shaped answer reports both
+/// or it misreports one. `TurnSpan::truncated` stays private: this is the only shape it is
+/// read in.
+pub fn turn_json(span: TurnSpan, shown: usize) -> Value;
 ```
+
+`TurnSpan`, `HitContext`, `Skeleton`, `turn_skeleton`, `SKELETON_BUDGET` and `doc_json` were
+already public and needed no change; `skeleton_json` and `turn_json` are the two that were not,
+and together with those they are everything an out-of-module caller needs to assemble a
+skeleton-shaped hit without reimplementing an envelope.
 
 Anything that prints a document's body prints its stored `body`, with `tool_output` beside it:
 the split is for retrieval and cannot be undone, so rendering from `text` + `code` would print
@@ -1569,6 +1685,13 @@ behind an `mcp` cargo feature. One `#[tool]` per subcommand, taking `Parameters<
 returning `Json<T>`, where `T` is the *same* struct clap derives into. Therefore: keep
 `Filters`/`SearchRequest` plain data, no clap types leaking into `search.rs`, and derive
 `serde::Deserialize` on them from the start.
+
+The foundation for a third front end is in place and it is not new code, it is code that stopped
+being written twice: `sessions.rs` holds the one `SessionMatcher` and the one unanswerable-filter
+list, `search::Edge`/`when_ms` hold the one date-edge resolution, `format::skeleton_json` /
+`turn_json` hold the one skeleton envelope, and `SearchResponse::warnings` carries what used to
+reach stderr alone. An MCP tool has no stderr a caller reads at all, which makes that last one
+the load-bearing part: `tracing` on a stdio transport goes nowhere the agent can see.
 
 Two traps recorded now: rmcp's README says `schemars = "0.8"` and is **wrong** (it is `^1.0`);
 and stdio transport owns stdout, so `tracing` must write to **stderr** and color must be off.
