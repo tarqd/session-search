@@ -334,11 +334,18 @@ server, never a default tool.
 
 ## Still open
 
-- **The schemas have not been driven by a model on the eval query set.** Everything above about
-  routing is an argument, and the tests assert that the descriptions *exist* and that the closed
-  vocabularies are constrained — not that a model reads them and picks the right tool. That is the
-  one acceptance item of #28 that cannot be checked from inside the process, and `EVAL.md` has no
-  MCP section yet.
+- **The routing evidence is a one-off, not a harness.** The schemas *have* now been driven by a
+  model working from the `instructions` string and the `tools/list` payload alone, over the 39
+  queries in `tests/fixtures/eval_queries.json` and the three canonical questions: all 42 routed
+  to the right tool on the first attempt and all 42 were answerable from the response. That
+  exercise is what produced most of the corrections in the descriptions, and every deliberate
+  mistake it made — `kind: "toolcall"`, `program: "Cargo"`, a bare `turn_seq`, a malformed
+  `grep` — came back with the repair rather than a bare zero.
+
+  What does not exist is a way to *re-run* it. The result is a paragraph in a commit message, not
+  a number `EVAL.md` tracks, so a description edited next month is unmeasured again. Routing is
+  also the cheap half: what a fixed query set cannot tell you is whether a model asks the right
+  question in the first place. `EVAL.md` has no MCP section.
 - **No resources and no prompts.** Tools only. A session transcript is an obvious MCP *resource*
   and is not exposed as one; nothing yet needs it, and a resource is a URI scheme to keep stable.
 - **The corpus counts in `instructions` are read once at startup** and not updated by a refresh.
