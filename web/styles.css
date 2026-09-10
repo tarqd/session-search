@@ -1,0 +1,1507 @@
+/* session-search — the whole visual design, in one file, no build step.
+ *
+ * Two rules hold the rest of this file together:
+ *
+ *   * every colour is a token defined on `:root` and redefined once for dark. A hardcoded
+ *     colour further down would survive the theme switch and turn into a black-on-black or
+ *     white-on-white patch that only one of the two audiences ever sees.
+ *   * chrome is the sans stack, transcript content is the mono stack. The content is
+ *     commands, paths, diffs and terminal output, where column alignment carries meaning;
+ *     proportional type there destroys information rather than prettifying it.
+ */
+
+/* ── Tokens ─────────────────────────────────────────────────────────────────────────────
+ * Light is the base definition. Dark is applied twice — once for the OS preference and once
+ * for an explicit `[data-theme="dark"]` — and the media query is guarded against an explicit
+ * light choice, so the toggle wins in both directions rather than only away from the OS.
+ */
+:root {
+  color-scheme: light;
+
+  --bg: #f6f6f7;
+  --panel: #ffffff;
+  --panel-2: #eeeff2;
+  --ink: #14161a;
+  --ink-dim: #575c66;
+  /* The faintest ink still carries card metadata at 12px, so it is held at ~5:1 against the
+     panel rather than at the grey that "looks about right" — dimming it further is the easy
+     change that quietly puts project and branch below AA in both themes. */
+  --ink-faint: #676d79;
+  --line: #dfe1e6;
+  --accent: #1d5fd0;
+  --accent-dim: #dbe6fa;
+  --ok: #16794a;
+  --warn: #8a5a00;
+  --err: #b4232f;
+  --add: #12683f;
+  --del: #a5232f;
+  --mark: #ffe08a;
+  --radius: 6px;
+  --mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, "Liberation Mono",
+    "DejaVu Sans Mono", monospace;
+  --sans: system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+
+  /* Extensions to the contract's list, all derived from the palette above: the tinted grounds
+     a diff and an error block need, and the few non-colour constants used more than twice. */
+  --add-bg: #e2f5ea;
+  --del-bg: #fce8ea;
+  --err-bg: #fdecee;
+  --sel: #cddffa;
+  --shadow: 0 1px 2px rgba(16, 20, 28, 0.06), 0 8px 24px rgba(16, 20, 28, 0.08);
+  --scrim: rgba(24, 28, 36, 0.42);
+  --fs-sm: 0.75rem;
+  --fs-base: 0.8125rem;
+  --fs-md: 0.875rem;
+  --block-max: 22rem;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    color-scheme: dark;
+
+    --bg: #0e1014;
+    --panel: #14171d;
+    --panel-2: #1a1e26;
+    --ink: #e5e8ee;
+    --ink-dim: #a3aab8;
+    --ink-faint: #838b9a;
+    --line: #262b35;
+    --accent: #7aa7ff;
+    --accent-dim: #1c2740;
+    --ok: #4cc38a;
+    --warn: #e0b341;
+    --err: #ff7a89;
+    --add: #57c98d;
+    --del: #ff7a89;
+    --mark: #5c4a12;
+
+    --add-bg: #12271c;
+    --del-bg: #2c1418;
+    --err-bg: #2a1417;
+    --sel: #26375c;
+    --shadow: 0 1px 2px rgba(0, 0, 0, 0.5), 0 12px 32px rgba(0, 0, 0, 0.55);
+    --scrim: rgba(0, 0, 0, 0.6);
+  }
+}
+
+:root[data-theme="dark"] {
+  color-scheme: dark;
+
+  --bg: #0e1014;
+  --panel: #14171d;
+  --panel-2: #1a1e26;
+  --ink: #e5e8ee;
+  --ink-dim: #a3aab8;
+  --ink-faint: #838b9a;
+  --line: #262b35;
+  --accent: #7aa7ff;
+  --accent-dim: #1c2740;
+  --ok: #4cc38a;
+  --warn: #e0b341;
+  --err: #ff7a89;
+  --add: #57c98d;
+  --del: #ff7a89;
+  --mark: #5c4a12;
+
+  --add-bg: #12271c;
+  --del-bg: #2c1418;
+  --err-bg: #2a1417;
+  --sel: #26375c;
+  --shadow: 0 1px 2px rgba(0, 0, 0, 0.5), 0 12px 32px rgba(0, 0, 0, 0.55);
+  --scrim: rgba(0, 0, 0, 0.6);
+}
+
+/* ── Base ───────────────────────────────────────────────────────────────────────────────── */
+*,
+*::before,
+*::after {
+  box-sizing: border-box;
+}
+
+html {
+  -webkit-text-size-adjust: 100%;
+}
+
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--ink);
+  font: var(--fs-base) / 1.5 var(--sans);
+  /* A transcript is full of 400-character paths and base64; without this a single hit widens
+     the document and the whole page scrolls sideways for the rest of the session. */
+  overflow-wrap: break-word;
+}
+
+::selection {
+  background: var(--sel);
+}
+
+a {
+  color: var(--accent);
+  text-decoration-color: color-mix(in srgb, var(--accent) 40%, transparent);
+  text-underline-offset: 2px;
+}
+
+/* One ring, everywhere, and only for keyboard traversal — a mouse user clicking a facet row
+   should not be left with a ring sitting on it. */
+:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+  border-radius: 3px;
+}
+
+button {
+  font: inherit;
+  color: inherit;
+}
+
+code,
+kbd,
+pre {
+  font-family: var(--mono);
+}
+
+/* `hidden` must win over any `display` set below, or an element the app is holding back —
+   the loading line, the empty state, an error not yet raised — is on screen from first paint
+   and the attribute silently does nothing. `#drawer` is the one deliberate exception; its
+   three-way visibility is spelled out in the drawer section. */
+[hidden]:not(#drawer) {
+  display: none !important;
+}
+
+.ss-icon {
+  width: 14px;
+  height: 14px;
+  flex: none;
+}
+
+/* Reachable by keyboard, out of the way otherwise: the facet rail is long, and tabbing
+   through every value to reach the results is the reason skip links exist. */
+.ss-skip {
+  position: absolute;
+  left: -9999px;
+  top: 0;
+  z-index: 100;
+  padding: 0.5rem 0.75rem;
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+}
+
+.ss-skip:focus {
+  left: 0.5rem;
+  top: 0.5rem;
+}
+
+/* ── Header ─────────────────────────────────────────────────────────────────────────────
+ * Sticky, because the query box is the one control used constantly and a result list is
+ * hundreds of cards long. It is opaque rather than translucent: transcript text scrolling
+ * visibly under a blurred bar is noise, not depth.
+ */
+.ss-header {
+  position: sticky;
+  top: 0;
+  z-index: 20;
+  display: flex;
+  flex-direction: column;
+  gap: 0.375rem;
+  padding: 0.5rem 1rem;
+  background: var(--panel);
+  border-bottom: 1px solid var(--line);
+}
+
+.ss-header-main {
+  display: flex;
+  align-items: center;
+  gap: 0.75rem;
+  flex-wrap: wrap;
+}
+
+.ss-brand {
+  display: flex;
+  align-items: center;
+  gap: 0.4rem;
+  color: var(--ink-dim);
+  font-weight: 600;
+  letter-spacing: -0.01em;
+  white-space: nowrap;
+}
+
+.ss-brand .ss-icon {
+  color: var(--accent);
+}
+
+.ss-brand-sep {
+  color: var(--ink-faint);
+}
+
+/* The search box takes every pixel the row can spare; `min-width` rather than `width` keeps
+   it from being the thing that forces the row to wrap on a narrow window. */
+.ss-search {
+  position: relative;
+  flex: 1 1 18rem;
+  min-width: 12rem;
+  display: flex;
+  align-items: center;
+}
+
+.ss-search-icon {
+  position: absolute;
+  left: 0.55rem;
+  color: var(--ink-faint);
+  pointer-events: none;
+}
+
+.ss-search-input {
+  width: 100%;
+  padding: 0.4rem 0.6rem 0.4rem 1.9rem;
+  font: var(--fs-md) / 1.4 var(--mono);
+  color: var(--ink);
+  background: var(--bg);
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+}
+
+/* The query language is the placeholder, so it must stay legible rather than fade out. */
+.ss-search-input::placeholder {
+  color: var(--ink-faint);
+  opacity: 1;
+}
+
+.ss-search-input:focus {
+  outline: none;
+  border-color: var(--accent);
+  box-shadow: 0 0 0 3px var(--accent-dim);
+}
+
+.ss-search-input::-webkit-search-cancel-button {
+  filter: grayscale(1);
+  opacity: 0.5;
+}
+
+.ss-controls {
+  display: flex;
+  align-items: center;
+  gap: 0.375rem;
+}
+
+.ss-select {
+  display: flex;
+  align-items: center;
+  gap: 0.35rem;
+  color: var(--ink-faint);
+  font-size: var(--fs-sm);
+}
+
+.ss-select-label {
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+}
+
+.ss-select select {
+  font: var(--fs-base) / 1.4 var(--sans);
+  color: var(--ink);
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  padding: 0.3rem 0.4rem;
+}
+
+.ss-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.35rem;
+  padding: 0.35rem 0.55rem;
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  color: var(--ink-dim);
+  cursor: pointer;
+}
+
+.ss-btn:hover {
+  background: var(--panel-2);
+  color: var(--ink);
+}
+
+.ss-btn:active {
+  transform: translateY(1px);
+}
+
+/* Marks the reindex button while POST /api/reindex is in flight; the server answers a second
+   concurrent call with a 409, so the affordance has to say "already running", not stay idle. */
+.ss-btn[aria-busy="true"],
+.ss-btn[disabled] {
+  opacity: 0.6;
+  cursor: default;
+}
+
+.ss-btn-icon {
+  padding: 0.35rem;
+}
+
+.ss-glyph-dark {
+  display: none;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) .ss-glyph-light {
+    display: none;
+  }
+  :root:not([data-theme="light"]) .ss-glyph-dark {
+    display: inline;
+  }
+}
+
+:root[data-theme="dark"] .ss-glyph-light {
+  display: none;
+}
+
+:root[data-theme="dark"] .ss-glyph-dark {
+  display: inline;
+}
+
+:root[data-theme="light"] .ss-glyph-light {
+  display: inline;
+}
+
+:root[data-theme="light"] .ss-glyph-dark {
+  display: none;
+}
+
+.ss-stats {
+  margin: 0;
+  color: var(--ink-faint);
+  font-family: var(--mono);
+  font-size: var(--fs-sm);
+  font-variant-numeric: tabular-nums;
+  min-height: 1.1em;
+}
+
+/* ── Shell: rail + main ─────────────────────────────────────────────────────────────────
+ * `minmax(0, 1fr)` on the results column, not `1fr`: a grid track's automatic minimum is its
+ * content, so one long unbroken command line in a card would otherwise stretch the column and
+ * push the page into a horizontal scroll.
+ */
+.ss-shell {
+  display: grid;
+  grid-template-columns: 15rem minmax(0, 1fr);
+  gap: 1rem;
+  align-items: start;
+  padding: 1rem;
+  max-width: 96rem;
+  margin: 0 auto;
+}
+
+.ss-rail {
+  position: sticky;
+  top: 4.25rem;
+  max-height: calc(100vh - 5.25rem);
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 0.75rem;
+  min-width: 0;
+  scrollbar-width: thin;
+}
+
+.ss-main {
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 0.75rem;
+}
+
+.ss-summary-row {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 0.75rem;
+  min-height: 1.25rem;
+}
+
+.ss-summary {
+  margin: 0;
+  color: var(--ink-dim);
+  font-size: var(--fs-sm);
+  font-variant-numeric: tabular-nums;
+}
+
+.ss-summary strong,
+.ss-summary b {
+  color: var(--ink);
+  font-weight: 600;
+}
+
+.ss-results {
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+}
+
+/* The skip link focuses this container programmatically, which should not paint a ring
+   around the whole result list; a real keyboard focus still gets one. */
+.ss-results:focus:not(:focus-visible) {
+  outline: none;
+}
+
+/* ── Filter chips ───────────────────────────────────────────────────────────────────────
+ * Every active filter is one chip carrying its own removal. A filter that is applied but not
+ * visible here reads as an empty index, which is the single most confusing failure this UI
+ * can produce.
+ */
+.ss-chips {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.3rem;
+}
+
+.ss-chips:empty {
+  display: none;
+}
+
+.ss-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.3rem;
+  max-width: 100%;
+  padding: 0.15rem 0.3rem 0.15rem 0.45rem;
+  background: var(--accent-dim);
+  border: 1px solid color-mix(in srgb, var(--accent) 35%, transparent);
+  border-radius: 999px;
+  color: var(--ink);
+  font-family: var(--mono);
+  font-size: var(--fs-sm);
+  line-height: 1.6;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.ss-chip-x {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  position: relative;
+  flex: none;
+  width: 1.05rem;
+  height: 1.05rem;
+  padding: 0;
+  background: none;
+  border: 0;
+  border-radius: 50%;
+  color: var(--ink-dim);
+  cursor: pointer;
+}
+
+.ss-chip-x:hover {
+  background: color-mix(in srgb, var(--accent) 25%, transparent);
+  color: var(--ink);
+}
+
+/* Drawn only when the renderer left the button empty, so a "×" or an <svg> supplied by app.js
+   is not doubled up with a second cross underneath it. */
+.ss-chip-x:empty::before,
+.ss-chip-x:empty::after {
+  content: "";
+  position: absolute;
+  width: 9px;
+  height: 1.5px;
+  background: currentColor;
+  border-radius: 1px;
+}
+
+.ss-chip-x:empty::before {
+  transform: rotate(45deg);
+}
+
+.ss-chip-x:empty::after {
+  transform: rotate(-45deg);
+}
+
+/* ── Facets ─────────────────────────────────────────────────────────────────────────────── */
+.ss-facets {
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+}
+
+.ss-facet {
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  overflow: hidden;
+}
+
+.ss-facet-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.5rem;
+  width: 100%;
+  padding: 0.4rem 0.55rem;
+  background: none;
+  border: 0;
+  border-bottom: 1px solid var(--line);
+  color: var(--ink-dim);
+  font-family: var(--mono);
+  font-size: var(--fs-sm);
+  font-weight: 600;
+  text-align: left;
+  cursor: pointer;
+}
+
+.ss-facet-head:hover {
+  color: var(--ink);
+}
+
+/* A collapsed facet still has to look collapsible, so the header stays and only the rows go. */
+.ss-facet[hidden] {
+  display: none;
+}
+
+.ss-facet-row {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 0.5rem;
+  width: 100%;
+  padding: 0.2rem 0.55rem;
+  background: none;
+  border: 0;
+  color: var(--ink);
+  font-family: var(--mono);
+  font-size: var(--fs-sm);
+  text-align: left;
+  cursor: pointer;
+}
+
+.ss-facet-row > :first-child {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.ss-facet-row:hover {
+  background: var(--panel-2);
+}
+
+/* A facet whose selection did not show would be a filter with no chip, so this tracks the
+   `aria-pressed` the row already needs to be an honest toggle rather than a second state flag
+   that can drift out of step with it. */
+.ss-facet-row[aria-pressed="true"] {
+  background: var(--accent-dim);
+  color: var(--ink);
+  box-shadow: inset 2px 0 0 var(--accent);
+}
+
+.ss-facet > :last-child {
+  padding-bottom: 0.3rem;
+}
+
+/* A labelled control, as opposed to `.ss-facet-row`'s value-and-count. Stacked, because the
+   rail is narrow and a text input beside its label leaves no room for the label to be read;
+   see `field()` in app.js. The label is sans — it is chrome, not transcript content. */
+.ss-field-row {
+  display: flex;
+  flex-direction: column;
+  gap: 0.2rem;
+  padding: 0.3rem 0.55rem;
+  font-family: var(--sans);
+  font-size: var(--fs-sm);
+}
+
+.ss-field-row > span {
+  color: var(--ink-dim);
+}
+
+.ss-field-row input[type="text"],
+.ss-field-row select {
+  /* `min-width: 0` because an input's intrinsic width otherwise refuses to shrink below its
+     `size`, which is what pushes the rail wider than its column at narrow viewports. */
+  width: 100%;
+  min-width: 0;
+}
+
+/* A checkbox is small enough to share the line with its label. */
+.ss-field-row.ss-field-inline {
+  flex-direction: row;
+  align-items: center;
+  justify-content: space-between;
+  cursor: pointer;
+}
+
+.ss-field-row.ss-field-inline > span {
+  color: var(--ink);
+}
+
+/* Counts are read down the column, not across the row: tabular figures keep the digits in
+   line, and the dimmed colour keeps them from competing with the values. */
+.ss-count {
+  flex: none;
+  color: var(--ink-faint);
+  font-variant-numeric: tabular-nums;
+  font-size: var(--fs-sm);
+}
+
+/* The honesty line under a facet: "41 distinct, 26 hidden". It is a caveat about the numbers
+   above it, so it is attached to them rather than floating as a separate note. */
+.ss-hint {
+  margin: 0.15rem 0.55rem 0.35rem;
+  padding-left: 0.5rem;
+  border-left: 2px solid var(--line);
+  color: var(--ink-faint);
+  font-size: var(--fs-sm);
+  line-height: 1.4;
+}
+
+.ss-hint code {
+  color: var(--ink-dim);
+}
+
+/* Server warnings and the "relevance means nothing here" caveat, above the results. It sits
+   between the summary and the first card, so it needs its own ground to read as commentary on
+   the search rather than as the first result. */
+.ss-notes {
+  display: flex;
+  flex-direction: column;
+  gap: 0.3rem;
+  margin-bottom: 0.6rem;
+}
+
+.ss-notes:empty {
+  display: none;
+}
+
+/* ── Result card ────────────────────────────────────────────────────────────────────────
+ * Fifty of these are on screen at once, so identity lives in a fixed left column: the eye
+ * runs down one edge to find "the Bash calls" without reading a single body. The head spans
+ * every row so that column stays whole however many blocks the body grows.
+ */
+.ss-card {
+  display: grid;
+  grid-template-columns: 8.5rem minmax(0, 1fr);
+  column-gap: 0.9rem;
+  row-gap: 0.4rem;
+  padding: 0.6rem 0.75rem;
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+}
+
+.ss-card > * {
+  grid-column: 2;
+  min-width: 0;
+}
+
+.ss-card > .ss-card-head {
+  grid-column: 1;
+  /* Pinned to the first row rather than spanned across all of them: a `span 99` would create
+     98 empty implicit rows, and `row-gap` applies between empty tracks too, so every card
+     would carry forty rems of blank space under it. */
+  grid-row: 1;
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 0.3rem;
+}
+
+.ss-card:hover {
+  border-color: color-mix(in srgb, var(--accent) 30%, var(--line));
+}
+
+.ss-card-body {
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 0.4rem;
+}
+
+/* Project, branch, model, time. Present on every card and interesting on almost none of
+   them, so it is sized and coloured to be found on purpose rather than read by accident. */
+.ss-meta {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.15rem 0.6rem;
+  color: var(--ink-faint);
+  font-family: var(--mono);
+  font-size: var(--fs-sm);
+  line-height: 1.5;
+}
+
+.ss-meta > * {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.ss-meta a {
+  color: inherit;
+}
+
+.ss-meta a:hover {
+  color: var(--accent);
+}
+
+/* ── Badges ─────────────────────────────────────────────────────────────────────────────── */
+.ss-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.25rem;
+  max-width: 100%;
+  padding: 0.05rem 0.35rem;
+  border: 1px solid var(--line);
+  border-radius: 3px;
+  background: var(--panel-2);
+  color: var(--ink-dim);
+  font-family: var(--mono);
+  font-size: var(--fs-sm);
+  line-height: 1.6;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+/* Who spoke. `user` is the accent because a search almost always starts from "what did I
+   ask"; the model's turns are the quiet default. */
+.ss-badge-role {
+  text-transform: lowercase;
+  letter-spacing: 0.02em;
+}
+
+.ss-badge-role[data-role="user"] {
+  border-color: color-mix(in srgb, var(--accent) 40%, transparent);
+  background: var(--accent-dim);
+  color: var(--ink);
+}
+
+.ss-badge-role[data-role="system"],
+.ss-badge-role[data-role="attachment"] {
+  color: var(--ink-faint);
+}
+
+/* `toolMeta` hands back an accent per tool; it arrives either as a token name in
+   `data-accent` or as a colour in `--tool-accent`, and either way one rule below reads it. */
+.ss-badge-tool {
+  color: var(--tool-accent, var(--ink));
+  border-color: color-mix(in srgb, var(--tool-accent, var(--line)) 40%, var(--line));
+  font-weight: 600;
+}
+
+/* The four `app.js` puts on the snippet label ("matched in what the tool printed"). */
+.ss-badge-tool[data-accent="accent"] {
+  --tool-accent: var(--accent);
+}
+
+.ss-badge-tool[data-accent="ok"] {
+  --tool-accent: var(--ok);
+}
+
+.ss-badge-tool[data-accent="warn"] {
+  --tool-accent: var(--warn);
+}
+
+.ss-badge-tool[data-accent="err"] {
+  --tool-accent: var(--err);
+}
+
+/* And the ten `toolMeta` emits, which are the list in `tools.js` — if the two lists drift
+   apart the badges silently all come out the same grey, which is what "no rule matched" looks
+   like. They group by what the call *did* rather than giving ten tools ten hues: reading is
+   blue, changing a file amber, running a command green, reaching outside the machine violet.
+   A reader scanning a session is looking for the group, and ten hand-picked hues at badge size
+   are ten shades of the same thing. Every value derives from a theme token, so the dark
+   palette needs no second table. */
+.ss-badge-tool[data-accent="run"] {
+  --tool-accent: var(--ok);
+}
+
+.ss-badge-tool[data-accent="read"] {
+  --tool-accent: var(--accent);
+}
+
+.ss-badge-tool[data-accent="find"] {
+  --tool-accent: color-mix(in srgb, var(--accent) 65%, var(--ok));
+}
+
+.ss-badge-tool[data-accent="write"] {
+  --tool-accent: var(--warn);
+}
+
+.ss-badge-tool[data-accent="edit"] {
+  --tool-accent: color-mix(in srgb, var(--warn) 70%, var(--err));
+}
+
+.ss-badge-tool[data-accent="web"] {
+  --tool-accent: color-mix(in srgb, var(--accent) 55%, var(--err));
+}
+
+.ss-badge-tool[data-accent="agent"] {
+  --tool-accent: color-mix(in srgb, var(--err) 70%, var(--accent));
+}
+
+.ss-badge-tool[data-accent="plan"] {
+  --tool-accent: var(--ink-dim);
+}
+
+/* An MCP tool and a tool this build has never heard of are the two "we do not know what this
+   does" cases, and they read as exactly that: no colour claim, just legible. */
+.ss-badge-tool[data-accent="mcp"] {
+  --tool-accent: color-mix(in srgb, var(--ink-dim) 70%, var(--accent));
+}
+
+.ss-badge-tool[data-accent="tool"] {
+  --tool-accent: var(--ink-faint);
+}
+
+/* A failed tool call is the one thing on a card that may shout, and it shouts on the badge
+   rather than on the body — the body is still the text the reader came for. */
+.ss-badge[data-error],
+.ss-badge.is-error,
+.ss-card[data-error] .ss-badge-tool {
+  border-color: color-mix(in srgb, var(--err) 45%, transparent);
+  background: var(--err-bg);
+  color: var(--err);
+}
+
+/* ── Paths ──────────────────────────────────────────────────────────────────────────────
+ * Directory dimmed, basename full strength: in a list of twenty hits under one repo the
+ * leading path is the same twenty times and the filename is the only part being compared.
+ */
+.ss-path {
+  font-family: var(--mono);
+  font-size: var(--fs-sm);
+  overflow-wrap: anywhere;
+}
+
+.ss-path-dir {
+  color: var(--ink-faint);
+}
+
+.ss-path-base {
+  color: var(--ink);
+  font-weight: 600;
+}
+
+/* ── The excerpt ────────────────────────────────────────────────────────────────────────
+ * The server sends escaped text with `<em>` around the matched spans; the mark has to be the
+ * loudest thing in the card without turning the card into a highlighter.
+ */
+.ss-snippet {
+  margin: 0;
+  max-height: var(--block-max);
+  overflow: auto;
+  color: var(--ink);
+  font-family: var(--mono);
+  font-size: var(--fs-base);
+  line-height: 1.55;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  scrollbar-width: thin;
+}
+
+.ss-snippet em,
+.ss-snippet mark,
+mark {
+  padding: 0 1px;
+  background: var(--mark);
+  color: var(--ink);
+  border-radius: 2px;
+  font-style: normal;
+}
+
+/* ── Content blocks ─────────────────────────────────────────────────────────────────────
+ * `.ss-code`, `.ss-term`, `.ss-out` and `.ss-json` all hold something that can be 800 lines
+ * long and 400 columns wide. Each caps its own height and scrolls in both directions itself,
+ * which is what keeps `body` from ever scrolling sideways.
+ */
+.ss-code,
+.ss-term,
+.ss-out,
+.ss-json {
+  margin: 0;
+  max-height: var(--block-max);
+  overflow: auto;
+  padding: 0.45rem 0.6rem;
+  background: var(--panel-2);
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  font-family: var(--mono);
+  font-size: var(--fs-sm);
+  line-height: 1.5;
+  /* `pre`, not `pre-wrap`: aligned columns in `ls -l`, a diff or a table are information, and
+     soft-wrapping them at the card width destroys it. */
+  white-space: pre;
+  tab-size: 4;
+  scrollbar-width: thin;
+}
+
+/* Any of the four can opt into wrapping when the renderer knows the content is prose. */
+/* Opt-in, for a block whose renderer knows it holds prose rather than code. Nothing takes it
+   today; it is here so that a renderer that should can, without inventing a second spelling. */
+.ss-code.ss-wrap,
+.ss-term.ss-wrap,
+.ss-out.ss-wrap,
+.ss-json.ss-wrap {
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+/* Lifted by the `.ss-more` button, which sets `data-expanded` on the block itself: the cap is
+   here, not in the content, so swapping the text without this leaves the box the same size. */
+.ss-code[data-expanded],
+.ss-term[data-expanded],
+.ss-out[data-expanded],
+.ss-json[data-expanded],
+.ss-snippet[data-expanded] {
+  max-height: none;
+}
+
+/* The language token is a label, not a highlighter — nothing here parses the code. It sits in
+   the corner so a reader can tell a `.rs` block from a `.json` one at a glance. */
+.ss-code {
+  position: relative;
+}
+
+.ss-code[data-lang]:not([data-lang=""])::before {
+  content: attr(data-lang);
+  float: right;
+  margin-left: 0.5rem;
+  color: var(--ink-faint);
+  font-size: 0.6875rem;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+}
+
+/* A terminal reads as a terminal: darker ground than the surrounding panel in both themes,
+   with the command itself lifted out of the output that follows it. */
+.ss-term {
+  background: color-mix(in srgb, var(--ink) 5%, var(--panel-2));
+  color: var(--ink-dim);
+}
+
+.ss-term-cmd {
+  display: block;
+  color: var(--ink);
+  font-weight: 600;
+}
+
+.ss-out {
+  color: var(--ink-dim);
+}
+
+/* Tool output that came back as a failure. The red is on the rail, not the text: error output
+   is still output, and colouring 40 lines of it red makes none of them readable. */
+.ss-out[data-error],
+.ss-out.is-error {
+  border-color: color-mix(in srgb, var(--err) 40%, transparent);
+  border-left-width: 3px;
+  border-left-color: var(--err);
+  background: var(--err-bg);
+}
+
+.ss-json {
+  color: var(--ink-dim);
+}
+
+/* ── Key/value tables ───────────────────────────────────────────────────────────────────
+ * The fallback for every tool this build has never heard of, so it has to look deliberate
+ * rather than like a renderer that gave up. It is styled for both a <table> and a <div>
+ * grid, because the generic renderer may reasonably emit either.
+ */
+.ss-kv {
+  width: 100%;
+  margin: 0;
+  font-family: var(--mono);
+  font-size: var(--fs-sm);
+  border-collapse: collapse;
+}
+
+.ss-kv:not(table) {
+  display: grid;
+  grid-template-columns: minmax(4rem, max-content) minmax(0, 1fr);
+  gap: 0.1rem 0.6rem;
+  align-items: baseline;
+}
+
+.ss-kv-k {
+  color: var(--ink-faint);
+  font-weight: 500;
+  text-align: left;
+  vertical-align: top;
+  white-space: nowrap;
+  padding: 0.1rem 0.6rem 0.1rem 0;
+}
+
+.ss-kv-v {
+  min-width: 0;
+  color: var(--ink);
+  overflow-wrap: anywhere;
+  vertical-align: top;
+  padding: 0.1rem 0;
+}
+
+.ss-kv-v pre,
+.ss-kv-v .ss-code,
+.ss-kv-v .ss-json {
+  margin-top: 0.2rem;
+}
+
+/* ── Diffs ──────────────────────────────────────────────────────────────────────────────
+ * Colour plus a left stripe, never colour alone: an Edit is red-and-green by nature and a
+ * reader who cannot separate the two hues still has the position cue to work from.
+ */
+.ss-diff {
+  margin: 0;
+  max-height: var(--block-max);
+  overflow: auto;
+  background: var(--panel-2);
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  font-family: var(--mono);
+  font-size: var(--fs-sm);
+  line-height: 1.5;
+  white-space: pre;
+  tab-size: 4;
+  scrollbar-width: thin;
+}
+
+.ss-diff[data-expanded] {
+  max-height: none;
+}
+
+.ss-diff-add,
+.ss-diff-del {
+  display: block;
+  padding: 0 0.6rem 0 0.45rem;
+  border-left: 3px solid transparent;
+}
+
+.ss-diff-add {
+  background: var(--add-bg);
+  border-left-color: var(--add);
+  color: var(--add);
+}
+
+.ss-diff-del {
+  background: var(--del-bg);
+  border-left-color: var(--del);
+  color: var(--del);
+}
+
+/* Context lines inside a diff get the same left inset so the added and removed lines do not
+   appear shifted against them. */
+.ss-diff > :not(.ss-diff-add):not(.ss-diff-del) {
+  display: block;
+  padding: 0 0.6rem 0 0.45rem;
+  border-left: 3px solid transparent;
+  color: var(--ink-dim);
+}
+
+/* ── Todo lists ─────────────────────────────────────────────────────────────────────────── */
+.ss-todo {
+  margin: 0;
+  padding: 0;
+  list-style: none;
+  font-family: var(--mono);
+  font-size: var(--fs-sm);
+}
+
+.ss-todo li,
+.ss-todo > div {
+  padding: 0.05rem 0 0.05rem 0.5rem;
+  border-left: 2px solid var(--line);
+  color: var(--ink-dim);
+}
+
+/* Done is struck through and dimmed rather than removed: the point of a TodoWrite record in
+   a transcript is what the model had already finished when it wrote the next thing. */
+.ss-todo-done {
+  color: var(--ink-faint);
+  text-decoration: line-through;
+  text-decoration-color: var(--ink-faint);
+  border-left-color: var(--ok);
+}
+
+.ss-todo-active {
+  color: var(--ink);
+  font-weight: 600;
+  border-left-color: var(--accent);
+}
+
+/* ── "Show more" ────────────────────────────────────────────────────────────────────────
+ * The honest half of every capped block. It is a real button on its own line under the block
+ * it opens, so a capped block never looks like the end of the content.
+ */
+.ss-more {
+  align-self: flex-start;
+  padding: 0.15rem 0.4rem;
+  background: none;
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  color: var(--ink-dim);
+  font-family: var(--mono);
+  font-size: var(--fs-sm);
+  cursor: pointer;
+}
+
+.ss-more:hover {
+  border-color: color-mix(in srgb, var(--accent) 40%, var(--line));
+  color: var(--accent);
+  background: var(--panel-2);
+}
+
+/* ── Expanded thread ────────────────────────────────────────────────────────────────────
+ * The window of neighbouring turns opened inside a card. The spine down the left is what
+ * makes it read as a nested conversation instead of as more cards that happen to be indented.
+ */
+.ss-thread {
+  display: flex;
+  flex-direction: column;
+  gap: 0.4rem;
+  margin: 0.15rem 0 0.1rem;
+  padding-left: 0.75rem;
+  border-left: 2px solid var(--line);
+}
+
+.ss-thread-turn {
+  position: relative;
+  padding: 0.3rem 0.45rem;
+  background: var(--bg);
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  font-size: var(--fs-sm);
+}
+
+/* A node on the spine, drawn rather than written, so it cannot collide with text a renderer
+   put at the start of the turn. */
+.ss-thread-turn::before {
+  content: "";
+  position: absolute;
+  left: -1.03rem;
+  top: 0.75rem;
+  width: 6px;
+  height: 6px;
+  background: var(--line);
+  border-radius: 50%;
+}
+
+/* The turn that actually matched. Without it an expanded window of seven turns loses the one
+   the reader searched for, which is the only reason the window exists. */
+.ss-focus {
+  background: var(--panel);
+  border-color: color-mix(in srgb, var(--accent) 45%, var(--line));
+  box-shadow: inset 3px 0 0 var(--accent);
+}
+
+.ss-focus::before {
+  background: var(--accent);
+}
+
+/* ── Pager ──────────────────────────────────────────────────────────────────────────────── */
+.ss-pager {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.3rem;
+  padding-top: 0.25rem;
+}
+
+.ss-pager:empty {
+  display: none;
+}
+
+.ss-pager button {
+  min-width: 2rem;
+  padding: 0.25rem 0.5rem;
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  color: var(--ink-dim);
+  font-variant-numeric: tabular-nums;
+  cursor: pointer;
+}
+
+.ss-pager button:hover:not([disabled]) {
+  background: var(--panel-2);
+  color: var(--ink);
+}
+
+.ss-pager button[disabled] {
+  opacity: 0.45;
+  cursor: default;
+}
+
+.ss-pager button[aria-current="page"],
+.ss-pager button.is-on {
+  background: var(--accent-dim);
+  border-color: color-mix(in srgb, var(--accent) 45%, transparent);
+  color: var(--ink);
+  font-weight: 600;
+}
+
+/* ── States: error, empty, loading ──────────────────────────────────────────────────────
+ * The API answers a bad filter or a bad sort with a 400 that names what it accepted instead.
+ * That message is the most useful text this UI ever shows, so it gets a block of its own at
+ * the top of the results rather than a toast that disappears.
+ */
+.ss-err {
+  padding: 0.5rem 0.7rem;
+  background: var(--err-bg);
+  border: 1px solid color-mix(in srgb, var(--err) 40%, transparent);
+  border-left: 3px solid var(--err);
+  border-radius: var(--radius);
+  color: var(--ink);
+  font-family: var(--mono);
+  font-size: var(--fs-sm);
+  line-height: 1.5;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+.ss-err strong {
+  color: var(--err);
+}
+
+.ss-empty {
+  padding: 1.5rem 1rem;
+  background: var(--panel);
+  border: 1px dashed var(--line);
+  border-radius: var(--radius);
+  color: var(--ink-dim);
+  text-align: center;
+}
+
+.ss-empty-title {
+  margin: 0 0 0.35rem;
+  color: var(--ink);
+  font-weight: 600;
+}
+
+.ss-empty-body {
+  margin: 0 auto;
+  max-width: 34rem;
+  color: var(--ink-faint);
+  font-size: var(--fs-sm);
+}
+
+.ss-empty code {
+  color: var(--ink-dim);
+}
+
+.ss-loading {
+  display: flex;
+  align-items: center;
+  gap: 0.4rem;
+  color: var(--ink-faint);
+  font-size: var(--fs-sm);
+}
+
+.ss-spinner {
+  display: inline-block;
+  width: 0.75rem;
+  height: 0.75rem;
+  border: 2px solid var(--line);
+  border-top-color: var(--accent);
+  border-radius: 50%;
+  animation: ss-spin 0.7s linear infinite;
+}
+
+@keyframes ss-spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+/* ── Drawer ─────────────────────────────────────────────────────────────────────────────
+ * The transcript view: full height, anchored right, and wide but not full-bleed so the result
+ * list it was opened from stays visible behind it.
+ *
+ * It is hidden three ways because the markup is a <dialog> shipped with `hidden`: closed by
+ * default whichever way app.js drives it, open for `showModal()`, for a cleared `hidden`, and
+ * for a class. Getting this wrong in one direction leaves the drawer permanently stuck open
+ * over the results.
+ */
+.ss-drawer {
+  display: none;
+  position: fixed;
+  inset: 0 0 0 auto;
+  width: min(56rem, 100%);
+  max-width: 100%;
+  max-height: 100%;
+  height: 100%;
+  margin: 0;
+  padding: 0;
+  background: var(--panel);
+  color: var(--ink);
+  border: 0;
+  border-left: 1px solid var(--line);
+  box-shadow: var(--shadow);
+  overflow: hidden;
+}
+
+.ss-drawer[open],
+.ss-drawer.ss-open,
+.ss-drawer:not([hidden]) {
+  display: flex;
+  flex-direction: column;
+}
+
+/* Only a modal `showModal()` draws a backdrop; when app.js opens the drawer by clearing
+   `hidden` there is none, and the shadow above is what separates it from the page. */
+.ss-drawer::backdrop {
+  background: var(--scrim);
+}
+
+.ss-drawer-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.75rem;
+  flex: none;
+  padding: 0.5rem 0.75rem;
+  background: var(--panel);
+  border-bottom: 1px solid var(--line);
+}
+
+.ss-drawer-title {
+  margin: 0;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-family: var(--mono);
+  font-size: var(--fs-md);
+  font-weight: 600;
+}
+
+.ss-drawer-body {
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  padding: 0.75rem;
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+  scrollbar-width: thin;
+}
+
+/* A whole session is a column of turns, not a grid of cards: there is no list to scan down,
+   so the left identity rail buys nothing and the width is better spent on the text. */
+.ss-drawer-body .ss-card {
+  grid-template-columns: minmax(0, 1fr);
+}
+
+.ss-drawer-body .ss-card > .ss-card-head {
+  grid-column: 1;
+  grid-row: auto;
+  flex-direction: row;
+  flex-wrap: wrap;
+  align-items: center;
+}
+
+/* ── Narrow screens ─────────────────────────────────────────────────────────────────────
+ * At 400px the rail becomes a band above the results rather than a column beside them, and
+ * the card's identity rail folds into a row above its body. Nothing is hidden: a filter the
+ * reader cannot see is a filter they cannot explain their results with.
+ */
+@media (max-width: 60rem) {
+  .ss-shell {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .ss-rail {
+    position: static;
+    max-height: none;
+    overflow: visible;
+  }
+
+  .ss-facets {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(13rem, 1fr));
+    gap: 0.5rem;
+    align-items: start;
+  }
+}
+
+@media (max-width: 34rem) {
+  .ss-header {
+    padding: 0.5rem 0.75rem;
+  }
+
+  .ss-shell {
+    padding: 0.75rem;
+    gap: 0.75rem;
+  }
+
+  .ss-brand-name {
+    /* The glyph alone identifies the page once the row has to wrap; the wordmark is the
+       first thing worth spending width on. */
+    display: none;
+  }
+
+  .ss-search {
+    order: 3;
+    flex-basis: 100%;
+  }
+
+  .ss-controls {
+    margin-left: auto;
+  }
+
+  .ss-btn-label {
+    display: none;
+  }
+
+  .ss-card {
+    grid-template-columns: minmax(0, 1fr);
+    row-gap: 0.35rem;
+  }
+
+  .ss-card > .ss-card-head {
+    grid-column: 1;
+    grid-row: auto;
+    flex-direction: row;
+    flex-wrap: wrap;
+    align-items: center;
+  }
+
+  .ss-facets {
+    grid-template-columns: minmax(0, 1fr);
+  }
+}
+
+/* ── Motion ─────────────────────────────────────────────────────────────────────────────
+ * The only animation on the page is the spinner, and a spinner is exactly the kind of
+ * continuous rotation that makes vestibular disorders miserable. It still has to read as
+ * "working", so it pulses in place instead of stopping dead.
+ */
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+    scroll-behavior: auto !important;
+  }
+
+  .ss-spinner {
+    animation: ss-pulse 1.4s ease-in-out infinite !important;
+    animation-duration: 1.4s !important;
+    animation-iteration-count: infinite !important;
+    border-top-color: var(--accent);
+  }
+
+  .ss-btn:active {
+    transform: none;
+  }
+}
+
+@keyframes ss-pulse {
+  50% {
+    opacity: 0.3;
+  }
+}

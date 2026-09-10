@@ -1,0 +1,14 @@
+# The version of Rust this repository is built and checked with, everywhere: rustup reads this
+# file before its own default, so a contributor's `cargo clippy` runs the same compiler — and
+# therefore the same lint set — as the CI job that gates their pull request. Without it CI
+# tracks whatever `stable` happens to be that week while a machine that has not run
+# `rustup update` in a while sits several releases behind, and clippy findings only show up
+# after the push.
+#
+# Bumping it is a deliberate one-line pull request: change the channel, run the four checks in
+# the README's "Development" section, and fix whatever the newer clippy has learned to see.
+[toolchain]
+channel = "1.98.1"
+# `minimal` leaves out rust-docs; these three are what the checks and an editor actually need.
+profile = "minimal"
+components = ["clippy", "rustfmt", "rust-src"]

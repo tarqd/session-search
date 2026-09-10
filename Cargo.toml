@@ -3,6 +3,14 @@ name = "session-search"
 version = "0.1.0"
 edition = "2024"
 
+[features]
+default = []
+# An HTTP server over the same read operations the CLI exposes, with an Elastic Search UI
+# compatible envelope. Off by default: it binds a port and serves your transcripts.
+http-api = ["dep:axum", "dep:tokio", "dep:serde_urlencoded"]
+# The static single-page frontend, embedded in the binary and served by the same server.
+web-ui = ["http-api"]
+
 [dependencies]
 anyhow = "1.0.104"
 brush-parser = "0.4.0"
@@ -19,6 +27,26 @@ tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 walkdir = "2.5.0"
 
+# --- optional, `http-api` / `web-ui` ------------------------------------------------------
+# `default-features = false` keeps the multipart, form and tower-log machinery out; the server
+# needs routing, JSON and query extraction and nothing else.
+axum = { version = "0.8.9", optional = true, default-features = false, features = [
+  "http1",
+  "json",
+  "query",
+  "tokio",
+] }
+tokio = { version = "1.49.0", optional = true, default-features = false, features = [
+  "rt-multi-thread",
+  "net",
+  "signal",
+] }
+# Deserializing a query string into `Vec<(String, String)>` is the one thing `axum::extract::Query`
+# cannot do, and repeatable parameters (`?tool=Bash&tool=Read`) need it.
+serde_urlencoded = { version = "0.7.1", optional = true }
+
 [dev-dependencies]
 insta = { version = "1.48.0", features = ["json", "redactions", "filters"] }
 tempfile = "3.27.0"
+# `ServiceExt::oneshot` drives the router in tests without binding a socket.
+tower = { version = "0.5.3", features = ["util"] }

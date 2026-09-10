@@ -21,6 +21,9 @@ permissions:
 
 env:
   CARGO_TERM_COLOR: always
+  # Incremental artifacts are worthless to a runner that starts from a restored cache, and
+  # they are large. The old `dtolnay/rust-toolchain` step used to set this for us.
+  CARGO_INCREMENTAL: 0
 
 jobs:
   # One job, not four. Each job is a fresh runner that re-downloads the cache and rebuilds
@@ -32,9 +35,11 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          components: rustfmt, clippy
+      # No version here on purpose: `rust-toolchain.toml` names the compiler and the
+      # components, and rustup installs whatever it asks for. That is what keeps this job's
+      # clippy the same clippy a contributor runs before pushing.
+      - name: Install the pinned toolchain
+        run: rustup toolchain install --no-self-update
 
       - uses: Swatinem/rust-cache@v2
 
@@ -46,13 +51,28 @@ jobs:
       - name: cargo clippy
         run: cargo clippy --locked --all-targets --all-features -- -D warnings
 
-      - name: cargo build
+      # Default features, deliberately: `http-api` and `web-ui` are off by default, and "it
+      # still builds with them off" is a claim `--all-features` cannot make for us. A `use` or
+      # a `match` arm that compiles only with the feature on breaks the binary everyone
+      # actually installs, and nothing else in this job would notice.
+      - name: cargo build (default features)
         run: cargo build --locked --all-targets
 
+      # `--all-features` so `src/api` and the `web/` assets are compiled and their tests run.
+      #
       # The four `#[ignore]`d tests read this machine's own `~/.claude/projects`, which a
       # runner does not have. They stay a by-hand check; see the README.
       - name: cargo test
-        run: cargo test --locked
+        run: cargo test --locked --all-features
+
+      # `http-api` without `web-ui` is a configuration the README documents and nothing above
+      # compiles: `--all-features` turns `web-ui` on, and the code that exists only without it —
+      # the `GET /` handler that says there is no UI, and the route that installs it — would
+      # stop compiling with every check here still green. `--all-features` does not subsume this
+      # run in the other direction either: `the_root_without_a_ui_points_at_the_api_rather_than_404ing`
+      # is `#[cfg(not(feature = "web-ui"))]`, so it is the one test that only ever runs here.
+      - name: cargo test (http-api without web-ui)
+        run: cargo test --locked --features http-api
 
   # macOS bills at 10x, so it does not run per-PR. This keeps the Apple leg from going stale
   # between releases without paying for it on every push: once a week, and on demand.
@@ -62,6 +82,9 @@ jobs:
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - run: rustup toolchain install --no-self-update
       - uses: Swatinem/rust-cache@v2
-      - run: cargo test --locked
+      # `--all-features` here too: the server is the only part of this crate that binds a
+      # socket and spawns a runtime, which is exactly the sort of thing that works on Linux
+      # and not on macOS.
+      - run: cargo test --locked --all-features

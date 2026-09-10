@@ -272,10 +272,15 @@ src/
   format.rs      human + JSON rendering                           [Build C]
   cli.rs         clap definitions                                 [Build C]
   main.rs        wiring only                                      [Build C]
+  api/mod.rs     server bootstrap, router, handlers, CORS         [feature http-api]
+  api/dto.rs     wire shapes: query strings, Search UI envelope   [feature http-api]
+  api/assets.rs  the `web/` files, compiled into the binary       [feature web-ui]
+web/             the browser UI; no build step, no CDN            [feature web-ui]
+  index.html  styles.css  dom.js  markdown.js  tools.js  app.js
 tests/
   fixtures/*.jsonl
 docs/
-  TRANSCRIPT-FORMAT.md   DESIGN.md
+  TRANSCRIPT-FORMAT.md   DESIGN.md   WEB-UI.md
 ```
 
 ## Index directory
@@ -643,7 +648,9 @@ impl FacetResult {
     pub fn is_search_shaped(&self) -> bool;
     pub fn hidden_values(&self) -> Option<u64>;
 }
-pub struct Hit { pub doc: Doc, pub score: f32, pub snippet: String }
+// Grew two fields with the web UI; see "Optional front ends" below for both and for why.
+pub struct Hit { pub doc: Doc, pub score: f32, pub snippet: String,
+                 pub snippet_field: SnippetSource, pub snippet_marks: Vec<Range<usize>> }
 pub struct SearchResponse {
     pub hits: Vec<Hit>, pub total: usize,
     pub facets: BTreeMap<String, FacetResult>, pub elapsed_ms: u128,
@@ -755,6 +762,56 @@ every inline span twice and move a fenced block to the end of the message. The o
 the rule above — a failed call previews its error first. `doc_json` carries `body`, `text`,
 `code`, `headings`, `code_lang` and `tool_output`.
 
+### Optional features: `http-api` and `web-ui`
+
+Two cargo features, neither in `default`: `http-api` adds `session-search serve`, a JSON API over
+the read operations this file already pins, and `web-ui` (which implies it) adds the static
+frontend, `include_str!`'d into the binary. They are opt-in **at build time** because the server
+binds a port and hands out a verbatim record of everything that was typed, secrets included; a
+default build links no `axum`, no `tokio`, and has no `serve` in `--help`.
+
+The wire contract — endpoints, the Elastic Search UI request/response envelope, the filter-field
+mapping, the `dto.rs`/`mod.rs` seam, and the frontend's DOM and CSS contracts — is
+[`WEB-UI.md`](WEB-UI.md), and is not repeated here. What the features add to the types pinned
+above is only this, in `search.rs`, shared by both front ends:
+
+```rust
+/// Hit order. Relevance is meaningless for a filter-only browse — every hit scores the same —
+/// which is exactly when time order earns its keep.
+pub enum SortBy { Relevance /* default */, Newest, Oldest }
+
+/// Which stored body a `Hit`'s snippet was cut from. One query spans `text`, `code`,
+/// `tool_output` and `thinking`, and the four read as different claims — what a turn said, a
+/// snippet it quoted, what a command printed, what the model reasoned privately. A renderer
+/// that labels them all the same way tells the reader something untrue about what matched.
+/// `Text` also covers the no-highlight fallback's `body`, which is the same claim.
+pub enum SnippetSource { Text, Code, ToolOutput, Thinking }
+
+pub struct SearchRequest { /* … as above … */ pub sort: SortBy }
+pub struct Hit { pub doc: Doc, pub score: f32, pub snippet: String,
+                 pub snippet_field: SnippetSource,
+                 /// Byte ranges into `snippet` naming what each marker pair wraps.
+                 pub snippet_marks: Vec<std::ops::Range<usize>> }
+
+/// The marker either side of a matched span in `Hit::snippet`, for a consumer that renders the
+/// snippet as-is — the terminal one in `format.rs`.
+///
+/// A consumer that *re-marks* the snippet reads `Hit::snippet_marks` instead and must not split
+/// on this: transcript bodies contain `**` of their own, splitting cannot tell those from the
+/// highlighter's, and the result is emphasis on words the query never matched.
+pub const HIGHLIGHT: &str = "**";
+```
+
+Under `Newest`/`Oldest` every hit carries `score: 0.0`: the collector orders by the timestamp fast
+field and a timestamp is not a relevance score, so reporting one would be a lie the caller cannot
+check. `SortBy::Relevance` is the default everywhere, so nothing that predates this sees a change.
+
+A document with no timestamp is still returned under a time order — Tantivy sorts on `Option<T>`
+and puts `None` last in both directions — so `total` keeps matching what paging can reach. Every
+transcript record carries a timestamp anyway; it is pinned by a test because "the count says 40
+and you can only page to 37" is the kind of quiet arithmetic lie this index does not tell.
+
+
 ## CLI surface
 
 ```
@@ -762,12 +819,14 @@ session-search index [--full] [--root DIR]... [--index DIR] [--jobs N] [--includ
                      [--no-spilled-results]
 session-search search <QUERY> [FILTERS] [--facets f1,f2] [--context N]
                               [--limit N] [--offset N] [--json] [--no-refresh]
-                              [--include-thinking]
+                              [--include-thinking] [--sort relevance|newest|oldest]
 session-search facets <FIELD> [--query Q] [FILTERS] [--top N] [--json] [--no-refresh]
 session-search show <SESSION_ID> [--agent AGENT_ID] [--around UUID|SEQ]
                                  [--before N] [--after N] [--limit N] [--json] [--no-refresh]
 session-search sessions [FILTERS] [--limit N] [--json] [--no-refresh]
 session-search stats [--json]
+session-search serve [--host ADDR] [--port PORT] [--cors ORIGIN]... [--refresh-secs N]
+                     [--no-refresh]                                   [feature http-api]
 
 FILTERS: -p/--project P  -t/--tool T  --tool-input k=v  --tool-output TEXT  --program NAME
          --lang LANG  --branch B  --model M

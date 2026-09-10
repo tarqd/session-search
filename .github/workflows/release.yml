@@ -21,6 +21,7 @@ permissions:
 
 env:
   CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
 
 jobs:
   verify:
@@ -53,9 +54,7 @@ jobs:
           echo "Tag ${GITHUB_REF_NAME} matches Cargo.toml version ${crate}."
 
       # A release is not the place to discover the tree is red.
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          components: rustfmt, clippy
+      - run: rustup toolchain install --no-self-update
       - uses: Swatinem/rust-cache@v2
       - run: cargo fmt --check
       - run: cargo clippy --locked --all-targets --all-features -- -D warnings
@@ -78,9 +77,13 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: ${{ matrix.target }}
+      # `rust-toolchain.toml` picks the compiler; the matrix picks what it builds for. Both
+      # targets are the runner's own, so `target add` is a no-op that keeps working if a
+      # cross-compiled entry is ever added to the matrix.
+      - name: Install the pinned toolchain
+        run: |
+          rustup toolchain install --no-self-update
+          rustup target add ${{ matrix.target }}
 
       - uses: Swatinem/rust-cache@v2
         with:
