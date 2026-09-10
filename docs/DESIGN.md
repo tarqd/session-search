@@ -101,7 +101,7 @@ Two registered analyzers, one per kind of text:
 | analyzer | fields | pipeline |
 | --- | --- | --- |
 | `code` | `code`, `tool_output`, `thinking`, `tool_input` | `WordTokenizer -> SplitIdentifiers -> LowerCaser -> RemoveLongFilter(255)` |
-| `prose` | `text`, `headings` | `WordTokenizer -> SplitIdentifiers -> LowerCaser -> Stemmer(English) -> RemoveLongFilter(255)` |
+| `prose` | `text`, `headings`, `context_text` | `WordTokenizer -> SplitIdentifiers -> LowerCaser -> Stemmer(English) -> RemoveLongFilter(255)` |
 
 `prose` is `code` plus an English stemmer, and the stemmer is the whole difference: `compiling`
 finds `compiled`. Stemming is exactly what must never touch a snippet — it turns `Serializes`
@@ -113,7 +113,9 @@ routed to `code`; a sentence naming `SnippetGenerator` without backticks stays i
 attachments, `system` records and a tool call's name and input — none of which is markdown to
 split at all. Tokenizing those the stock way would index `SnippetGenerator` as one opaque word
 and leave `snippet` unable to find it, which is the hole the `code` analyzer exists to close.
-A plain English word still emits once, stemmed. `thinking` keeps `code`: it is
+`context_text` takes `prose` for the reason its
+contents are: a title, an opening prompt and a branch name are English, and the shared `code`
+base still splits the identifiers inside them. A plain English word still emits once, stemmed. `thinking` keeps `code`: it is
 prose and snippets interleaved with no marker between them, so there is no split to make, and
 the analyzer that keeps identifiers intact loses least. `tool_output` keeps `code` for the same
 reason — a result is diagnostics, paths and program output, never a markdown message. And
@@ -338,6 +340,12 @@ pub struct Doc {
     /// the record that opened it. See "Turns" below. `#[serde(default)]`: travels in the carry.
     #[serde(default)]
     pub turn_seq: u64,
+    /// The text of the human prompt that opened this doc's turn, capped at `TURN_PROMPT_BYTES`
+    /// (240) on a word boundary. Only the parser can know it and only the carry can move it
+    /// across an incremental boundary; `schema::context_header` prepends it to `context_text`.
+    /// See "Contextual BM25" below. `#[serde(default)]`: travels in the carry.
+    #[serde(default)]
+    pub turn_prompt: Option<String>,
     pub session_id: String,
     pub agent_id: Option<String>,
     pub agent_type: Option<String>,
@@ -435,6 +443,11 @@ pub struct ParseCarry {
                                          // continues numbering instead of restarting it at
                                          // its own `seq_base`. `None` (an older state.json)
                                          // falls back to `seq_base`.
+    pub open_turn_prompt: Option<String>,// that same turn's opening prompt — `Doc::turn_prompt`
+                                         // for the docs the next tail emits. Carried for the
+                                         // same reason: the record it came from is behind the
+                                         // byte offset, and a tail that guessed would give the
+                                         // same document a different `context_text`.
 }
 
 /// Per-file inputs that are not the bytes of the file itself.
@@ -482,7 +495,12 @@ pub fn discover(roots: &[PathBuf]) -> anyhow::Result<Vec<TranscriptFile>>;
 ```rust
 pub struct Fields { /* one pub Field per name below */ }
 pub fn build_schema() -> (tantivy::schema::Schema, Fields);
-pub fn doc_to_json(doc: &Doc, include_thinking: bool) -> serde_json::Value; // feed to parse_json
+/// `session` is the merged `sessions.json` row for this doc's transcript; it is what the
+/// `context_text` header's session half is built from. `None` composes from the doc alone.
+pub fn doc_to_json(doc: &Doc, session: Option<&SessionInfo>, include_thinking: bool)
+    -> serde_json::Value;                       // feed to parse_json
+/// The `context_text` header for one document. See "Contextual BM25" below.
+pub fn context_header(doc: &Doc, session: Option<&SessionInfo>) -> Option<String>;
 ```
 
 Field names and options:
@@ -662,9 +680,9 @@ pub fn facets(index: &tantivy::Index, f: &Fields, field: &str, req: &SearchReque
     -> anyhow::Result<FacetResult>;
 ```
 
-Query semantics: the free-text query goes through `QueryParser` over `text`, `code`, `headings`
-and `tool_output` (+ `thinking` when opted in, + `tool_input`), so phrases, booleans and
-`field:value` all work. `tool_output` is a *default* field, not an opt-in one: the result text
+Query semantics: the free-text query goes through `QueryParser` over `text`, `code`, `headings`,
+`tool_output` and `context_text` (+ `thinking` when opted in, + `tool_input`), so phrases,
+booleans and `field:value` all work. `tool_output` is a *default* field, not an opt-in one: the result text
 used to live in `text`, and leaving it out would make a bare query stop matching what it always
 matched; `code` and `headings` are default for the mirror-image reason, since the split moved a
 message's snippets and titles out of `text`. `QueryParser` applies each field's own analyzer to
@@ -672,7 +690,8 @@ the query, so one word is stemmed against the prose fields and split into identi
 against the code ones — and a word that expands into several terms becomes a positional query,
 which is why every full-text field is indexed `WithFreqsAndPositions`. `headings` carries
 `set_field_boost(2.0)`: a section title says what the section is about, so a term in one is a
-better answer than the same term in the middle of a paragraph. **There is no fuzzy operator**:
+better answer than the same term in the middle of a paragraph. `context_text` carries
+`set_field_boost(0.3)`, for the mirror-image reason — see "Contextual BM25". **There is no fuzzy operator**:
 `~` is phrase slop in Tantivy 0.26 and `set_field_fuzzy` is deliberately not wired
 up, so do not advertise `term~1`. A query that fails to parse falls back to
 `parse_query_lenient`, and the discarded errors are logged at WARN — a typo'd field name must
@@ -751,6 +770,79 @@ tail would restart numbering at its own `seq_base` and the incremental result wo
 `turn_seq` for free — they are rebuilt from the carried `Doc`, and a late result only fills in
 `tool_output`. A `Reset` is handed no carry at all (`index::Job::file_context`), so a rewind or a
 `resetSessionFile()` cannot leave a tail continuing a turn out of bytes that no longer exist.
+
+### Contextual BM25
+
+Our documents are fragments torn out of a conversation, and a fragment is not retrievable by
+what it was *for*. A tool call indexes a tool name and the strings of its input — `Bash cargo
+build --release` — with no trace of what it was in aid of; half of all user messages are "yes",
+"do that", "still broken". Neither is reachable by anything a person would type. Anthropic's
+Contextual Retrieval measures the fix: prepending chunk-specific context before indexing cut
+top-20 retrieval failure from 5.7% to 3.7% on the embedding side, and the BM25 half of the same
+technique took the combination to 2.9%. The BM25 half needs no embeddings — it is an index-time
+text change to the lexical index we already have.
+
+`context_text` is that header, and every consequence follows from two words in its schema row:
+**indexed, not stored**. Not stored is why `search::doc_from_stored` cannot read it back, why no
+`SnippetGenerator` can highlight it, and why `format::doc_json` cannot print it — a property of
+the schema rather than a rule three call sites have to remember. It is *not* a change to `text`:
+a message's markdown is split into `text` / `code` / `headings` with `body` holding the original,
+and scaffolding injected into `text` would corrupt that split and leak into every snippet.
+
+**What is in it, cheapest first.** The session's title, then its first prompt, then the project
+path's *basename* (the whole path is already an exact-match field, and `/home/user/` is not a
+word anyone searches by), then the git branch, then the opening human prompt of the document's
+own turn. Pieces are joined with `" · "`, whitespace inside each is collapsed, and a piece equal
+to one already in the header is dropped — a session whose title *is* its opening prompt would
+otherwise hand those words a term frequency they did not earn, in every document it holds. The
+document that *is* its turn's opening prompt (`seq == turn_seq`) gets no turn piece at all: it
+would be indexing its own words a second time.
+
+**Where each piece is composed, and why it has to be in two places.**
+
+- The **per-turn** piece is known only to the parser, and on a tail parse the opening record is
+  almost always on the far side of the byte offset. So the parser tracks it beside
+  `Parser::current_turn` — set where `is_human_turn()` fires, cleared there too so a text-less
+  human turn cannot leave the previous prompt describing it — carries it in
+  `ParseCarry::open_turn_prompt`, and puts it on every doc of the turn as `Doc::turn_prompt`.
+  A `Doc` field rather than a side channel, so a completed tool call rebuilt from the carried
+  document keeps its header byte-identical for free.
+- The **per-session** pieces are *not* reliably known to a tail parse — the `summary` record and
+  the first prompt are behind the offset — but `index.rs` already maintains the merged
+  `SessionInfo` per path. So `consume()` merges the session row **before** it writes the
+  documents and hands that row to `doc_to_json`. The trade-off this leaves: a title that arrives
+  after a doc was indexed is not in that doc's header until the next `index --full`. That is the
+  bargain `sessions.json` was built on — a late title is a cheap JSON rewrite, not a doc rebuild
+  — and the `first_prompt` fallback is in the header from the very first parse, which is the
+  half that matters.
+- `project` and `git_branch` are already per-doc and need no carry.
+
+**The cap.** A long first prompt would dominate a short tool call's fieldnorm, so every piece
+has a budget — 100 bytes for each prose piece, 40 for a name — and the assembled header a hard
+ceiling of 400. The budgets sum below the ceiling on purpose (3 × 100 + 2 × 40 + separators =
+396): the ceiling is a backstop against a piece added later, not a knife, so the most
+document-specific piece — the turn's own prompt, composed last — is never the one a long session
+title crowds out. Every cut is on a word boundary as well as a char one
+(`parse::truncate_words`): a header is fed to the `prose` analyzer, so a cut through the middle
+of a word invents a term nobody types and still charges the document for it.
+
+**What it does to scoring.** Two effects, both deliberate.
+
+- *Fieldnorms.* A near-constant prefix on every document shifts `avgdl` and so changes BM25
+  length normalisation corpus-wide. Capping the header is what bounds the shift; the eval
+  harness that would quantify it does not exist yet, so there are no before/after numbers here
+  and none are claimed.
+- *IDF collapse.* Every document in a session shares a header, driving those terms toward 100%
+  document frequency *within* the session. `context_text` therefore carries
+  `set_field_boost(0.3)` — well below 1.0, because the header is a claim about what a document
+  was for and the body is what it says. Without the discount, scaffolding shared by a whole
+  session would reorder that entire session at once. With it, a document holding the term in its
+  body outranks the ones carrying it only in their header, which is asserted rather than argued.
+
+**Snippets.** A `context_text` match must never become the rendered snippet. It cannot — the
+field is not stored, so `snippet_from_doc` has nothing to read and `search()` builds no generator
+for it — but a hit matched *only* through its header still has to show something honest, and it
+falls through to the excerpt of its own body.
 
 `format.rs`:
 

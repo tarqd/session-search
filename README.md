@@ -264,6 +264,15 @@ The call and its result are separate fields, so you can ask about either one alo
 
 A bare query still spans the pair, so nothing that used to match stops matching.
 
+A bare query also spans one thing the transcript never said. Every document is indexed with a
+short **context header** beside its body — the session's title and opening prompt, the project,
+the branch, and the prompt that opened the document's own turn — so a message that reads "yes"
+and a `cargo build --release` that says nothing about what it was building are findable by what
+they were *for*. The header is scaffolding, not content: it is never stored, so it is never
+shown, never highlighted in a snippet, and never appears in `--json`. It is also weighted well
+below the body, so a document that genuinely discusses your term always outranks the ones that
+merely happened in the same session.
+
 ### 5. Read the conversation around a hit
 
 `--context N` pulls the surrounding turns in next to each hit:
@@ -1473,6 +1482,12 @@ code and capped independently of the body. Every one of these fields is searched
 query, and `tool_output:"No such file"` asks about what a tool *returned* rather than what it
 was asked to do.
 
+One more field is indexed and stored nowhere: `context_text`, a capped header naming the
+session, the project, the branch and the turn a document belongs to. It exists because a
+document is a fragment of a conversation and a fragment does not carry its own subject — see
+"Contextual BM25" in `docs/DESIGN.md`. Because it is not stored it can never be read back, so
+`show`, `--context` and `--json` print exactly what the transcript held.
+
 The index for this project's own development history:
 
 ```bash
@@ -1549,6 +1564,11 @@ entirely from `~/.claude/projects/`.
 A session's title arrives in a `summary` sidecar record that can be appended long after the
 messages it titles. Keeping session metadata in `sessions.json` means a late title update is a
 cheap JSON rewrite instead of a document rebuild.
+
+The one thing that bargain costs: the context header above is built when a document is written,
+so a title that only arrives afterwards is in `sessions.json` immediately and in that document's
+header at the next `--full`. The session's opening prompt is in the header from the first parse,
+which is the half that does the work.
 
 ---
 

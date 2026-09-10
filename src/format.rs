@@ -1196,6 +1196,7 @@ mod tests {
             source_path: "/home/u/.claude/projects/p/b20208d8.jsonl".into(),
             seq,
             turn_seq: 0,
+            turn_prompt: None,
             session_id: "b20208d8-fbdb-5918-ba69-d203de6ed6dc".into(),
             agent_id: None,
             agent_type: None,

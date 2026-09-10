@@ -82,6 +82,21 @@ pub struct Doc {
     /// `#[serde(default)]`: a `Doc` also travels inside [`ParseCarry`] in `state.json`.
     #[serde(default)]
     pub turn_seq: u64,
+    /// The text of the human prompt that opened this doc's turn, capped at
+    /// [`TURN_PROMPT_BYTES`]. It is the one piece of a document's context only the parser can
+    /// know: on a tail parse the opening record is nearly always on the far side of the
+    /// incremental boundary, so it travels in [`ParseCarry::open_turn_prompt`] the same way
+    /// `turn_seq` does. `schema::context_header` prepends it to the indexed-only
+    /// `context_text`, minus the doc that *is* the opening prompt, which would otherwise index
+    /// its own words twice.
+    ///
+    /// `#[serde(default)]`: a `Doc` also travels inside [`ParseCarry`] in `state.json`.
+    /// `skip_serializing_if`: the field is never stored, so a `Doc` read back out of the index
+    /// has nothing here, and a consumer that serializes the struct whole (the HTTP API) would
+    /// otherwise report `null` on every document — which reads as "this turn had no prompt",
+    /// not as "the header is not kept". A carried doc still round-trips: it has a value.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub turn_prompt: Option<String>,
     pub session_id: String,
     pub agent_id: Option<String>,
     pub agent_type: Option<String>,
@@ -267,6 +282,11 @@ pub struct ParseCarry {
     /// at its own `seq_base` and stops matching what a whole-file parse produces. `None` (a
     /// `state.json` from before this field) falls back to `seq_base`.
     pub open_turn_seq: Option<u64>,
+    /// The opening prompt of that same still-open turn — [`Doc::turn_prompt`] for the docs the
+    /// next tail emits. Carried for the same reason `open_turn_seq` is: the record it came
+    /// from sits in the already-consumed prefix, and a tail that guessed it would give the
+    /// same document a different `context_text` than a whole-file parse does.
+    pub open_turn_prompt: Option<String>,
 }
 
 /// One tool call whose document is in the index but whose result has not been read yet.
@@ -358,6 +378,14 @@ impl Default for ParseOptions {
 
 /// Prefix of the first human prompt kept on [`SessionInfo`].
 const FIRST_PROMPT_CHARS: usize = 500;
+
+/// How much of a turn's opening prompt rides on every document of that turn.
+///
+/// It is copied onto each doc and carried in `state.json`, so it is bounded twice over: an
+/// unbounded prompt would be duplicated across a whole turn's documents and would grow the
+/// carry a pending tool call has to fit inside ([`PENDING_DOC_CAP`]). `schema::context_header`
+/// trims it again to the share of the header it is allowed, so this only has to be small.
+const TURN_PROMPT_BYTES: usize = 240;
 
 /// Attachment subtypes whose text is pure noise or pure boilerplate. Everything not listed
 /// is indexed — the subtype universe is open, so the default must be "keep".
@@ -489,8 +517,13 @@ struct Parser<'a> {
     fallback_first_prompt: Option<String>,
     /// The turn the previous tail parse left open, from [`ParseCarry::open_turn_seq`].
     carried_open_turn: Option<u64>,
+    /// That turn's opening prompt, from [`ParseCarry::open_turn_prompt`].
+    carried_open_turn_prompt: Option<String>,
     /// `turn_seq` for every doc emitted from here on; set by `finish` as it walks the records.
     current_turn: u64,
+    /// [`Doc::turn_prompt`] for every doc emitted from here on, moved by the same records that
+    /// move `current_turn`.
+    current_turn_prompt: Option<String>,
 }
 
 impl<'a> Parser<'a> {
@@ -533,7 +566,9 @@ impl<'a> Parser<'a> {
             tail_line: ctx.carry.tail_line,
             fallback_first_prompt: None,
             carried_open_turn: ctx.carry.open_turn_seq,
+            carried_open_turn_prompt: ctx.carry.open_turn_prompt.clone(),
             current_turn: 0,
+            current_turn_prompt: None,
         }
     }
 
@@ -844,6 +879,7 @@ impl<'a> Parser<'a> {
         // A tail continues the turn the last run left open; a whole-file parse — or a file
         // that opens mid-conversation — starts in a synthetic turn numbered `seq_base`.
         self.current_turn = self.carried_open_turn.unwrap_or(seq_base);
+        self.current_turn_prompt = self.carried_open_turn_prompt.take();
 
         for line in &lines {
             self.absorb_metadata(&line.parsed);
@@ -855,6 +891,10 @@ impl<'a> Parser<'a> {
                     // and meta turns are `user` records too; the predicate excludes them.
                     if u.is_human_turn() {
                         self.current_turn = seq;
+                        // The prompt travels with the turn, so it has to be cleared here and
+                        // not only refilled below: a human turn whose message carries no text
+                        // would otherwise leave the previous turn's prompt describing it.
+                        self.current_turn_prompt = None;
                     }
                     self.user_docs(u, &mut emitted)
                 }
@@ -954,6 +994,7 @@ impl<'a> Parser<'a> {
             charged_message_ids: tail_of(self.charged_order.clone(), CARRY_CAP),
             tail_line: self.tail_line,
             open_turn_seq: Some(self.current_turn),
+            open_turn_prompt: self.current_turn_prompt.clone(),
         }
     }
 
@@ -1142,6 +1183,12 @@ impl<'a> Parser<'a> {
 
     fn note_first_prompt(&mut self, u: &UserRecord, text: &str) {
         let text = &*media::scrub(text);
+        if u.is_human_turn() {
+            // This record opened the turn `finish` just switched to, so its text is what every
+            // document of that turn is *about* — the referent half of all user messages
+            // ("yes", "do that", "still broken") do not carry themselves.
+            self.current_turn_prompt = Some(truncate_words(text, TURN_PROMPT_BYTES));
+        }
         if self.session.first_prompt.is_none() && u.is_human_turn() {
             self.session.first_prompt = Some(truncate_chars(text, FIRST_PROMPT_CHARS));
         }
@@ -1392,6 +1439,7 @@ impl<'a> Parser<'a> {
             source_path: self.session.source_path.clone(),
             seq,
             turn_seq: self.current_turn,
+            turn_prompt: self.current_turn_prompt.clone(),
             session_id,
             agent_id,
             agent_type,
@@ -1830,6 +1878,28 @@ fn truncate(s: &str, max: usize) -> String {
         end -= 1;
     }
     s[..end].to_string()
+}
+
+/// Truncate to at most `max` bytes on a **word** boundary as well as a char one.
+///
+/// A context header is prose fed to the `prose` analyzer, and a cut through the middle of a
+/// word invents a term: `tokeni` is not `tokenizer`, it matches nothing anybody types, and it
+/// still costs the document a slot in its field length. A single word longer than the whole
+/// budget is the one case with no word boundary to fall back to, and is cut where the chars
+/// allow.
+pub(crate) fn truncate_words(s: &str, max: usize) -> String {
+    if s.len() <= max {
+        return s.trim_end().to_string();
+    }
+    let cut = truncate(s, max);
+    // The cut already landed between two words: nothing was broken, so nothing is dropped.
+    if s[cut.len()..].starts_with(char::is_whitespace) {
+        return cut.trim_end().to_string();
+    }
+    match cut.rfind(char::is_whitespace) {
+        Some(i) if !cut[..i].trim_end().is_empty() => cut[..i].trim_end().to_string(),
+        _ => cut,
+    }
 }
 
 fn truncate_chars(s: &str, max_chars: usize) -> String {
@@ -3674,6 +3744,159 @@ mod tests {
             text_of(&out.docs[2]),
             "answering the second",
             "the second turn opens on the answer, because the prompt indexed nothing"
+        );
+    }
+
+    /// The cap on a turn's opening prompt, and why it cuts where it does.
+    ///
+    /// A header is fed to the `prose` analyzer, so a cut through the middle of a word invents a
+    /// term nobody types and still charges the document for it; and a cut through the middle of
+    /// a multi-byte char would panic on the slice rather than merely index badly.
+    #[test]
+    fn a_capped_prompt_ends_on_a_whole_word() {
+        assert_eq!(
+            truncate_words("fix the tokenizer", 100),
+            "fix the tokenizer"
+        );
+        // The budget lands inside `tokenizer`, so the partial word goes.
+        assert_eq!(truncate_words("fix the tokenizer", 10), "fix the");
+        // ...and when it lands exactly on the gap, nothing was broken and nothing is dropped.
+        assert_eq!(truncate_words("fix the tokenizer", 7), "fix the");
+        assert_eq!(truncate_words("fix the tokenizer", 8), "fix the");
+        // A single word longer than the whole budget has no boundary to fall back to.
+        assert_eq!(truncate_words("supercalifragilistic", 5), "super");
+        // Multi-byte chars are never split, at any budget and in either branch.
+        let text = "héllo wörld ünicode";
+        for max in 0..text.len() + 4 {
+            let cut = truncate_words(text, max);
+            assert!(text.starts_with(&cut), "{max}: {cut:?} is not a prefix");
+            assert!(cut.len() <= max.max(text.len()), "{max}: {cut:?}");
+        }
+    }
+
+    /// Every document of a turn carries the prompt that opened it, because that prompt is the
+    /// only thing in the transcript that says what "yes" was an answer to.
+    #[test]
+    fn every_doc_of_a_turn_carries_the_prompt_that_opened_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let out = parse_body(
+            dir.path(),
+            "turns.jsonl",
+            &[
+                r#"{"type":"user","uuid":"u1","sessionId":"s","cwd":"/p","origin":{"kind":"human"},"message":{"role":"user","content":"fix the tokenizer"}}"#,
+                r#"{"type":"assistant","uuid":"a1","sessionId":"s","cwd":"/p","message":{"role":"assistant","id":"m1","model":"mm","content":[{"type":"text","text":"on it"}]}}"#,
+                r#"{"type":"user","uuid":"u2","sessionId":"s","cwd":"/p","origin":{"kind":"human"},"message":{"role":"user","content":"yes"}}"#,
+                r#"{"type":"assistant","uuid":"a2","sessionId":"s","cwd":"/p","message":{"role":"assistant","id":"m2","model":"mm","content":[{"type":"text","text":"done"}]}}"#,
+                "",
+            ]
+            .join("\n"),
+        );
+        let prompts: Vec<Option<&str>> =
+            out.docs.iter().map(|d| d.turn_prompt.as_deref()).collect();
+        assert_eq!(
+            prompts,
+            [
+                Some("fix the tokenizer"),
+                Some("fix the tokenizer"),
+                Some("yes"),
+                Some("yes"),
+            ]
+        );
+        // The prompt travels with the turn, so the carry hands the *open* one to the next tail.
+        assert_eq!(out.carry.open_turn_prompt.as_deref(), Some("yes"));
+    }
+
+    /// A human turn whose message emits no document of its own must not leave the previous
+    /// turn's prompt describing it: the header would then claim the answer was about something
+    /// the reader never asked.
+    #[test]
+    fn a_new_turn_clears_the_previous_prompt_even_when_it_emits_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let out = parse_body(
+            dir.path(),
+            "empty-turn.jsonl",
+            &[
+                r#"{"type":"user","uuid":"u1","sessionId":"s","cwd":"/p","origin":{"kind":"human"},"message":{"role":"user","content":"fix the tokenizer"}}"#,
+                r#"{"type":"user","uuid":"u2","sessionId":"s","cwd":"/p","origin":{"kind":"human"},"message":{"role":"user","content":"   "}}"#,
+                r#"{"type":"assistant","uuid":"a1","sessionId":"s","cwd":"/p","message":{"role":"assistant","id":"m1","model":"mm","content":[{"type":"text","text":"done"}]}}"#,
+                "",
+            ]
+            .join("\n"),
+        );
+        let last = out.docs.last().unwrap();
+        assert_eq!(last.turn_seq, 1, "the blank record still opened a turn");
+        assert_eq!(
+            last.turn_prompt, None,
+            "a stale prompt would describe the wrong turn"
+        );
+    }
+
+    /// The convergence rule, applied to the turn prompt: a document whose turn opened before an
+    /// incremental boundary has to come out of a tail parse exactly as a whole-file parse would
+    /// produce it. The opening record is behind the offset, so only [`ParseCarry`] can supply it.
+    #[test]
+    fn a_tail_parse_gives_the_same_turn_prompt_as_a_whole_file_parse() {
+        let dir = tempfile::tempdir().unwrap();
+        let head = concat!(
+            r#"{"type":"user","uuid":"u1","sessionId":"s","cwd":"/p","origin":{"kind":"human"},"message":{"role":"user","content":"fix the markdown tokenizer"}}"#,
+            "\n",
+        );
+        let tail = concat!(
+            r#"{"type":"assistant","uuid":"a1","sessionId":"s","cwd":"/p","message":{"role":"assistant","id":"m1","model":"mm","content":[{"type":"text","text":"yes"}]}}"#,
+            "\n",
+        );
+        let path = dir.path().join("split-turn.jsonl");
+        std::fs::write(&path, head).unwrap();
+        let (first, offset) = parse_file(
+            &path,
+            0,
+            0,
+            &ParseOptions::default(),
+            &FileContext::default(),
+        )
+        .unwrap();
+
+        std::fs::write(&path, format!("{head}{tail}")).unwrap();
+        // Through serde, the way `index.rs` hands a carry to the next run: it lives in
+        // `state.json` between processes, so a field that does not survive the round trip is
+        // silently dropped and the tail quietly stops matching.
+        let carried: ParseCarry =
+            serde_json::from_str(&serde_json::to_string(&first.carry).unwrap()).unwrap();
+        let ctx = FileContext {
+            carry: carried,
+            ..FileContext::default()
+        };
+        let (second, _) = parse_file(
+            &path,
+            offset,
+            first.docs.len() as u64,
+            &ParseOptions::default(),
+            &ctx,
+        )
+        .unwrap();
+
+        let whole = parse_whole(&path, &ParseOptions::default()).unwrap();
+        assert_eq!(second.docs.len(), 1);
+        assert_eq!(second.docs[0].seq, whole.docs[1].seq);
+        assert_eq!(second.docs[0].turn_seq, whole.docs[1].turn_seq);
+        assert_eq!(
+            second.docs[0].turn_prompt.as_deref(),
+            Some("fix the markdown tokenizer")
+        );
+        assert_eq!(second.docs[0].turn_prompt, whole.docs[1].turn_prompt);
+
+        // Without the carry the tail has nothing to say what the answer answered.
+        let (naive, _) = parse_file(
+            &path,
+            offset,
+            1,
+            &ParseOptions::default(),
+            &FileContext::default(),
+        )
+        .unwrap();
+        assert_eq!(
+            naive.docs[0].turn_prompt, None,
+            "the defect the carry stops"
         );
     }
 }
