@@ -48,7 +48,11 @@ pub fn run(state: &State, req: AggregateRequest) -> anyhow::Result<AggregateResp
     // `until` rather than an `anyhow` chain surfacing from inside the search.
     let time_range = envelope::resolve_time_range(&req.filters)?;
 
-    // Second, and still before the searcher opens: an unknown field costs nothing to catch here
+    // Then the turn address, whole or not at all: half of one counts over the whole corpus while
+    // the echo says the buckets came from a single turn.
+    super::check_turn_address(&req.filters)?;
+
+    // Third, and still before the searcher opens: an unknown field costs nothing to catch here
     // and is expensive to catch late, where the only report available is an opaque one.
     //
     // The empty spelling gets its own sentence ahead of that. The schema declares `field`
@@ -582,6 +586,35 @@ mod tests {
             .downcast_ref::<crate::sessions::FilterError>()
             .expect("a bad date is a filter error");
         assert_eq!(filter_error.field, "since");
+    }
+
+    /// Counting inside one turn is the reason this filter is reachable from here at all — and
+    /// half an address does not count inside one turn, it counts over the whole corpus while the
+    /// echo names a turn. Refused at this call site too: one rule, and the tool that skips it is
+    /// the one nobody tests.
+    #[test]
+    fn half_a_turn_address_is_refused_before_anything_is_counted() {
+        let fx = fixture();
+        let err = run(
+            &fx.state,
+            request("tool_name", |r| r.filters.turn_seq = Some(3)),
+        )
+        .expect_err("half an address is not a request");
+        assert!(
+            err.downcast_ref::<crate::mcp::CallerError>().is_some(),
+            "a malformed address is the caller's mistake, not the server's: {err:#}"
+        );
+        // The whole pair is answerable, so the refusal is about the half and not about the
+        // filter: a turn that exists counts its own documents.
+        let out = run(
+            &fx.state,
+            request("tool_name", |r| {
+                r.filters.turn_of = Some("/nowhere/none.jsonl".into());
+                r.filters.turn_seq = Some(3);
+            }),
+        )
+        .expect("a whole address is a request, even when it matches nothing");
+        assert_eq!(out.facet.matching_docs, 0);
     }
 
     #[test]

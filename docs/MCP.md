@@ -169,6 +169,8 @@ The interesting part is the ranking, because nothing else in the codebase ranks 
 order cannot be read off the request. It follows from **how each filter is matched**, which is
 precisely what the caller cannot see:
 
+0. an address (`turn_of` + `turn_seq`) — an intersection naming one turn of one file. Every other
+   filter selects a set; this one selects a place, so nothing below it can be narrower;
 1. phrase over analyzed text (`tool_input`, `tool_output`) — adjacent, in order, unstemmed;
 2. exact term over an **open** vocabulary (`program`, `branch`, `model`, `tool`, `agent_type`,
    `lang`) — byte equality against a value reproduced from memory, so a silent zero whenever it
@@ -183,6 +185,15 @@ and the retry substitutes a legal value rather than dropping the filter. **Scope
 back:** `project` and the time window drop last, because dropping them does not widen the
 question, it answers a different one. A hit from another repository is not a better answer than
 zero; it is a wrong answer that reads like a right one.
+
+One filter is outside the ranking altogether. `all_records` only ever widens — it brings the
+apparatus records (attachments, `system` records, meta turns) back into a scope that excludes them
+by default — so it cannot be the cause of a zero, and naming it would tell a caller to drop the
+one thing holding the search open. It is still echoed as applied, because the retry is rebuilt
+from that echo and a retry that dropped it would search *less* than the call it is answering. What
+the scope did to a result is reported as a number instead: `search_turns` returns `hidden`, the
+count of documents the query matched and the default scope refused, which is the difference
+between a search that found nothing and a search that was not allowed to look.
 
 Three rules govern what the retry *does* with that diagnosis, because the message is prose a model
 may skim and the retry is an object it will send unread — where the two disagree, the retry wins in
@@ -218,16 +229,16 @@ nothing), a similarity seed whose every term fell outside the tuning, and a grou
 back short because the collapse window ran out before `limit` distinct turns did. Each was logged
 at WARN and nothing else. Over stdio there is no stderr the caller is reading, so a warning that
 only reaches `tracing` reaches nobody; they now travel on the response and land in the envelope.
-`search_sessions` carries the parallel list — the ten per-message filters `sessions.json` cannot
-answer — through the same channel, because a listing filtered by nine of ten filters looks exactly
-like a listing filtered by ten.
+`search_sessions` carries the parallel list — the twelve filters `sessions.json` cannot answer,
+the ten per-message ones plus both halves of the turn address — through the same channel, because
+a listing filtered by eleven of twelve filters looks exactly like a listing filtered by twelve.
 
 ## Errors: the caller's mistake, or the server's
 
 `ErrorData` is a JSON-RPC protocol error, which clients render opaquely and models often cannot
 act on. It is used **only** for requests that could not be started: a malformed date, a reference
-naming nothing, two addresses at once, a field this index cannot count, a `grep` that is not a
-regex. Everything a tool can answer, including "nothing matched", comes back as a normal result
+naming nothing, two addresses at once, half a turn address, a field this index cannot count, a
+`grep` that is not a regex. Everything a tool can answer, including "nothing matched", comes back as a normal result
 whose envelope explains itself.
 
 That distinction has to be made in exactly one place. Integrating the four tool bodies turned up

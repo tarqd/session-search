@@ -87,6 +87,9 @@ pub fn run(state: &State, req: SearchTurnsRequest) -> anyhow::Result<SearchTurns
     // where a caller cannot tell a bad date from an empty corpus — and the absolute window the
     // envelope echoes back does not exist until somebody has resolved it.
     let time_range = envelope::resolve_time_range(&req.filters)?;
+    // Second, and still before the index is opened: half a turn address narrows nothing, so a
+    // request carrying one would search the whole corpus and report the half back as applied.
+    super::check_turn_address(&req.filters)?;
 
     let request = SearchRequest {
         query: req.query.clone(),
@@ -118,6 +121,7 @@ pub fn run(state: &State, req: SearchTurnsRequest) -> anyhow::Result<SearchTurns
         total,
         elapsed_ms,
         mut warnings,
+        hidden,
         ..
     } = search::search(&state.index, &state.fields, &request)?;
 
@@ -170,6 +174,11 @@ pub fn run(state: &State, req: SearchTurnsRequest) -> anyhow::Result<SearchTurns
         returned: turns.len(),
         turns,
         total_documents: total,
+        // Carried through rather than recomputed. `search()` counts the refused set with one
+        // `Count` over the complement of the scope it applied, so a second opinion assembled
+        // here could disagree with the answer it is attached to — and the number's whole job is
+        // to be trusted when the page above it looks thin.
+        hidden,
         // `u128` on the way in because `Instant::elapsed` is; nothing this side of a hung index
         // reaches the saturation, and a wrapping cast would report an hour-long search as fast.
         elapsed_ms: u64::try_from(elapsed_ms).unwrap_or(u64::MAX),
@@ -419,6 +428,83 @@ mod tests {
         assert!(object.contains_key("source_path") && object.contains_key("turn_seq"));
         // And nothing about a page of hits is an occasion for a retry suggestion.
         assert!(out.envelope.no_results.is_none());
+    }
+
+    /// The number that separates "the corpus has nothing" from "the scope refused to look".
+    ///
+    /// A default-scoped search drops attachments, `system` records and meta turns, which on this
+    /// fixture is most of the file. Without `hidden` on the response, a caller reading a short
+    /// page has no way to tell that a fifth of the index was never consulted — and reports the
+    /// absence as a fact about the work rather than about the query.
+    #[test]
+    fn a_search_reports_how_many_documents_the_default_scope_refused() {
+        let fx = fixture(&[SESSION], 0);
+        let scoped = run(&fx.state, request("claude")).unwrap();
+        assert!(
+            scoped.hidden > 0,
+            "the fixture's attachment records match `claude`, so some were refused: hidden={}",
+            scoped.hidden
+        );
+
+        let mut widened = request("claude");
+        widened.filters.all_records = true;
+        let whole = run(&fx.state, widened).unwrap();
+        assert_eq!(
+            whole.hidden, 0,
+            "nothing was refused, so nothing is reported"
+        );
+        assert_eq!(
+            whole.total_documents,
+            scoped.total_documents + scoped.hidden,
+            "`hidden` counts exactly what the default scope held back"
+        );
+    }
+
+    /// Half a turn address narrows nothing, so a request carrying one must not be answered.
+    ///
+    /// `clap` pairs the two with `requires` and `api::dto` refuses half of one; nothing said it
+    /// over MCP, where `search::build_query` reads the pair together and silently ignores a lone
+    /// `turn_seq`. The answer that came back was the whole corpus — wider than the one asked
+    /// for, and indistinguishable from a search that was narrowed.
+    #[test]
+    fn half_a_turn_address_is_refused_rather_than_answered_over_the_whole_corpus() {
+        let fx = fixture(&[SESSION], 0);
+        let whole = run(&fx.state, request("claude")).unwrap();
+        let address = whole.turns[0].turn.clone();
+
+        for half in [
+            (Some(address.source_path.clone()), None),
+            (None, Some(address.turn_seq)),
+        ] {
+            let mut req = request("claude");
+            (req.filters.turn_of, req.filters.turn_seq) = half;
+            let err = run(&fx.state, req).expect_err("half an address is not a request");
+            assert!(
+                err.downcast_ref::<crate::mcp::CallerError>().is_some(),
+                "a malformed address is the caller's mistake, not the server's: {err:#}"
+            );
+            let rendered = format!("{err:#}");
+            assert!(
+                rendered.contains("turn_of") && rendered.contains("turn_seq"),
+                "{rendered}"
+            );
+        }
+
+        // And the whole pair is a request: it narrows to that one turn rather than being
+        // dropped, which is what makes the refusal above a repair and not just a refusal.
+        let mut addressed = request("claude");
+        addressed.filters.turn_of = Some(address.source_path.clone());
+        addressed.filters.turn_seq = Some(address.turn_seq);
+        let one = run(&fx.state, addressed).unwrap();
+        assert!(one.total_documents > 0, "the turn the hit came from");
+        assert!(
+            one.total_documents <= whole.total_documents,
+            "an address cannot match more than the search it narrows: {} vs {}",
+            one.total_documents,
+            whole.total_documents
+        );
+        assert_eq!(one.returned, 1, "one turn, addressed");
+        assert_eq!(one.turns[0].turn.turn_seq, address.turn_seq);
     }
 
     /// Two caps, two channels, and neither one implies the other: the byte budget stops the

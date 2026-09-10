@@ -297,9 +297,12 @@ impl Server {
     ///
     /// Reads session metadata, not the document index, so the per-message filters do not apply and
     /// are ignored with a warning rather than silently narrowing anything: `tool`, `tool_input`,
-    /// `tool_output`, `program`, `lang`, `model`, `role`, `kind`, `errors_only`, `min_thinking`.
+    /// `tool_output`, `program`, `lang`, `model`, `role`, `kind`, `errors_only`, `min_thinking`,
+    /// and the turn address `turn_of` + `turn_seq` — the coarsest thing this tool can return is a
+    /// whole session, so an address naming one turn inside one is not something a row can answer.
     /// What does apply is what a session has: `project`, `session`, `branch`, `agent_type`,
-    /// `since`, `until`, and the sidechain flags.
+    /// `since`, `until`, and the sidechain flags. `all_records` is neither: a listing has no
+    /// document scope to widen, so it changes nothing here and nothing was hidden from you.
     ///
     /// Not this tool when you need the content of what was said — take the session id from here and
     /// pass it to `search_turns` as the `session` filter, or `get_turn` for a specific turn. Not this
@@ -466,8 +469,8 @@ pub fn from_filter_error(err: &FilterError) -> ErrorData {
     invalid_params(format!("{err:#}"))
 }
 
-/// A request a tool could not start on: an address that names nothing, two addresses at once, a
-/// field this index cannot count, a `grep` that is not a regex.
+/// A request a tool could not start on: an address that names nothing, two addresses at once,
+/// half a turn address, a field this index cannot count, a `grep` that is not a regex.
 ///
 /// One type for all four tools rather than one per tool, because the classification is the same
 /// everywhere and [`from_anyhow`] has to recognise it: a second type is a second arm somebody

@@ -15,9 +15,11 @@
 //! # The ranking
 //!
 //! Nothing in the codebase ranks filters, and the order cannot be read off the request: it
-//! follows from *how* each filter is matched, which the caller cannot see. Four mechanisms, most
+//! follows from *how* each filter is matched, which the caller cannot see. Five mechanisms, most
 //! to least selective:
 //!
+//! 0. an address (`turn_of` + `turn_seq`) — an intersection naming one turn of one file. Every
+//!    other filter selects a set; this one selects a place, so nothing below it can be narrower;
 //! 1. phrase over analyzed text (`tool_input`, `tool_output`) — adjacent, in order, unstemmed;
 //! 2. exact term over an **open** vocabulary (`program`, `branch`, `model`, `tool`,
 //!    `agent_type`, `lang`) — byte equality against a value reproduced from memory, so a silent
@@ -37,6 +39,14 @@
 //!   them does not widen the question, it answers a different one. A hit from another repository
 //!   or another month is not a better answer than zero; it is a wrong answer that reads as a
 //!   right one.
+//!
+//! And one filter is outside the ranking altogether. `all_records` only ever widens — it brings
+//! the apparatus records (attachments, `system`, meta turns) back into scope — so it cannot be
+//! the cause of a zero, and naming it would tell a caller to drop the one thing holding the
+//! search open. It is still echoed as applied, because the retry is rebuilt from that echo and a
+//! retry that dropped it would search less than the call it is answering. What the scope did to
+//! a result is reported as a number instead: `hidden` on the `search_turns` response counts the
+//! documents the default scope refused.
 //!
 //! # What the retry does with the diagnosis
 //!
@@ -185,6 +195,40 @@ pub fn applied_filters(f: &Filters, range: &TimeRange) -> Vec<AppliedFilter> {
             resolved: range.until.clone(),
         });
     }
+    // Written straight into `out` rather than through `push`, like the two dates above it: the
+    // closure holds a mutable borrow of `out` from where it is defined to where it is last used.
+    //
+    // All three are echoed, and `all_records` is the one worth defending. It widens rather than
+    // narrows, so it looks like nothing a "filters applied" line needs to carry — but this echo
+    // is also what [`retry_body`] rebuilds the retry from, and a retry assembled without it
+    // would quietly re-narrow the scope the caller had opened. A suggested retry that searches
+    // less than the call it is answering is the one shape of advice nobody can debug.
+    if f.all_records {
+        out.push(AppliedFilter {
+            name: "all_records".into(),
+            value: json!(true),
+            resolved: None,
+        });
+    }
+    if let Some(v) = f
+        .turn_of
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        out.push(AppliedFilter {
+            name: "turn_of".into(),
+            value: json!(v),
+            resolved: None,
+        });
+    }
+    if let Some(n) = f.turn_seq {
+        out.push(AppliedFilter {
+            name: "turn_seq".into(),
+            value: json!(n),
+            resolved: None,
+        });
+    }
     if f.errors_only {
         out.push(AppliedFilter {
             name: "errors_only".into(),
@@ -264,10 +308,15 @@ pub struct Ranked {
 /// The narrowest filter the request actually set, per the drop order above. `None` when no
 /// filter is set at all — the query itself is then the only thing that can have failed.
 ///
-/// The order is exhaustive over [`Filters`] and stops at the first filter present, so it is a
-/// total function of the request and never depends on the corpus. That matters: a ranking that
-/// probed the index would take a second pass over the same query for every zero-hit answer, and
-/// would still be a guess.
+/// The order is exhaustive over [`Filters`] — every field but `all_records`, which is excluded
+/// on purpose and for the reason given at its place in the order — and stops at the first filter
+/// present, so it is a total function of the request and never depends on the corpus. That
+/// matters: a ranking that probed the index would take a second pass over the same query for
+/// every zero-hit answer, and would still be a guess.
+///
+/// `the_drop_order_is_exhaustive_and_stops_at_the_first_filter_set` reads the field list off
+/// `Filters` itself rather than repeating it, so a field added to that struct and forgotten here
+/// fails as a missing name instead of passing quietly.
 pub fn narrowest(f: &Filters) -> Option<Ranked> {
     // 1. `kind` / `role` with a value outside its legal set — statically provable.
     if let Some(v) = opt(&f.kind)
@@ -359,6 +408,36 @@ pub fn narrowest(f: &Filters) -> Option<Ranked> {
             contradicts: None,
         })
     };
+
+    // 3. The turn address. Narrower than anything below it and narrow in a different way: every
+    //    other filter selects a set, this one names a place — one turn of one file, ten to fifty
+    //    documents. It is ranked under `turn_of` because a `Ranked` names one filter and the
+    //    path is the half that carries the meaning; `retry_body` drops both, since half an
+    //    address is not a request.
+    if let Some(path) = opt(&f.turn_of)
+        && let Some(seq) = f.turn_seq
+    {
+        return rank(
+            "turn_of",
+            json!(path),
+            &format!(
+                "`turn_of` + `turn_seq` address one turn of one file — the narrowest filter \
+                 there is, and the only one that names a place rather than a set. A zero means \
+                 that turn does not contain the query terms; the address itself is rarely the \
+                 fault, since it came back from a `search_turns` hit. Dropping it asks the same \
+                 question of the whole corpus, and `get_turn` on the same pair (source_path \
+                 {path}, turn_seq {seq}) is how to read what the turn actually says instead of \
+                 searching inside it"
+            ),
+        );
+    }
+
+    // `all_records` is deliberately not in this order, and this note is here so that it cannot
+    // be added later by someone reading the list as a checklist of fields. It is the only filter
+    // that widens: setting it brings the apparatus records back into scope, so it can turn a
+    // zero into a hit and never the other way round. Naming it as the narrowest would tell a
+    // caller to drop the one thing holding the search open. `hidden` on the response is where
+    // the scope belongs in a zero-hit story, and it is a count rather than a suspicion.
 
     if !f.tool_input.is_empty() {
         return rank(
@@ -837,8 +916,8 @@ fn rarest_term<'a>(terms: &[&'a str]) -> &'a str {
 /// A ready-to-send arguments object for the same tool.
 ///
 /// Built from the request's parts rather than by serializing the request and deleting a key:
-/// `Filters` carries `#[serde(default)]`, not `skip_serializing_if`, so a round-trip emits all
-/// eighteen fields as nulls and empty arrays — a "ready-to-send retry" nobody would send.
+/// `Filters` carries `#[serde(default)]`, not `skip_serializing_if`, so a round-trip emits every
+/// one of its fields as nulls and empty arrays — a "ready-to-send retry" nobody would send.
 pub fn retry_body(ctx: &Context<'_>, ranked: Option<&Ranked>) -> Value {
     let drop = ranked
         .filter(|r| r.action != RetryAction::Fix)
@@ -846,12 +925,19 @@ pub fn retry_body(ctx: &Context<'_>, ranked: Option<&Ranked>) -> Value {
     let fix = ranked
         .filter(|r| r.action == RetryAction::Fix)
         .and_then(|r| r.fix_to.as_ref().map(|to| (r.filter, to)));
+    // One filter written in two fields: dropping `turn_of` alone would hand back a `turn_seq`
+    // with no path, which every front end refuses — a "ready-to-send" retry that cannot be sent.
+    let dropped = |name: &str| match drop {
+        Some("turn_of") => name == "turn_of" || name == "turn_seq",
+        Some(one) => name == one,
+        None => false,
+    };
     let mut map = serde_json::Map::new();
     if let Some(q) = ctx.query.map(str::trim).filter(|q| !q.is_empty()) {
         map.insert("query".into(), json!(q));
     }
     for applied in applied_filters(ctx.filters, &ctx.time_range) {
-        if Some(applied.name.as_str()) == drop {
+        if dropped(&applied.name) {
             continue;
         }
         let value = match fix {
@@ -1175,11 +1261,27 @@ mod tests {
         assert_eq!(narrowest(&f).expect("set").filter, "until");
     }
 
+    /// The filters this order deliberately does not rank, and why. See [`narrowest`].
+    const NOT_RANKED: &[&str] = &["all_records"];
+
     #[test]
     fn the_drop_order_is_exhaustive_and_stops_at_the_first_filter_set() {
         // Every filter, alone, ranks as itself: the order cannot skip one and silently blame a
         // filter the caller never sent.
+        //
+        // Coverage is checked against `Filters` itself, not against a count written here. The
+        // previous version of this test ended in `assert_eq!(cases.len(), 18)`, which is a
+        // statement about this list and not about the struct — so `all_records`, `turn_of` and
+        // `turn_seq` arrived on `main`, went unranked, and this test passed. A field added to
+        // `Filters` now fails the set comparison at the end, naming itself.
         let cases: Vec<(&str, Filters)> = vec![
+            (
+                "turn_of",
+                filters(|f| {
+                    f.turn_of = Some("/p/abc.jsonl".into());
+                    f.turn_seq = Some(12);
+                }),
+            ),
             ("tool_input", filters(|f| f.tool_input = vec!["k=v".into()])),
             (
                 "tool_output",
@@ -1205,10 +1307,23 @@ mod tests {
             ("until", filters(|f| f.until = Some("now".into()))),
             ("project", filters(|f| f.project = Some("/p".into()))),
         ];
-        assert_eq!(cases.len(), 18, "every Filters field is ranked");
+        let mut covered: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
         for (name, f) in &cases {
+            let fields = crate::search::testkit::filter_fields_set(f);
+            assert!(
+                fields.contains(*name),
+                "the case for `{name}` does not set it: {fields:?}"
+            );
             assert_eq!(narrowest(f).expect("one filter is set").filter, *name);
+            covered.extend(fields);
         }
+        covered.extend(NOT_RANKED.iter().map(|s| (*s).to_string()));
+        assert_eq!(
+            covered,
+            crate::search::testkit::filter_field_names(),
+            "every field of `Filters` is either ranked here or listed in NOT_RANKED with a \
+             reason at its place in the order"
+        );
 
         // And the full set ranks as the narrowest of all of them.
         let mut all = Filters::default();
@@ -1222,10 +1337,98 @@ mod tests {
         assert_eq!(ranked.filter, "no_sidechains");
         assert_eq!(ranked.contradicts, Some("sidechains_only"));
 
-        // With the flags settled, the phrase filter wins — `kind`/`role` are legal here, so the
-        // statically provable case does not fire either.
+        // With the flags settled, the turn address wins: it names one turn of one file, which
+        // no phrase over the whole corpus can be narrower than.
         all.no_sidechains = false;
+        assert_eq!(narrowest(&all).expect("set").filter, "turn_of");
+
+        // And with the address gone, the phrase filter — `kind`/`role` are legal here, so the
+        // statically provable case does not fire either.
+        all.turn_of = None;
+        all.turn_seq = None;
         assert_eq!(narrowest(&all).expect("set").filter, "tool_input");
+    }
+
+    #[test]
+    fn a_turn_address_outranks_every_other_filter_and_the_retry_drops_both_halves() {
+        // `turn_of` + `turn_seq` name one turn of one file — ten to fifty documents — so nothing
+        // that selects a set can be narrower, and a zero beside one is almost always "that turn
+        // does not say this" rather than "that filter is wrong".
+        let f = filters(|f| {
+            f.turn_of = Some("/home/u/.claude/projects/p/abc.jsonl".into());
+            f.turn_seq = Some(12);
+            f.tool_input = vec!["command=cargo".into()];
+            f.project = Some("/home/u/code".into());
+        });
+        let ranked = narrowest(&f).expect("a filter is set");
+        assert_eq!(ranked.filter, "turn_of");
+        assert_eq!(ranked.action, RetryAction::Drop);
+        // The one thing a model holding a turn reference most needs told, said where it will be
+        // read: the tool that returns the turn is `get_turn`, not this filter.
+        assert!(ranked.why.contains("get_turn"), "{}", ranked.why);
+
+        let corpus = corpus();
+        let c = ctx(Some("cargo"), &f, &corpus);
+        let none = build(&c, 0, Vec::new())
+            .no_results
+            .expect("zero carries a suggestion");
+        // Both halves are echoed: an address is what the caller sent and what they must be able
+        // to compare the answer against.
+        assert!(
+            none.message
+                .contains("turn_of=/home/u/.claude/projects/p/abc.jsonl"),
+            "{}",
+            none.message
+        );
+        assert!(none.message.contains("turn_seq=12"), "{}", none.message);
+        // And the retry drops both. A retry that kept `turn_seq` would be an ordinal with no
+        // path — refused by every front end, which is a suggestion nobody can send.
+        assert_eq!(
+            none.retry,
+            json!({
+                "query": "cargo",
+                "tool_input": ["command=cargo"],
+                "project": "/home/u/code",
+            }),
+            "{}",
+            none.message
+        );
+    }
+
+    #[test]
+    fn all_records_is_echoed_as_applied_but_is_never_blamed_for_the_zero() {
+        // It is the only filter that widens: it brings the apparatus records back into scope, so
+        // it can turn a zero into a hit and never the other way round. Blaming it would tell the
+        // caller to drop the one thing holding the search open.
+        let f = filters(|f| f.all_records = true);
+        assert!(
+            narrowest(&f).is_none(),
+            "a filter that only widens cannot be the narrowest cause of a zero"
+        );
+
+        // Echoed all the same, and that is not decoration: `retry_body` rebuilds the retry from
+        // the echo, so a filter missing there is a filter the retry silently drops — here, a
+        // suggested call that searches *less* of the index than the one it is answering.
+        let f = filters(|f| {
+            f.all_records = true;
+            f.program = vec!["Cargo".into()];
+        });
+        assert_eq!(narrowest(&f).expect("program is set").filter, "program");
+        let corpus = corpus();
+        let c = ctx(Some("cargo"), &f, &corpus);
+        let none = build(&c, 0, Vec::new())
+            .no_results
+            .expect("zero carries a suggestion");
+        assert_eq!(
+            none.retry,
+            json!({
+                "query": "cargo",
+                "program": ["cargo"],
+                "all_records": true,
+            }),
+            "{}",
+            none.message
+        );
     }
 
     fn merge(into: &mut Filters, from: &Filters) {
@@ -1246,6 +1449,9 @@ mod tests {
         into.agent_type = into.agent_type.clone().or_else(|| from.agent_type.clone());
         into.since = into.since.clone().or_else(|| from.since.clone());
         into.until = into.until.clone().or_else(|| from.until.clone());
+        into.all_records |= from.all_records;
+        into.turn_of = into.turn_of.clone().or_else(|| from.turn_of.clone());
+        into.turn_seq = into.turn_seq.or(from.turn_seq);
         into.errors_only |= from.errors_only;
         into.no_sidechains |= from.no_sidechains;
         into.sidechains_only |= from.sidechains_only;

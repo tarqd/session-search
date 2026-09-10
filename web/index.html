@@ -84,6 +84,16 @@
             </select>
           </label>
 
+          <label class="ss-select" for="group">
+            <span class="ss-select-label">show</span>
+            <!-- The result unit. `turn` is `groupBy: "turn"` on the wire; `none` omits the key
+                 entirely, which is the flat Search UI shape. -->
+            <select id="group">
+              <option value="turn">turns</option>
+              <option value="none">documents</option>
+            </select>
+          </label>
+
           <button id="refresh" class="ss-btn" type="button" title="Re-scan transcripts and index what changed">
             <svg class="ss-icon" viewBox="0 0 16 16" aria-hidden="true">
               <path
@@ -168,6 +178,9 @@
     <dialog id="drawer" class="ss-drawer" hidden aria-labelledby="drawer-title">
       <header class="ss-drawer-head">
         <h2 id="drawer-title" class="ss-drawer-title"></h2>
+        <!-- Match count and the two steppers, filled by app.js only when there are query
+             terms to step through. Empty on a filter-only browse, which has none. -->
+        <div id="drawer-nav" class="ss-drawer-nav"></div>
         <button id="drawer-close" class="ss-btn ss-btn-icon" type="button" aria-label="Close transcript">
           <svg class="ss-icon" viewBox="0 0 16 16" aria-hidden="true">
             <path d="M4 4l8 8M12 4l-8 8" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" />

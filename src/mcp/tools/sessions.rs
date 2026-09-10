@@ -56,13 +56,18 @@ pub fn run(state: &State, req: SearchSessionsRequest) -> anyhow::Result<SearchSe
     // 1. The window, before any file is read. `?` keeps the `FilterError` concrete all the way
     //    to `from_anyhow`, which downcasts it into `invalid_params` naming `since` or `until`.
     let time_range = envelope::resolve_time_range(&req.filters)?;
+    // 2. Half a turn address is refused here too, though this listing could not have answered a
+    //    whole one either. The two outcomes read differently and only one of them is true: a
+    //    warning saying `turn_seq` was ignored invites the caller to ask the same malformed
+    //    question of `search_turns`, where it would be refused.
+    super::check_turn_address(&req.filters)?;
 
-    // 2. What this listing was asked and cannot answer, taken from the request rather than from
+    // 3. What this listing was asked and cannot answer, taken from the request rather than from
     //    the result: a filter that could never have been applied is worth saying on a page of
     //    fifty rows exactly as much as on a zero, and the caller has no stderr to hear it on.
     let warnings = unanswerable_filter_notes(&req.filters, SearchSurface::McpTool);
 
-    // 3. The rows. `SessionMatcher` resolves the same two dates a second time against its own
+    // 4. The rows. `SessionMatcher` resolves the same two dates a second time against its own
     //    `now`, microseconds after `resolve_time_range` did — irrelevant at the resolution of a
     //    session's last activity, and the alternative is a second constructor on a type three
     //    front ends share.
@@ -91,7 +96,7 @@ pub fn run(state: &State, req: SearchSessionsRequest) -> anyhow::Result<SearchSe
     matched.truncate(req.limit);
 
     let sessions: Vec<SessionRow> = matched.into_iter().map(row).collect();
-    // 4. The filters the envelope is allowed to reason about: the ones this listing actually
+    // 5. The filters the envelope is allowed to reason about: the ones this listing actually
     //    applied. Everything the warnings above call ignored is cleared first, for the reason in
     //    `applied`'s own doc comment — an envelope over the raw request blames filters that
     //    narrowed nothing.
@@ -143,6 +148,11 @@ fn applied_filters(f: &Filters) -> Filters {
             "model" => applied.model = None,
             "role" => applied.role = None,
             "kind" => applied.kind = None,
+            // Both halves, always together: the envelope echoes them as two fields and a
+            // `turn_seq` left behind would be echoed as a filter this listing applied — and
+            // `narrowest` reads the pair, so half of one would rank as nothing at all.
+            "turn_of" => applied.turn_of = None,
+            "turn_seq" => applied.turn_seq = None,
             "errors_only" => applied.errors_only = false,
             other => debug_assert!(
                 false,
@@ -422,10 +432,13 @@ mod tests {
 
     #[test]
     fn every_filter_this_listing_cannot_apply_is_cleared_before_the_envelope_sees_it() {
-        // The drift guard for `applied_filters`: the ten names come from
+        // The drift guard for `applied_filters`: the names come from
         // `sessions::unanswerable_filters`, and a filter added to that list without an arm to
-        // clear it would go back to being blamed for zeroes it did not cause. Everything a
-        // `Filters` can carry is set here, so the two lists are compared in full.
+        // clear it would go back to being blamed for zeroes it did not cause — the `debug_assert`
+        // in that match is what says so, and it only fires for a filter this request actually
+        // sets. So the request sets every field there is, checked against `Filters` itself rather
+        // than against a count: the previous version asserted `ignored.len() == 10` over a
+        // hand-written request, which is why `turn_of` and `turn_seq` could arrive unlisted.
         let (_tmp, state) = state_over(&[session("aaa", 1_700_000_000_000)]);
         let req = request(50, |f| {
             f.project = Some("/home/user/session-search".into());
@@ -443,11 +456,20 @@ mod tests {
             f.agent_type = Some("Explore".into());
             f.since = Some("2020-01-01".into());
             f.until = Some("2030-01-01".into());
+            f.all_records = true;
+            f.turn_of = Some("/home/user/.claude/projects/p/abc.jsonl".into());
+            f.turn_seq = Some(12);
             f.errors_only = true;
             f.no_sidechains = true;
+            f.sidechains_only = true;
         });
+        assert_eq!(
+            crate::search::testkit::filter_fields_set(&req.filters),
+            crate::search::testkit::filter_field_names(),
+            "this request must carry every filter, or a new one goes unchecked here"
+        );
         let ignored = crate::sessions::unanswerable_filters(&req.filters);
-        assert_eq!(ignored.len(), 10, "{ignored:?}");
+        assert_eq!(ignored.len(), 12, "{ignored:?}");
         let res = run(&state, req).expect("unanswerable filters are not errors");
 
         for name in ignored {
@@ -473,8 +495,47 @@ mod tests {
                 "agent_type",
                 "since",
                 "until",
-                "no_sidechains"
+                // Neither answered nor ignored: a listing has no document scope to widen, so
+                // `all_records` cost this caller nothing and warning about it would be noise.
+                // It is echoed because the retry is rebuilt from the echo.
+                "all_records",
+                "no_sidechains",
+                "sidechains_only"
             ]
+        );
+    }
+
+    /// A listing cannot answer a turn address at all — but half of one is refused rather than
+    /// warned about, and the difference matters. A warning saying `turn_seq` was ignored invites
+    /// the caller to ask the same malformed question of `search_turns`, where it is an error;
+    /// the refusal tells them the address is broken while they still hold both halves.
+    #[test]
+    fn half_a_turn_address_is_refused_here_too_rather_than_reported_as_ignored() {
+        let (_tmp, state) = state_over(&[session("aaa", 1_700_000_000_000)]);
+        let err = run(&state, request(50, |f| f.turn_seq = Some(3)))
+            .expect_err("half an address is not a request");
+        assert!(
+            err.downcast_ref::<crate::mcp::CallerError>().is_some(),
+            "a malformed address is the caller's mistake, not the server's: {err:#}"
+        );
+
+        // A whole one is answered — as a warning, because a row is a session and an address
+        // names a turn inside one.
+        let res = run(
+            &state,
+            request(50, |f| {
+                f.turn_of = Some("/home/user/.claude/projects/p/abc.jsonl".into());
+                f.turn_seq = Some(3);
+            }),
+        )
+        .expect("an unanswerable filter is not an error");
+        assert_eq!(res.total, 1, "the listing was not narrowed by it");
+        let warned: Vec<&String> = res.envelope.warnings.iter().collect();
+        assert_eq!(warned.len(), 2, "one note per half: {warned:?}");
+        assert!(warned[0].starts_with("`turn_of` was ignored"), "{warned:?}");
+        assert!(
+            warned[1].starts_with("`turn_seq` was ignored"),
+            "{warned:?}"
         );
     }
 

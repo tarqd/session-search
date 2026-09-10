@@ -389,6 +389,23 @@ pub struct SearchTurnsResponse {
     pub total_documents: usize,
     /// How many turns this page actually carries.
     pub returned: usize,
+    /// Documents this query matched and the default scope refused: attachments, `system`
+    /// records and meta turns. `0` when `all_records` or an explicit `role` is set, because
+    /// nothing was refused then.
+    ///
+    /// Here rather than left to [`crate::search::SearchResponse`] because this is the only
+    /// number that separates the two readings of a thin answer: `hidden: 0` means the corpus
+    /// has nothing more to give, and `hidden: 340` means the question was answered out of four
+    /// fifths of the index. Without it a caller reads the first out of the second and reports
+    /// "nothing was found" for a search that was not allowed to look.
+    #[schemars(description = "\
+Documents this query matched that the default scope refused — attachments (system reminders, \
+environment blocks, pasted file contents), `system` records and meta turns, which are excluded \
+unless `all_records` or an explicit `role` asks for them. `0` means nothing was refused, so \
+widening the scope cannot help. Anything else is the difference between a search that found \
+nothing and a search that was not allowed to look: retry with `all_records: true` before \
+reporting that the corpus has nothing.")]
+    pub hidden: usize,
     pub elapsed_ms: u64,
     pub envelope: Envelope,
 }

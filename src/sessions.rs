@@ -152,17 +152,30 @@ fn set(v: &Option<String>) -> Option<&str> {
 /// The filters that arrived and that a session listing cannot answer, in [`Filters`] declaration
 /// order.
 ///
-/// Ten of them, and the list is the *complement* of what [`SessionMatcher`] reads rather than a
-/// remembered subset — that is the whole point of it living beside the matcher. A
+/// Twelve of them, and the list is the *complement* of what [`SessionMatcher`] reads rather than
+/// a remembered subset — that is the whole point of it living beside the matcher. A
 /// [`SessionInfo`] is a per-transcript row: it holds a project, a branch, a session id, an agent
 /// type and two timestamps, and nothing about any individual message. So `tool`, `tool_input`,
 /// `tool_output`, `lang`, `min_thinking`, `program`, `model`, `role`, `kind` and `errors_only`
 /// have no column to be compared against, at any cost — they are not slow here, they are
 /// unanswerable.
 ///
-/// Silently dropping one is the outcome this refuses. A listing filtered by nine of ten filters
-/// looks exactly like a listing filtered by ten, and the caller reads "no session used that
-/// model" out of a result that means "that question cannot be asked here".
+/// `turn_of` and `turn_seq` are here for a sharper version of the same reason, and `turn_of` is
+/// the one that has to be argued: a row *does* carry a `source_path`, so half the address looks
+/// answerable. It is not. The pair names a turn, and the coarsest thing this listing can return
+/// is a whole session — matching the file alone would answer "the session that turn is in",
+/// which is a different question, and would report a narrowing that the ordinal never got. Half
+/// an answer to an address is indistinguishable from a whole one in the result.
+///
+/// `all_records` is the one filter that belongs to neither list. It is not answerable and not
+/// unanswerable: it widens the *document* scope, and a session listing has no document scope to
+/// widen. Every row of `sessions.json` is returned either way, so nothing was refused and
+/// nothing was dropped. Reporting it as ignored would be a warning about a loss that did not
+/// happen, which teaches a caller to skim past the warnings that describe real ones.
+///
+/// Silently dropping one is the outcome this refuses. A listing filtered by eleven of twelve
+/// filters looks exactly like a listing filtered by twelve, and the caller reads "no session
+/// used that model" out of a result that means "that question cannot be asked here".
 ///
 /// Names are the plain field names, not flags: `cli.rs` renders `--tool-input` and the HTTP API
 /// renders `tool_input`, and the spelling is the front end's business (see [`FilterError`]).
@@ -177,6 +190,8 @@ pub fn unanswerable_filters(f: &Filters) -> Vec<&'static str> {
         ("model", f.model.is_some()),
         ("role", f.role.is_some()),
         ("kind", f.kind.is_some()),
+        ("turn_of", f.turn_of.is_some()),
+        ("turn_seq", f.turn_seq.is_some()),
         ("errors_only", f.errors_only),
     ]
     .into_iter()
@@ -252,6 +267,88 @@ mod tests {
         f
     }
 
+    /// Everything a `Filters` can carry, set at once.
+    ///
+    /// `every_filter_is_answered_named_unanswerable_or_deliberately_neither` pins that this is
+    /// literally everything, against the struct rather than against a count — so a field added
+    /// to `Filters` cannot slip past the tests below by simply not being mentioned in them,
+    /// which is exactly how `all_records`, `turn_of` and `turn_seq` arrived unclassified.
+    fn every_filter_set() -> Filters {
+        filters_with(|f| {
+            f.project = Some("/home/user".into());
+            f.tool = vec!["Bash".into()];
+            f.tool_input = vec!["command=cargo".into()];
+            f.tool_output = vec!["No such file".into()];
+            f.lang = vec!["rust".into()];
+            f.min_thinking = Some(500);
+            f.program = vec!["cargo".into()];
+            f.branch = Some("main".into());
+            f.model = Some("claude-opus-5".into());
+            f.role = Some("assistant".into());
+            f.kind = Some("tool_call".into());
+            f.session = Some("b20208d8".into());
+            f.agent_type = Some("Explore".into());
+            f.since = Some("7d".into());
+            f.until = Some("now".into());
+            f.all_records = true;
+            f.turn_of = Some("/home/user/.claude/projects/p/abc.jsonl".into());
+            f.turn_seq = Some(12);
+            f.errors_only = true;
+            f.no_sidechains = true;
+            f.sidechains_only = true;
+        })
+    }
+
+    /// The filters a `SessionInfo` row can actually be compared against — what
+    /// [`SessionMatcher::matches`] reads, named here so the three-way split below is exhaustive.
+    const ANSWERED_BY_MATCHER: &[&str] = &[
+        "project",
+        "branch",
+        "session",
+        "agent_type",
+        "since",
+        "until",
+        "no_sidechains",
+        "sidechains_only",
+    ];
+
+    /// The filter that is neither answered nor unanswerable, and the reason it is neither.
+    ///
+    /// `all_records` widens the *document* scope, and a session listing has no document scope:
+    /// every row of `sessions.json` is returned with or without it, so nothing was refused and
+    /// nothing was dropped. Calling it ignored would warn about a loss that did not happen.
+    const INERT_HERE: &[&str] = &["all_records"];
+
+    #[test]
+    fn every_filter_is_answered_named_unanswerable_or_deliberately_neither() {
+        // The three buckets must partition `Filters` exactly. The two tests below check each
+        // bucket behaves; this one checks that no field is in none of them — the failure that
+        // has no symptom, because a filter nobody classified is a filter nobody warns about.
+        let all = every_filter_set();
+        assert_eq!(
+            crate::search::testkit::filter_fields_set(&all),
+            crate::search::testkit::filter_field_names(),
+            "the fixture must set every field of `Filters`, or the split below is not exhaustive"
+        );
+
+        let mut covered: std::collections::BTreeSet<String> = unanswerable_filters(&all)
+            .into_iter()
+            .map(str::to_string)
+            .collect();
+        for name in ANSWERED_BY_MATCHER.iter().chain(INERT_HERE) {
+            assert!(
+                covered.insert((*name).to_string()),
+                "`{name}` is both answered here and reported as unanswerable"
+            );
+        }
+        assert_eq!(
+            covered,
+            crate::search::testkit::filter_field_names(),
+            "every field of `Filters` is answered by the matcher, named unanswerable, or listed \
+             in INERT_HERE with a reason"
+        );
+    }
+
     #[test]
     fn the_unanswerable_filter_list_is_the_same_on_both_front_ends() {
         // Everything a `Filters` can carry, set at once: the answer is the complement of what
@@ -272,6 +369,9 @@ mod tests {
             f.agent_type = Some("Explore".into());
             f.since = Some("7d".into());
             f.until = Some("now".into());
+            f.all_records = true;
+            f.turn_of = Some("/home/user/.claude/projects/p/abc.jsonl".into());
+            f.turn_seq = Some(12);
             f.errors_only = true;
             f.no_sidechains = true;
         });
@@ -285,6 +385,11 @@ mod tests {
             "model",
             "role",
             "kind",
+            // Both halves of the address, never one: a row carries a `source_path`, so matching
+            // on `turn_of` alone would answer "the session that turn is in" and report a
+            // narrowing the ordinal never got. `all_records` is absent — see `INERT_HERE`.
+            "turn_of",
+            "turn_seq",
             "errors_only",
         ];
         assert_eq!(unanswerable_filters(&f), expected);
