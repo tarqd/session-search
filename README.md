@@ -930,8 +930,8 @@ cargo test
 ```
 
 ```
-running 177 tests
-test result: ok. 173 passed; 0 failed; 4 ignored; 0 measured; 0 filtered out; finished in 1.9s
+running 189 tests
+test result: ok. 185 passed; 0 failed; 4 ignored; 0 measured; 0 filtered out; finished in 2.2s
 ```
 
 The four ignored tests all need this machine's own `~/.claude/projects` and are the ones worth
@@ -942,6 +942,43 @@ on real data:
 ```bash
 cargo test --release -- --ignored --nocapture
 ```
+
+### Continuous integration
+
+[`.github/workflows/ci.yml`](.github/workflows/ci.yml) runs exactly the four commands above on
+every push to `main` and every pull request, as a single Linux job — `fmt`, then `clippy` with
+`-D warnings`, then `build --all-targets`, then `test`. The ignored four are not among them: a
+runner has no `~/.claude/projects`, so they stay a by-hand check.
+
+The crate resolves `~/.claude` through `$HOME`, which Windows does not set, so Windows is neither
+built nor tested. macOS is: `cargo test` runs there weekly (Mondays 07:00 UTC) and on demand via
+**Actions → CI → Run workflow**, rather than on every pull request, because macOS runners bill at
+ten times the Linux rate on a private repository.
+
+[`.github/dependabot.yml`](.github/dependabot.yml) proposes dependency bumps weekly and action
+bumps monthly. `Cargo.lock` is committed and every CI command passes `--locked`, so a dependency
+moves only in a pull request that has run the whole suite first.
+
+### Cutting a release
+
+[`.github/workflows/release.yml`](.github/workflows/release.yml) is driven by an annotated tag:
+
+```bash
+# Cargo.toml must already say 0.1.0 — the workflow refuses a tag that disagrees with it.
+git tag -a v0.1.0 -m 'v0.1.0'
+git push origin v0.1.0
+```
+
+It re-runs `fmt`, `clippy` and `test`, builds `x86_64-unknown-linux-gnu` and
+`aarch64-apple-darwin`, checks that each binary starts (`--version`), and publishes a GitHub
+Release carrying one `.tar.gz` per target plus a `SHA256SUMS` covering both. Each archive unpacks
+into its own directory holding the binary, the README and the LICENSE.
+
+The Linux binary is built on `ubuntu-22.04` rather than the newest image so that it needs only
+glibc 2.35 and runs on distributions older than the runner.
+
+**Actions → Release → Run workflow** does everything except publish: the archives land on the
+workflow run as artifacts, which is the way to check a packaging change without spending a tag.
 
 Two documents are worth reading before changing anything:
 

@@ -1,0 +1,21 @@
+version: 2
+updates:
+  # Cargo.lock is committed and CI builds with `--locked`, so a dependency only moves when
+  # a PR moves it — and that PR runs the full suite before anyone merges it.
+  - package-ecosystem: cargo
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+    open-pull-requests-limit: 5
+    groups:
+      # One PR for the routine semver-compatible drift, individual PRs for the rest.
+      patch-and-minor:
+        update-types: [patch, minor]
+
+  # The workflows pin actions to a major tag (`@v4`); this is what moves them to `@v5`.
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: monthly
+    open-pull-requests-limit: 3
