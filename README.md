@@ -383,6 +383,147 @@ session-search show b20208d8 --limit 1
 
 Raise `--limit` to replay more of it; `show <ID> --around <SEQ|UUID>` prints a window instead.
 
+### 6. One hit per turn, and turns without their output
+
+> The blocks in this section were captured against the two committed slices of that same session
+> — `tests/fixtures/real_main_slice.jsonl` and its subagent — rather than the whole thing, so
+> that anyone can reproduce them from a checkout. Same session, same ids; smaller corpus, so the
+> hit counts are smaller than in the sections above.
+
+Four documents describe one moment. A query for `transcript` matches the prompt that asked the
+question, the assistant text answering it, the `Bash` call it made and the output that came back
+— so a `--limit 5` spends itself on two conversations:
+
+```bash
+session-search search "transcript" --limit 5
+```
+
+```
+5 of 14 hits · 7 ms
+
+▌ b20208d8-fbdb-5918-ba69-d203de6ed6dc  wild-spinning-puppy  agent a10845c5ff9c7d4ec · Explore  (2 hits)
+▌ /home/user/session-search · claude/rust-mcp-session-indexing-67tza2 · 2026-09-09 19:09
+
+   1. 19:09:19  assistant  #6  2.12
+      I'll start by exploring the directory structure and the **transcript** store
+
+   3. 19:09:17  user       #0  1.67
+      Read-only investigation. Goal: exhaustively characterize the on-disk Claude Code session
+      **transcript** format so we can write a robust Rust parser for it. Be very thorough. Look at
+      /home/PLACEHOLDER/.claude/ (the user's Claude home
+
+▌ b20208d8-fbdb-5918-ba69-d203de6ed6dc  (3 hits)
+▌ /home/user/session-search · claude/rust-mcp-session-indexing-67tza2 · 2026-09-09 19:07
+
+   2. 19:07:19  assistant  #6  1.77
+      I'll start by exploring the repo and the actual session **transcript** format, then set up the
+      workflow
+   …
+```
+
+`--group-by-turn` collapses them. One hit per turn, anchored on the best-scoring document, with a
+count of what it is standing in for:
+
+```bash
+session-search search "transcript" --limit 5 --group-by-turn
+```
+
+```
+2 turns · 14 matching docs · 8 ms
+
+▌ b20208d8-fbdb-5918-ba69-d203de6ed6dc  wild-spinning-puppy  agent a10845c5ff9c7d4ec · Explore  (1 turn)
+▌ /home/user/session-search · claude/rust-mcp-session-indexing-67tza2 · 2026-09-09 19:09
+
+   1. 19:09:19  assistant  +10 in turn  #6  2.12
+      I'll start by exploring the directory structure and the **transcript** store
+
+▌ b20208d8-fbdb-5918-ba69-d203de6ed6dc  (1 turn)
+▌ /home/user/session-search · claude/rust-mcp-session-indexing-67tza2 · 2026-09-09 19:07
+
+   2. 19:07:19  assistant  +2 in turn  #6  1.77
+      I'll start by exploring the repo and the actual session **transcript** format, then set up the
+      workflow
+```
+
+The header line changes with it. `2 turns · 14 matching docs` counts two different things on
+purpose — the turns on this page, and the documents that matched — because `2 of 14 hits` would
+invite you to divide one by the other. `+10 in turn` is exact: it is every other matching
+document in that turn, not the ones that happened to fit in the fetch. Paging follows the same
+rule, so `--limit` and `--offset` count turns while grouping is on.
+
+**`--context skeleton`** answers the other half. `--context turn` shows the whole enclosing turn,
+which is the right window and the wrong size: tool output is most of the bytes in a transcript
+and almost none of the intent. A skeleton is that same turn as one line per document — what was
+asked, what was said, and every call's *signature* — with the results left out:
+
+```bash
+session-search search "transcript" --limit 2 --group-by-turn --context skeleton
+```
+
+```
+2 turns · 14 matching docs · 8 ms
+
+▌ b20208d8-fbdb-5918-ba69-d203de6ed6dc  wild-spinning-puppy  agent a10845c5ff9c7d4ec · Explore  (1 turn)
+▌ /home/user/session-search · claude/rust-mcp-session-indexing-67tza2 · 2026-09-09 19:09
+
+   1. 19:09:19  assistant  +10 in turn  #6  2.12
+      I'll start by exploring the directory structure and the **transcript** store
+      turn #0 · 11 docs
+      user: Read-only investigation. Goal: exhaustively characterize the on-disk Claude Code session tran…
+      attachment: environment <system-reminder> # Environment You have been invoked in the following envi…
+      attachment: model <system-reminder> You are powered by the model named Opus 5. The exact model ID i…
+      attachment: session_context <system-reminder> As you answer the user's questions, you can use the f…
+      attachment: date <system-reminder> Today's date is 2026-09-09. </system-reminder>
+      attachment: remote_session_change <system-reminder> Attribution for git commits and pull requests y…
+      assistant: I'll start by exploring the directory structure and the transcript store.
+      Bash(command=ls -la /home/PLACEHOLDER/.claude/ 2>&1 | head -50; echo "=== PROJECTS ==="; ls -la /ho…
+      Bash(command=ls -la /home/PLACEHOLDER/.claude/sessions/ /home/PLACEHOLDER/.claude/session-env/ /hom…
+      … +2 more doc(s) over the skeleton budget
+```
+
+Every call ends in a marker: `-> ok`, `-> no result` for a call whose result never reached the
+index, and — the one exception to "no output" — `-> error: ` followed by the *first line* of what
+failed. A failed call's error is the answer and the command that failed is only context, which is
+the whole point of `--errors-only`; the frames under that first line are what `show` is for.
+
+The saving is the point. As `--json`, the two commands above are 39,709 bytes and 6,197: the
+skeleton replaces the turn's documents rather than joining them, so what you pay for context
+drops by an order of magnitude. Measured across the whole eval corpus and both real captures, a
+turn's context costs 5,872 bytes on average and its skeleton 555 — 9.5%, recorded in
+[`EVAL.md` §5](docs/EVAL.md#5-turn-skeletons--issue-25). The hit itself is untouched: it is still
+the full document, with its own `body` and `tool_output`.
+
+`show` has the same rendering under `--turn --skeleton`:
+
+```bash
+session-search show b20208d8 --agent a10845 --around 6 --turn --skeleton
+```
+
+```
+▌ b20208d8-fbdb-5918-ba69-d203de6ed6dc  wild-spinning-puppy  agent a10845c5ff9c7d4ec · Explore
+▌ /home/user/session-search · claude/rust-mcp-session-indexing-67tza2 · 2026-09-09 19:09
+▌ turn #0 · 11 docs
+
+user: Read-only investigation. Goal: exhaustively characterize the on-disk Claude Code session tran…
+attachment: environment <system-reminder> # Environment You have been invoked in the following envi…
+attachment: model <system-reminder> You are powered by the model named Opus 5. The exact model ID i…
+attachment: session_context <system-reminder> As you answer the user's questions, you can use the f…
+attachment: date <system-reminder> Today's date is 2026-09-09. </system-reminder>
+attachment: remote_session_change <system-reminder> Attribution for git commits and pull requests y…
+assistant: I'll start by exploring the directory structure and the transcript store.
+Bash(command=ls -la /home/PLACEHOLDER/.claude/ 2>&1 | head -50; echo "=== PROJECTS ==="; ls -la /ho…
+Bash(command=ls -la /home/PLACEHOLDER/.claude/sessions/ /home/PLACEHOLDER/.claude/session-env/ /hom…
+… +2 more doc(s) over the skeleton budget
+```
+
+Both caps report themselves. `turn #0 · 11 docs` is the document cap on the window (`… of 347
+docs` when it bites), and `… +2 more doc(s) over the skeleton budget` is the byte cap on the
+skeleton — a rendering that stopped in the middle of a turn without saying so would read as a
+turn that stopped there.
+
+Two things a skeleton never contains, at any budget: tool output other than that one error line,
+and assistant thinking. Both stay behind the flags that already gate them.
+
 ### Images are described, not indexed
 
 Transcripts carry images inline, in the same fields prose lives in: a pasted screenshot is
@@ -905,36 +1046,42 @@ Arguments:
   [QUERY]  Query string: words, "phrases", AND/OR/NOT, `field:value`
 
 Options:
-      --facets <FIELD>      Comma-separated facet fields, e.g.
-                            `tool_name,code_lang,tool_input.file_path`
-      --index <DIR>         Index directory. Defaults to `$XDG_DATA_HOME/session-search` [env:
-                            SESSION_SEARCH_INDEX=]
-      --context <N|turn>    Also show N documents either side of each hit, or `turn` for the hit's
-                            whole enclosing turn — the prompt that opened it, what was tried, and
-                            what came back [default: 0]
-  -v, --verbose...          Raise the log level on stderr; repeatable (`-v` info, `-vv` debug,
-                            `-vvv` trace)
-      --limit <N>           [default: 20]
-      --no-color            Never colourise. Also honoured: a non-empty `$NO_COLOR`, and a non-tty
-                            stdout
-      --offset <N>          [default: 0]
-      --json                One JSON object on stdout instead of the human rendering
-      --no-refresh          Skip the incremental index refresh that normally runs first
-      --include-thinking    Search assistant thinking blocks too
-      --sort <ORDER>        Hit order. Relevance is meaningless without a query, so a filter-only
-                            search is worth ordering by time [default: relevance] [possible values:
-                            relevance, newest, oldest]
-      --similar-to <REF>    Rank by similarity to the turn a document reference names. REF is
-                            `SESSION:SEQ`, `SESSION:AGENT:SEQ`, a record uuid or a `doc_id` — any of
-                            them by unambiguous prefix. Composes with the query and with every
-                            filter
-      --similar-in <FIELD>  Which bodies of the source turn seed the similarity: `text` (the
-                            default), `code`, `tool_output`, `thinking`. Comma-separated. `thinking`
-                            additionally needs `--include-thinking` [possible values: text, code,
-                            tool_output, thinking]
-      --include-source      Keep the source turn in the results of a `--similar-to` search. It is
-                            left out by default, because it is the turn you are already looking at
-  -h, --help                Print help (see more with '--help')
+      --facets <FIELD>             Comma-separated facet fields, e.g.
+                                   `tool_name,code_lang,tool_input.file_path`
+      --index <DIR>                Index directory. Defaults to `$XDG_DATA_HOME/session-search`
+                                   [env: SESSION_SEARCH_INDEX=]
+      --context <N|turn|skeleton>  Also show N documents either side of each hit, `turn` for the
+                                   hit's whole enclosing turn — the prompt that opened it, what was
+                                   tried, and what came back — or `skeleton` for that same turn as
+                                   one line per document: call signatures with no output, except the
+                                   first line of a failed one [default: 0]
+  -v, --verbose...                 Raise the log level on stderr; repeatable (`-v` info, `-vv`
+                                   debug, `-vvv` trace)
+      --group-by-turn              Collapse hits that share a turn into one, keeping the
+                                   best-scoring member and reporting how many others matched.
+                                   `--limit` and `--offset` then count turns
+      --no-color                   Never colourise. Also honoured: a non-empty `$NO_COLOR`, and a
+                                   non-tty stdout
+      --limit <N>                  [default: 20]
+      --offset <N>                 [default: 0]
+      --json                       One JSON object on stdout instead of the human rendering
+      --no-refresh                 Skip the incremental index refresh that normally runs first
+      --include-thinking           Search assistant thinking blocks too
+      --sort <ORDER>               Hit order. Relevance is meaningless without a query, so a
+                                   filter-only search is worth ordering by time [default: relevance]
+                                   [possible values: relevance, newest, oldest]
+      --similar-to <REF>           Rank by similarity to the turn a document reference names. REF is
+                                   `SESSION:SEQ`, `SESSION:AGENT:SEQ`, a record uuid or a `doc_id` —
+                                   any of them by unambiguous prefix. Composes with the query and
+                                   with every filter
+      --similar-in <FIELD>         Which bodies of the source turn seed the similarity: `text` (the
+                                   default), `code`, `tool_output`, `thinking`. Comma-separated.
+                                   `thinking` additionally needs `--include-thinking` [possible
+                                   values: text, code, tool_output, thinking]
+      --include-source             Keep the source turn in the results of a `--similar-to` search.
+                                   It is left out by default, because it is the turn you are already
+                                   looking at
+  -h, --help                       Print help (see more with '--help')
 ```
 
 Plus the filter block above.
@@ -1170,6 +1317,8 @@ Options:
       --turn              Snap the `--around` window to the enclosing turn instead of counting
                           documents with `--before`/`--after`. Capped by `--limit`, and what the cap
                           left out is reported
+      --skeleton          Render the `--turn` window as a skeleton: one line per document, call
+                          signatures with no output, except the first line of a failed one
       --before <N>        [default: 3]
       --after <N>         [default: 3]
       --limit <N>         [default: 200]
@@ -1293,6 +1442,36 @@ session-search search "aggregation" -t Bash --limit 1 --json --facets tool_name
   "total": 27
 }
 ```
+
+`--group-by-turn` and `--context skeleton` each add one key to a hit. `collapsed` is the number
+of other matching documents in the anchor's turn — present only when it is non-zero, so an
+ordinary search grows no column of `0`s. `skeleton` **replaces** `context`, because sending both
+would undo the only thing it is for:
+
+```bash
+session-search search "transcript" --limit 1 --group-by-turn --context skeleton --json
+```
+
+```json
+{
+  "collapsed": 10,
+  "context_turn": { "turn_seq": 0, "shown": 11, "docs_in_turn": 11, "truncated": false },
+  "skeleton": {
+    "bytes": 1586,
+    "dropped": 2,
+    "lines": [
+      "user: Read-only investigation. Goal: exhaustively characterize the on-disk Claude…",
+      "attachment: environment <system-reminder> # Environment You have been invoked in…",
+      "assistant: I'll start by exploring the directory structure and the transcript store.",
+      "Bash(command=ls -la /home/PLACEHOLDER/.claude/ 2>&1 | head -50; echo \"=== PROJECTS…"
+    ]
+  }
+}
+```
+
+(The hit's own fields are omitted from that excerpt, and the lines are cut for width. `bytes` is
+the rendered size of `lines`, and `dropped` is what the per-turn byte budget left out — the same
+fact `context_turn.truncated` reports for the document cap above it.)
 
 (Pretty-printed here; the real output is a single line. `snippet`, `source_path`, `text`,
 `tool_output` and `tool_input.command` are truncated with `…` for width — they are complete in
@@ -1710,6 +1889,11 @@ taking and returning the *same* structs the CLI already derives. `search.rs` was
 in mind — `Filters` derives `clap::Args` and `serde::Deserialize` side by side over plain
 `Option<String>`/`Vec<String>` fields, `SearchRequest` is pure serde data, and `--json` already
 emits the exact payloads the tools will return.
+
+`--group-by-turn` and `--context skeleton` were built for that surface before it exists. An agent
+pays for a search in context window, and the two together are what make a page of twenty results
+affordable: one hit per turn instead of four documents describing one moment, and each turn's
+context as a few hundred bytes of call signatures instead of its tool output in full.
 
 The [`http-api` feature](#the-web-ui-and-the-http-api) is the first instalment of that plan, and
 it worked: `serve` decodes a request into the same `SearchRequest` the CLI builds, hands it to the

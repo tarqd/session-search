@@ -34,6 +34,7 @@ mod fixture;
 mod metrics;
 mod report;
 mod similar;
+mod skeleton;
 
 use std::collections::BTreeSet;
 use std::path::PathBuf;
@@ -103,6 +104,34 @@ fn publish(name: &str, contents: &str) -> anyhow::Result<()> {
     std::fs::create_dir_all(&dir)?;
     std::fs::write(dir.join(name), contents)?;
     println!("{contents}");
+    Ok(())
+}
+
+/// Issue #25's acceptance number: skeleton bytes against full-turn bytes, on the real captures
+/// and the eval corpus, in the unit a caller pays in.
+///
+/// Snapshotted rather than merely printed. The ratio is the justification for the feature
+/// existing, so a change that quietly halves the saving — a wider budget, a second line per
+/// call, output creeping into a skeleton — has to show up as a diff someone approves.
+#[test]
+fn a_skeleton_costs_a_fraction_of_the_turn_it_describes() -> anyhow::Result<()> {
+    let rows = skeleton::measure()?;
+    assert!(!rows.is_empty(), "no transcripts were measured");
+
+    // The floor, set well below what the corpus scores so ordinary movement does not trip it.
+    // A skeleton that stopped being a fraction of the turn would still print a tidy table.
+    for row in &rows {
+        assert!(
+            row.percent() < 40.0,
+            "{} skeletons cost {:.1}% of the documents they stand in for",
+            row.label,
+            row.percent()
+        );
+    }
+
+    let table = skeleton::table(&rows);
+    publish("skeleton.md", &table)?;
+    insta::assert_snapshot!(table);
     Ok(())
 }
 

@@ -58,6 +58,15 @@ const HEADING_BOOST: Score = 2.0;
 /// Weight of a match in the `context_text` header. See `build_query`.
 const CONTEXT_BOOST: Score = 0.3;
 
+/// Documents fetched per requested turn when [`SearchRequest::group_by_turn`] is on.
+///
+/// A turn is 10–50 documents, but only the ones that *matched* compete for its slot, and the
+/// worst case — one turn owning the whole page — is the one this has to survive. Eight is
+/// generous for a message-level query and cheap regardless: `collector_limit` clamps the ask to
+/// the size of the index, and a document that never anchors a hit costs one stored-field read
+/// and no snippet work at all.
+const GROUP_FANOUT: usize = 8;
+
 #[derive(Debug, Clone, Default, clap::Args, serde::Serialize, serde::Deserialize)]
 #[serde(default)]
 pub struct Filters {
@@ -166,6 +175,18 @@ pub struct SearchRequest {
     /// caller has no way to tell "your reference was ambiguous" from "your query found
     /// nothing". `cli::run` resolves it with [`resolve_similar`] before building the request.
     pub similar_to: Option<SimilarSource>,
+    /// Collapse hits that share a turn into one, keeping the best-scoring member as the anchor.
+    ///
+    /// Off by default, because it changes what a hit *is*. A message-level query for "why did
+    /// the build fail" matches the prompt, the assistant text, the tool call and the result —
+    /// four hits describing one moment, and 40% of a `--limit 10` spent on it. Collapsing on
+    /// `(source_path, turn_seq)` dedupes that structurally, which is what a diversity rerank
+    /// exists to patch after the fact.
+    ///
+    /// Two things change with it on, each documented where it lands: [`Hit::collapsed`] says
+    /// how many other documents of the turn matched, and `offset` counts **turns** rather than
+    /// documents — a page of turns cannot be skipped by a number of documents.
+    pub group_by_turn: bool,
 }
 
 impl Default for SearchRequest {
@@ -181,6 +202,7 @@ impl Default for SearchRequest {
             include_thinking: false,
             sort: SortBy::Relevance,
             similar_to: None,
+            group_by_turn: false,
         }
     }
 }
@@ -290,14 +312,30 @@ pub struct Hit {
     /// ranges are recorded where the truth is, at the point the markers are written.
     #[serde(default)]
     pub snippet_marks: Vec<Range<usize>>,
+    /// Other documents of this hit's turn that matched the same query and were folded into it
+    /// by [`SearchRequest::group_by_turn`]. `0` whenever grouping is off.
+    ///
+    /// Counted against the whole matched set rather than against the fetched page: this is the
+    /// number of hits the anchor stands in for, and a count taken from the page would shrink
+    /// as the page filled up — the one reading under which "+3 more" is a lie.
+    #[serde(default)]
+    pub collapsed: u64,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct SearchResponse {
     pub hits: Vec<Hit>,
+    /// Documents matching the query and filters. **Not** the number of hits a grouped search
+    /// could return: grouping collapses the page, not the match set, and the distinct turns
+    /// behind that set are a second pass over all of it for a number nobody pages by.
+    /// [`SearchResponse::grouped`] is what tells a caller the two now mean different things.
     pub total: usize,
     pub facets: BTreeMap<String, FacetResult>,
     pub elapsed_ms: u128,
+    /// True when [`SearchRequest::group_by_turn`] collapsed the hits: every hit is one turn,
+    /// and `total` is still a document count.
+    #[serde(default)]
+    pub grouped: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -318,8 +356,20 @@ pub fn search(
     // user-supplied numbers abort the process — or overflow the addition — before a single
     // document is read. No request can return, or skip past, more documents than the index
     // holds, so that is the ceiling for both.
-    let top = TopDocs::with_limit(collector_limit(&searcher, req.limit))
-        .and_offset(req.offset.min(searcher.num_docs() as usize));
+    // Grouping pages in *turns*, so the document offset the collector applies would skip the
+    // wrong thing; the skip moves into the collapse loop below and the collector is asked for a
+    // window wide enough to hold `offset + limit` distinct turns. See `GROUP_FANOUT`.
+    let (wanted, doc_offset) = if req.group_by_turn {
+        (
+            req.limit
+                .saturating_add(req.offset)
+                .saturating_mul(GROUP_FANOUT),
+            0,
+        )
+    } else {
+        (req.limit, req.offset.min(searcher.num_docs() as usize))
+    };
+    let top = TopDocs::with_limit(collector_limit(&searcher, wanted)).and_offset(doc_offset);
 
     // Facet fields are validated up front so a typo is a clear error rather than a
     // Tantivy-internal one, and so the aggregation rides along in the same pass as the hits.
@@ -444,10 +494,29 @@ pub fn search(
     // an explicit `--limit 0` still means "no hits, just totals and facets".
     let top_hits = if req.limit == 0 { Vec::new() } else { top_hits };
 
-    let mut hits = Vec::with_capacity(top_hits.len());
+    let mut hits = Vec::with_capacity(top_hits.len().min(req.limit));
+    // The turns already anchored, in the order the collector handed them over: with grouping on
+    // the first document of a turn to arrive is its best-scoring one (or, under `--sort`, its
+    // earliest or latest), and every later one is folded into it.
+    let mut anchored: BTreeSet<(String, u64)> = BTreeSet::new();
+    let mut skipped = 0usize;
     for (score, address) in top_hits {
         let stored: TantivyDocument = searcher.doc(address)?;
         let doc = doc_from_stored(f, &stored);
+        if req.group_by_turn {
+            // `turn_seq` is a per-file ordinal, so the path is half the key: two transcripts
+            // sharing a session id (§9's `resetSessionFile()`) both have a turn #0.
+            if !anchored.insert((doc.source_path.clone(), doc.turn_seq)) {
+                continue;
+            }
+            if skipped < req.offset {
+                skipped += 1;
+                continue;
+            }
+            if hits.len() >= req.limit {
+                break;
+            }
+        }
         // Prose first, then code, then the tool result, then thinking: the prose is what a
         // reader recognises, and a highlight anywhere beats a head-of-body excerpt with no
         // highlight at all. Each carries the field it came from: the four read as different
@@ -476,7 +545,35 @@ pub fn search(
             snippet,
             snippet_field,
             snippet_marks,
+            collapsed: 0,
         });
+    }
+
+    // Counted after the page is chosen, and only for the anchors on it: one intersection of the
+    // query with a two-term turn lookup per hit, driven by the turn's own posting list, which is
+    // tens of documents. The alternative — counting members as they stream past — reports the
+    // fetch window instead of the match, and `GROUP_FANOUT` would silently become part of the
+    // contract.
+    if req.group_by_turn {
+        for hit in &mut hits {
+            hit.collapsed = collapsed_count(&searcher, f, &*query, &hit.doc)?;
+        }
+    }
+
+    // A turn the fetch window never reached cannot anchor a hit, and with grouping on that is
+    // the one way a page comes back short of `--limit` while documents are still matching.
+    if req.group_by_turn
+        && hits.len() < req.limit
+        && anchored.len() < req.limit.saturating_add(req.offset)
+        && total > collector_limit(&searcher, wanted)
+    {
+        tracing::warn!(
+            turns = anchored.len(),
+            docs_scanned = collector_limit(&searcher, wanted),
+            matching_docs = total,
+            "grouped page is short: the matched documents cluster into fewer turns than the \
+             collapse window reached. Raise --limit, or narrow the query."
+        );
     }
 
     // An unqualified `word:value` is a JSON-subpath lookup, so it cannot fail to parse — it
@@ -516,7 +613,28 @@ pub fn search(
         total,
         facets,
         elapsed_ms: started.elapsed().as_millis(),
+        grouped: req.group_by_turn,
     })
+}
+
+/// How many *other* documents of this document's turn matched `query`.
+///
+/// Exact, and deliberately not derived from the hits already in hand: the fetch window is a
+/// tuning constant, and a count taken from it would make "+12 more in this turn" mean "+12 that
+/// happened to fit", which shrinks as the page grows. `context::turn_query` is the same
+/// `(source_path, turn_seq)` intersection a turn window walks, so the two can never disagree
+/// about what a turn is.
+fn collapsed_count(
+    searcher: &Searcher,
+    f: &Fields,
+    query: &dyn Query,
+    doc: &Doc,
+) -> anyhow::Result<u64> {
+    let in_turn = crate::context::turn_query(f, &doc.source_path, doc.turn_seq);
+    let scoped = BooleanQuery::intersection(vec![query.box_clone(), Box::new(in_turn)]);
+    let matched = searcher.search(&scoped, &Count)?;
+    // The anchor itself is one of them.
+    Ok((matched as u64).saturating_sub(1))
 }
 
 /// A snippet generator for `field`, driven by the *whole* terms of the query — plus, on a
@@ -4994,5 +5112,249 @@ mod tests {
         assert_eq!(whole(code(), "assistant"), "assistant");
         assert_eq!(whole(prose(), "tool_use"), "toolus");
         assert_eq!(whole(code(), "tool_use"), "tooluse");
+    }
+
+    // -----------------------------------------------------------------------
+    // grouping by turn
+    // -----------------------------------------------------------------------
+
+    /// Three turns of the shape a debugging question really has: a prompt, the answer, and the
+    /// calls in between — every document of a turn carrying the word the query will ask for, so
+    /// an ungrouped search returns the turn several times over.
+    fn turns_about(word: &str, sizes: &[usize]) -> Vec<Doc> {
+        let mut docs = Vec::new();
+        let mut seq = 0u64;
+        for (turn, size) in sizes.iter().enumerate() {
+            let turn_seq = seq;
+            for member in 0..*size {
+                let mut d = blank_doc(seq);
+                d.turn_seq = turn_seq;
+                // Descending, so the best-scoring document of a turn is never its first: an
+                // anchor picked by position rather than by score would pass a test that only
+                // ever scored them equally.
+                let repeats = size - member;
+                d.text = vec![format!("turn{turn} {}", vec![word; repeats].join(" "))];
+                d.role = if member == 0 { "user" } else { "assistant" }.into();
+                docs.push(d);
+                seq += 1;
+            }
+        }
+        docs
+    }
+
+    #[test]
+    fn grouping_collapses_a_turn_to_its_best_document_and_says_how_many_it_stood_in_for() {
+        let docs = turns_about("memmap", &[4, 3, 2]);
+        let (index, f) = index_docs(&docs);
+
+        let plain = search(&index, &f, &req("memmap")).unwrap();
+        assert_eq!(plain.hits.len(), 9, "every document of every turn is a hit");
+        assert!(!plain.grouped);
+        assert!(plain.hits.iter().all(|h| h.collapsed == 0));
+
+        let grouped = search(
+            &index,
+            &f,
+            &SearchRequest {
+                group_by_turn: true,
+                ..req("memmap")
+            },
+        )
+        .unwrap();
+        assert!(grouped.grouped);
+        assert_eq!(grouped.hits.len(), 3, "one hit per turn");
+
+        // `total` still counts documents. That is the point of reporting `grouped` beside it:
+        // the two numbers answer different questions and neither is the other's page count.
+        assert_eq!(grouped.total, 9);
+
+        let turns: Vec<u64> = grouped.hits.iter().map(|h| h.doc.turn_seq).collect();
+        assert_eq!(turns, vec![0, 4, 7]);
+        // The anchor is the best-scoring member, which `turns_about` made the *first* document
+        // of each turn — the one that repeats the term most.
+        assert_eq!(
+            grouped.hits.iter().map(|h| h.doc.seq).collect::<Vec<_>>(),
+            vec![0, 4, 7]
+        );
+        // Four documents matched in the first turn, three in the second, two in the third; the
+        // anchor is one of them, so it stands in for the rest.
+        assert_eq!(
+            grouped.hits.iter().map(|h| h.collapsed).collect::<Vec<_>>(),
+            vec![3, 2, 1]
+        );
+    }
+
+    /// The count is of the *matched* set, not of the page. A turn whose members are spread
+    /// across a fetch window still reports all of them, and a `--limit 1` reports the same
+    /// number a `--limit 10` does.
+    #[test]
+    fn the_collapsed_count_does_not_depend_on_the_page_size() {
+        let docs = turns_about("memmap", &[6, 2]);
+        let (index, f) = index_docs(&docs);
+        let collapsed = |limit: usize| {
+            search(
+                &index,
+                &f,
+                &SearchRequest {
+                    group_by_turn: true,
+                    limit,
+                    ..req("memmap")
+                },
+            )
+            .unwrap()
+            .hits[0]
+                .collapsed
+        };
+        assert_eq!(collapsed(1), 5);
+        assert_eq!(collapsed(10), 5);
+    }
+
+    /// Only the documents that *matched* collapse. A turn is not a bucket of everything that
+    /// happened in it — `collapsed` is "hits this one is standing in for", so a document of the
+    /// same turn that the query never touched is not counted.
+    #[test]
+    fn only_matching_documents_collapse() {
+        let mut docs = turns_about("memmap", &[3]);
+        let mut unrelated = blank_doc(9);
+        unrelated.turn_seq = 0;
+        unrelated.text = vec!["turn0 something else entirely".into()];
+        docs.push(unrelated);
+        let (index, f) = index_docs(&docs);
+
+        let grouped = search(
+            &index,
+            &f,
+            &SearchRequest {
+                group_by_turn: true,
+                ..req("memmap")
+            },
+        )
+        .unwrap();
+        assert_eq!(grouped.hits.len(), 1);
+        assert_eq!(grouped.hits[0].collapsed, 2, "three matched, one anchors");
+        assert_eq!(grouped.total, 3);
+    }
+
+    /// `turn_seq` is a per-file ordinal, so the path is half the key. Two transcripts sharing a
+    /// session id (§9's `resetSessionFile()`) both hold a turn #0, and collapsing on the number
+    /// alone would merge two conversations into one hit.
+    #[test]
+    fn two_files_sharing_a_turn_number_are_two_turns() {
+        let mut docs = turns_about("memmap", &[2]);
+        let relocated: Vec<Doc> = docs
+            .iter()
+            .map(|d| Doc {
+                source_path: "/tmp/s1-relocated.jsonl".into(),
+                doc_id: format!("{}:relocated", d.doc_id),
+                ..d.clone()
+            })
+            .collect();
+        docs.extend(relocated);
+        let (index, f) = index_docs(&docs);
+
+        let grouped = search(
+            &index,
+            &f,
+            &SearchRequest {
+                group_by_turn: true,
+                ..req("memmap")
+            },
+        )
+        .unwrap();
+        assert_eq!(grouped.hits.len(), 2, "one hit per file, not one overall");
+        assert_eq!(
+            grouped.hits.iter().map(|h| h.collapsed).collect::<Vec<_>>(),
+            vec![1, 1],
+            "neither file's count leaks into the other"
+        );
+    }
+
+    /// Paging a grouped search pages turns. An offset in documents would skip *into* the first
+    /// turn and hand back the same turn again under a different anchor.
+    #[test]
+    fn a_grouped_offset_skips_turns_not_documents() {
+        let docs = turns_about("memmap", &[4, 3, 2]);
+        let (index, f) = index_docs(&docs);
+        let page = |limit: usize, offset: usize| {
+            search(
+                &index,
+                &f,
+                &SearchRequest {
+                    group_by_turn: true,
+                    limit,
+                    offset,
+                    ..req("memmap")
+                },
+            )
+            .unwrap()
+            .hits
+            .iter()
+            .map(|h| h.doc.turn_seq)
+            .collect::<Vec<_>>()
+        };
+        assert_eq!(page(2, 0), vec![0, 4]);
+        assert_eq!(page(2, 1), vec![4, 7]);
+        assert_eq!(page(2, 2), vec![7]);
+        assert_eq!(page(2, 3), Vec::<u64>::new());
+    }
+
+    /// A time-ordered grouped search has no scores to pick an anchor by, so the anchor is the
+    /// first document of the turn the ordering reaches — the newest one under `--sort newest`.
+    /// The turn is still collapsed, and still reports what it collapsed.
+    #[test]
+    fn grouping_survives_a_time_ordered_search() {
+        let docs = turns_about("memmap", &[3, 2]);
+        let (index, f) = index_docs(&docs);
+        let grouped = search(
+            &index,
+            &f,
+            &SearchRequest {
+                group_by_turn: true,
+                sort: SortBy::Newest,
+                ..req("memmap")
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            grouped.hits.iter().map(|h| h.doc.seq).collect::<Vec<_>>(),
+            vec![4, 2],
+            "the newest document of each turn anchors it, newest turn first"
+        );
+        assert_eq!(
+            grouped.hits.iter().map(|h| h.collapsed).collect::<Vec<_>>(),
+            vec![1, 2]
+        );
+    }
+
+    /// Grouping composes with the filters rather than sitting in front of them: `collapsed`
+    /// counts the documents that survived the whole query, not the documents in the turn.
+    #[test]
+    fn the_collapsed_count_respects_the_filters() {
+        let mut docs = turns_about("memmap", &[4]);
+        for d in docs.iter_mut().skip(2) {
+            d.role = "assistant".into();
+            d.kind = DocKind::ToolCall;
+            d.tool_name = Some("Bash".into());
+        }
+        let (index, f) = index_docs(&docs);
+
+        let grouped = search(
+            &index,
+            &f,
+            &SearchRequest {
+                group_by_turn: true,
+                filters: Filters {
+                    tool: vec!["Bash".into()],
+                    ..Filters::default()
+                },
+                ..req("memmap")
+            },
+        )
+        .unwrap();
+        assert_eq!(grouped.hits.len(), 1);
+        assert_eq!(
+            grouped.hits[0].collapsed, 1,
+            "two Bash calls matched, so the anchor stands in for one"
+        );
     }
 }

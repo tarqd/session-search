@@ -1,0 +1,14 @@
+---
+source: src/format.rs
+expression: rendered
+---
+▌ b20208d8-fbdb-5918-ba69-d203de6ed6dc  wild-spinning-puppy
+▌ [path] · claude/rust-mcp · [date]
+▌ turn #10 · 6 of 347 docs
+
+user: why did the release build start failing?
+assistant: Checking what the last green run did.
+Bash(command=cargo build --release, description=Reproduce it) -> ok
+Read(file_path=[path] -> ok
+Grep(path=src, pattern=register_tokenizer) -> ok
+assistant: The analyzer was renamed, so every field's tokenizer is missing.
