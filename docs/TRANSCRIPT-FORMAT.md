@@ -112,10 +112,12 @@ accounting by `message.id` or you multiply-count.
 `slug` (human-ish session nickname) appears on only *some* records. Do not require it.
 
 **Content block types seen:** `thinking` `{type,thinking,signature}`, `text` `{type,text}`,
-`tool_use` `{type,id,name,input,caller}`.
+`tool_use` `{type,id,name,input,caller}`, `image`
+`{type,source:{type:"base64",media_type,data}}` — a pasted screenshot, ~300 KB of base64 on the
+line. `source.type` is also `"url"` (`{url}`) and `"file"` (`{file_id}`); MCP flattens the same
+block to `{type:"image",data,mimeType}`. `document` carries a PDF the same way.
 **Exist in the bundle, not in the sample — must be tolerated:** `redacted_thinking`,
-`server_tool_use`, `web_search_tool_result`, `mcp_tool_use`, `image`, `document`,
-`search_result`.
+`server_tool_use`, `web_search_tool_result`, `mcp_tool_use`, `search_result`.
 
 `caller`: the only emitted form is `{"type":"direct"}`, absent on older records. Keep it
 `Option<Value>`.
@@ -185,6 +187,9 @@ Object shapes by tool:
 
 ```
 Bash:       {stdout, stderr, interrupted, isImage, noOutputExpected}
+            isImage:true means stdout IS the image bytes; stderr beside it is still text
+Read (bin): {type:"image"|"pdf"|"audio"|"video", file:{base64, type, originalSize, dimensions?}}
+            pdf adds file.filePath and pages:[{base64, mediaType}]
 Bash (bg):  {..., backgroundTaskId, backgroundCwdHint}
 Read:       {type:"text", file:{filePath,content,numLines,startLine,totalLines,truncatedByTokenCap?}, artifactRead?}
 Edit:       {filePath, oldString, newString, originalFile, structuredPatch, userModified, replaceAll,

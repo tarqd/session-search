@@ -108,6 +108,8 @@ Filter field names in the Search UI form map onto `Filters` like this. Anything 
 | `tool_name` / `tool`       | `tool`                 | repeatable, ORed                         |
 | `tool_output`              | `tool_output`          | repeatable, ANDed phrases                |
 | `tool_input.<path>`        | `tool_input`           | `values` become `<path>=<value>`         |
+| `code_lang` / `lang`       | `lang`                 | repeatable, ORed                         |
+| `bash_cmd.program` / `program` | `program`          | repeatable, ORed                         |
 | `project`                  | `project`              | prefix match; one value only             |
 | `model` `role` `kind`      | same                   | one value only                           |
 | `agent_type` `session_id`  | `agent_type` `session` | one value only                           |
@@ -130,7 +132,12 @@ Response:
   "results": [
     {
       "id": { "raw": "9f2c…:-:a41b:118" },
-      "text": { "raw": "…", "snippet": "…the <em>memmap</em> panic…" },
+      // `body` is the body as a reader saw it. `text` and `code` are the indexed halves of it,
+      // one entry per block, and cannot be reassembled into it — the split drops link
+      // destinations and keeps no record of where a fence sat. Render `body`.
+      "body": { "raw": "…the memmap panic…" },
+      "text": { "raw": ["…"], "snippet": "…the <em>memmap</em> panic…" },
+      "code": { "raw": ["…"] },
       "tool_name": { "raw": "Bash" },
       "tool_input": { "raw": { "command": "cargo test" } },
       "timestamp": { "raw": "2026-09-09T19:07:19.248Z" },
@@ -138,7 +145,10 @@ Response:
       "_meta": {
         "id": "9f2c…:-:a41b:118",
         "score": 12.4,
-        "snippetField": "text",   // text | tool_output | thinking — which body it was cut from
+        // text | code | tool_output | thinking — which body it was cut from. Four different
+        // claims: what the turn said, a snippet it quoted, what a command printed, what the
+        // model reasoned privately. The snippet is attached to that field above, too.
+        "snippetField": "text",
         "doc": { /* the whole document, `raw` line excluded — see ApiDoc */ }
       }
     }
@@ -173,6 +183,10 @@ so a stock Search UI `Result` component works without knowing anything about us.
 top-level key in the body, say. It is never used to paper over a bad filter or a bad sort;
 those are errors.
 
+The `snippet` sits on whichever field it was cut from, which is what `_meta.snippetField`
+names — so a hit matched in a command's output carries `tool_output.snippet`, not
+`text.snippet`. A stock Search UI template reading one fixed field should read `_meta` instead.
+
 `snippet` is **HTML**: the text is escaped first and the matched spans are then wrapped in
 `<em>`, which is the convention Elastic's own snippets follow (and what every Search UI
 template expects to `dangerouslySetInnerHTML`). The unescaped, `**`-marked form the CLI
@@ -187,8 +201,8 @@ Repeatable keys are repeated, not comma-joined (`?tool=Bash&tool=Read`).
 
 ```
 q, page, size, offset, sort, facets (comma-separated), facet_top, snippet_chars,
-include_thinking, project, tool, tool_input, tool_output, min_thinking, branch, model,
-role, kind, session, agent_type, since, until, errors_only, no_sidechains, sidechains_only
+include_thinking, project, tool, tool_input, tool_output, lang, program, min_thinking, branch,
+model, role, kind, session, agent_type, since, until, errors_only, no_sidechains, sidechains_only
 ```
 
 An unrecognised parameter is a `400` listing what is accepted. A typo'd filter that

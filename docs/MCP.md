@@ -33,7 +33,7 @@ a stdio server does not need.
 
 ```
 search    -> SearchResponse       full-text search, optional facets
-facets    -> Vec<FacetCount>      count a fast field or any tool_input.<path>
+facets    -> Vec<FacetCount>      a fast field, a tool_input.<path>, or bash_cmd.program
 show      -> Vec<Doc>             a session, or a window around one hit
 sessions  -> Vec<SessionInfo>     list indexed sessions
 stats     -> IndexStats           index statistics
@@ -65,6 +65,10 @@ pub struct Filters {
     /// Tool name; repeatable.
     #[arg(short = 't', long, value_name = "NAME")]
     pub tool: Vec<String>,
+    /// Program run by a Bash command — any simple command in the script, e.g.
+    /// `--program cargo`; repeatable, OR.
+    #[arg(long, value_name = "NAME")]
+    pub program: Vec<String>,
     …
 }
 ```
@@ -85,6 +89,13 @@ That is tolerable at a shell prompt, where you see the zero and retry. It is wor
 which will read "0 results" as a fact about the corpus. The MCP schema should therefore constrain
 those two fields with a schemars `enum` even though clap does not — the one place the front ends
 should legitimately differ.
+
+`program` has a milder version of the same problem: it is matched against `bash_cmd.program`,
+which is indexed with the `raw` tokenizer, so `"Cargo"` and `"cargo build"` are silent zeroes
+where `"cargo"` is a hit. The field's description should say so, since an agent cannot see the
+tokenizer. The `facets` tool has the matching gain: `bash_cmd.program` and `bash_cmd.args` are
+aggregatable JSON paths like any `tool_input.<path>`, so "which programs does this project run"
+needs no new tool.
 
 ## Two recorded traps
 

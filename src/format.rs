@@ -184,17 +184,28 @@ fn hit_json(hit: &Hit, context: &[Doc]) -> Value {
 /// **A failed call shows its result first.** `--errors-only` otherwise retrieves exactly the
 /// right documents and previews the command that failed rather than the reason it broke — the
 /// error is the answer there, and the input is only context.
-fn doc_body(d: &Doc) -> &str {
-    let (first, second) = if d.is_error {
-        (d.tool_output.as_deref(), Some(d.text.as_str()))
-    } else {
-        (Some(d.text.as_str()), d.tool_output.as_deref())
-    };
-    [first, second, d.thinking.as_deref()]
-        .into_iter()
-        .flatten()
-        .find(|b| !b.trim().is_empty())
-        .unwrap_or("")
+fn doc_body(d: &Doc) -> String {
+    // A failed call leads with its result: `--errors-only` shows the reason it broke, not the
+    // heredoc that broke. This is a rendering rule, not a storage one — nothing is reordered
+    // underneath a query.
+    let output = d.tool_output.as_deref().filter(|s| !s.trim().is_empty());
+    if d.is_error
+        && let Some(output) = output
+    {
+        return output.to_string();
+    }
+    // Otherwise the body as it was written, which is what the split cannot be undone into.
+    if !d.body.trim().is_empty() {
+        return d.body.clone();
+    }
+    let joined = body(d);
+    if !joined.trim().is_empty() {
+        return joined;
+    }
+    output
+        .or(d.thinking.as_deref())
+        .unwrap_or_default()
+        .to_string()
 }
 
 /// The stable JSON shape of one document. `raw` is deliberately not included.
@@ -217,6 +228,7 @@ pub fn doc_json(d: &Doc) -> Value {
         "tool_name": d.tool_name,
         "tool_use_id": d.tool_use_id,
         "tool_input": d.tool_input,
+        "bash_cmd": d.bash_cmd,
         "is_error": d.is_error,
         "is_sidechain": d.is_sidechain,
         "is_meta": d.is_meta,
@@ -224,9 +236,16 @@ pub fn doc_json(d: &Doc) -> Value {
         "permission_mode": d.permission_mode,
         "version": d.version,
         "slug": d.slug,
+        "body": d.body,
         "text": d.text,
+        "code": d.code,
+        "headings": d.headings,
+        "code_lang": d.code_langs,
         "tool_output": d.tool_output,
         "thinking": d.thinking,
+        // Stored and filterable through `--min-thinking`, and on a machine that strips
+        // thinking text before it reaches disk it is the only measure of the turn left.
+        "thinking_tokens": d.thinking_tokens,
         "source_path": d.source_path,
     })
 }
@@ -266,7 +285,7 @@ fn human_search(
             writeln!(w)?;
             write_hit_line(w, hit, i + 1, ink, cols)?;
             let body = if hit.snippet.trim().is_empty() {
-                one_line(doc_body(&hit.doc), cols * MAX_SNIPPET_LINES)
+                one_line(&doc_body(&hit.doc), cols * MAX_SNIPPET_LINES)
             } else {
                 one_line(&hit.snippet, usize::MAX)
             };
@@ -408,8 +427,8 @@ fn write_context(
             _ => doc.role.clone(),
         };
         let prefix = format!("      #{:<5} {:<20} ", doc.seq, truncate(&label, 20));
-        let body = one_line(doc_body(doc), cols.saturating_sub(prefix.chars().count()));
-        writeln!(w, "{}", ink.paint(&format!("{prefix}{body}"), dim()))?;
+        let line = one_line(&doc_body(doc), cols.saturating_sub(prefix.chars().count()));
+        writeln!(w, "{}", ink.paint(&format!("{prefix}{line}"), dim()))?;
     }
     Ok(())
 }
@@ -576,7 +595,7 @@ pub fn session_view(w: &mut impl Write, docs: &[Doc], o: &OutputOpts) -> Result<
         } else {
             MESSAGE_BUDGET
         };
-        for line in wrap(&clip(&doc.text, budget), cols.saturating_sub(6)) {
+        for line in wrap(&clip(&doc_body(doc), budget), cols.saturating_sub(6)) {
             writeln!(w, "      {line}")?;
         }
         // The result gets its own budget and its own indent: on a tool call the interesting
@@ -819,6 +838,29 @@ fn is_control_char(c: char) -> bool {
     !c.is_whitespace() && (c.is_control() || ('\u{80}'..='\u{9f}').contains(&c))
 }
 
+/// Everything of a document a reader would have seen, in the order the transcript holds it.
+///
+/// The stored `body` is that text verbatim, which is why it exists: `parse.rs` splits a
+/// message into prose and code for *retrieval*, and that split cannot be undone. It drops link
+/// destinations, repeats every inline span in both halves, and would print a message's fenced
+/// blocks after the paragraph that follows them rather than where they were written.
+///
+/// The join below is the fallback for a [`Doc`] that carries no `body` — one built by hand in
+/// a test, or read back from an index written before the field existed.
+fn body(d: &Doc) -> String {
+    if !d.body.is_empty() {
+        return d.body.clone();
+    }
+    let mut out = d.text.join("\n");
+    for block in &d.code {
+        if !out.is_empty() {
+            out.push('\n');
+        }
+        out.push_str(block);
+    }
+    out
+}
+
 /// Whitespace collapsed onto one line, control characters neutralised, then truncated to `max`
 /// visible characters.
 fn one_line(s: &str, max: usize) -> String {
@@ -1057,6 +1099,7 @@ mod tests {
             tool_name: None,
             tool_use_id: None,
             tool_input: None,
+            bash_cmd: None,
             is_error: false,
             is_sidechain: false,
             is_meta: false,
@@ -1064,7 +1107,11 @@ mod tests {
             permission_mode: None,
             version: Some("2.1.266".into()),
             slug: Some("wild-spinning-puppy".into()),
-            text: text.into(),
+            body: text.into(),
+            text: vec![text.into()],
+            code: Vec::new(),
+            headings: Vec::new(),
+            code_langs: Vec::new(),
             tool_output: None,
             thinking: None,
             thinking_tokens: None,
@@ -1073,12 +1120,24 @@ mod tests {
     }
 
     fn tool_doc(seq: u64, tool: &str, input: Value, text: &str) -> Doc {
+        // Filled the way `parse::tool_call_doc` fills it, so the JSON rendering is exercised
+        // with the shape the index actually holds.
+        let bash_cmd = (tool == "Bash")
+            .then(|| {
+                input
+                    .get("command")
+                    .and_then(Value::as_str)
+                    .and_then(crate::bash::extract)
+                    .map(|c| c.to_json())
+            })
+            .flatten();
         Doc {
             kind: DocKind::ToolCall,
             role: "assistant".into(),
             tool_name: Some(tool.into()),
             tool_use_id: Some(format!("toolu_{seq}")),
             tool_input: Some(input),
+            bash_cmd,
             model: Some("claude-opus-5".into()),
             ..doc(seq, "assistant", text)
         }
@@ -1199,6 +1258,7 @@ mod tests {
             "tool_name",
             "tool_use_id",
             "tool_input",
+            "bash_cmd",
             "is_error",
             "is_sidechain",
             "is_meta",
@@ -1233,6 +1293,9 @@ mod tests {
         assert_eq!(hit["timestamp_ms"], T0 + 41_000);
         assert_eq!(hit["tool_name"], "Bash");
         assert_eq!(hit["tool_input"]["command"], "cargo build --release");
+        // The structured view rides along beside the raw input, verbatim.
+        assert_eq!(hit["bash_cmd"]["program"], json!(["cargo"]));
+        assert_eq!(hit["bash_cmd"]["args"], json!(["build", "--release"]));
         assert_eq!(hit["agent_id"], Value::Null);
         assert_eq!(hit["is_error"], false);
         assert_eq!(v["hits"][1]["kind"], "message");
@@ -1326,7 +1389,8 @@ mod tests {
         let view = render(|w| session_view(w, &[doc(1, "user", "hello")], &json_opts()));
         let v: Value = serde_json::from_str(&view).unwrap();
         assert_eq!(v["count"], 1);
-        assert_eq!(v["docs"][0]["text"], "hello");
+        assert_eq!(v["docs"][0]["body"], "hello");
+        assert_eq!(v["docs"][0]["text"][0], "hello");
     }
 
     // -- human rendering ----------------------------------------------------
@@ -1585,6 +1649,65 @@ mod tests {
             "long bodies are clipped: {out}"
         );
         assert!(out.len() < long.len() + 4_000);
+    }
+
+    /// A document is indexed as prose and code in separate fields, but it is *rendered* from
+    /// the body it was written as: a tool call with no output on screen, or an answer with its
+    /// code cut out of it, would be a regression in what the command displays.
+    #[test]
+    fn session_view_prints_the_body_as_it_was_written() {
+        let source = "## The fix\n\nCall `register` first:\n\n```rust\npub fn open_or_create(dir: &Path) {}\n```\n\nThen re-run `cargo test`.";
+        let mut answer = doc(1, "assistant", "");
+        let parts = crate::markdown::split(source);
+        answer.body = source.to_string();
+        answer.text = parts.text;
+        answer.code = parts.code;
+        answer.headings = parts.headings;
+        let mut call = tool_doc(
+            2,
+            "Bash",
+            json!({"command": "cargo test"}),
+            "Bash\ncargo test",
+        );
+        call.code = vec!["error: test failed".into()];
+        call.body = "Bash\ncargo test\nerror: test failed".into();
+
+        let out = render(|w| session_view(w, &[answer], &plain()));
+        assert!(out.contains("Call `register` first:"), "{out}");
+        assert!(out.contains("pub fn open_or_create"), "{out}");
+        // Source order, not "all prose, then all code": the fenced block sits between the
+        // paragraph that introduces it and the one that follows it...
+        let fence = out.find("pub fn open_or_create").unwrap();
+        assert!(out.find("Call `register` first:").unwrap() < fence, "{out}");
+        assert!(out.find("Then re-run").unwrap() > fence, "{out}");
+        // ...and the inline span is printed once, inside its sentence, not again as a block.
+        assert_eq!(out.matches("cargo test").count(), 1, "{out}");
+
+        // A tool call has no source markdown, so its body is its name, its input and then its
+        // output — which is the order it was built in, and all of it is on screen.
+        let out = render(|w| session_view(w, &[call], &plain()));
+        assert!(out.contains("error: test failed"), "{out}");
+        assert!(
+            out.rfind("cargo test").unwrap() < out.find("error: test failed").unwrap(),
+            "{out}"
+        );
+    }
+
+    /// The JSON shape carries the new fields, so a `--json` consumer sees the whole document.
+    #[test]
+    fn doc_json_carries_the_code_and_heading_fields() {
+        let mut d = doc(1, "assistant", "Use the helper:");
+        d.code = vec!["pub fn open_or_create(dir: &Path) {}".into()];
+        d.headings = vec!["The fix".into()];
+        d.code_langs = vec!["rust".into()];
+        d.thinking_tokens = Some(300);
+        let v = doc_json(&d);
+        assert_eq!(v["body"], "Use the helper:");
+        assert_eq!(v["text"][0], "Use the helper:");
+        assert_eq!(v["code"][0], "pub fn open_or_create(dir: &Path) {}");
+        assert_eq!(v["headings"][0], "The fix");
+        assert_eq!(v["code_lang"][0], "rust");
+        assert_eq!(v["thinking_tokens"], 300);
     }
 
     #[test]

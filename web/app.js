@@ -852,7 +852,10 @@ function snippetBlock(result, meta, doc) {
   } else {
     // A hit with no snippet is normal for a filter-only browse, where there are no query terms
     // to mark. Showing the head of the body is better than showing an empty card.
-    const body = doc.kind === "tool_call" ? doc.tool_output || doc.text : doc.text;
+    // `body` is the body as a reader saw it; `text` and `code` are the indexed halves of it,
+    // split for retrieval and not reassemblable into it (the split drops link destinations and
+    // loses where a fence sat). So the reader always gets `body`.
+    const body = doc.kind === "tool_call" ? doc.tool_output || doc.body : doc.body;
     nodes.push(el("p", { class: "ss-snippet", text: clampText(body || "(no indexed text)", 400) }));
   }
   return frag(...nodes);
@@ -902,8 +905,8 @@ function turnContent(doc) {
     const result = renderToolResult(doc);
     if (result) out.push(result);
     rendered = true;
-  } else if (doc.text && doc.text.trim()) {
-    out.push(el("div", {}, renderMarkdown(doc.text)));
+  } else if (doc.body && doc.body.trim()) {
+    out.push(el("div", {}, renderMarkdown(doc.body)));
     rendered = true;
   }
 

@@ -1,17 +1,28 @@
 //! The Tantivy schema and the JSON encoding of a [`Doc`].
 //!
-//! The field table is pinned in `docs/DESIGN.md`. The one load-bearing subtlety is
-//! `tool_input`: a JSON field that is **indexed and fast**, with dots expanded, which is what
-//! makes `tool_input.command:cargo` filtering *and* a terms aggregation over parameter keys
-//! that were never declared in the schema both work.
+//! The field table is pinned in `docs/DESIGN.md`. Three things in it are load-bearing:
+//!
+//! * `tool_input` is a JSON field that is **indexed and fast**, with dots expanded, which is
+//!   what makes `tool_input.command:cargo` filtering *and* a terms aggregation over parameter
+//!   keys that were never declared in the schema both work.
+//! * `bash_cmd` is the same trick with a different tokenizer: it holds the parsed shape of a
+//!   Bash command (`{"program": [...], "args": [...]}`) and is tokenized `raw`, because its
+//!   contents are exact-match facts — `--release` has to stay `--release`.
+//! * a message's body is spread over three *indexed* fields rather than one. `text` and
+//!   `headings` hold its prose and are analyzed as English; `code` holds its snippets and is
+//!   analyzed as code; `code_lang` holds the fence languages as facet values. `parse.rs` does
+//!   the splitting and `markdown.rs` decides what goes where. Beside them, `body` keeps the
+//!   body as it was written, stored and never indexed, because that is what gets rendered.
+//!   A tool call's *result* is none of those: it lives in `tool_output`, analyzed as code.
 
 use serde_json::{Map, Value, json};
 use tantivy::schema::{
     FAST, INDEXED, IndexRecordOption, JsonObjectOptions, STORED, STRING, Schema, SchemaBuilder,
-    TEXT, TextFieldIndexing,
+    TextFieldIndexing, TextOptions,
 };
 
 use crate::parse::{Doc, DocKind};
+use crate::tokenizer::{CODE_ANALYZER, PROSE_ANALYZER};
 
 /// One handle per schema field. Cheap to clone.
 #[derive(Debug, Clone, Copy)]
@@ -38,7 +49,18 @@ pub struct Fields {
 
     pub project_facet: tantivy::schema::Field,
     pub tool_input: tantivy::schema::Field,
+    pub bash_cmd: tantivy::schema::Field,
+    /// Stored only: the body as a reader saw it, which is what every renderer prints.
+    pub body: tantivy::schema::Field,
+    /// Multi-valued: one value per prose block of the message.
     pub text: tantivy::schema::Field,
+    /// Multi-valued: one value per code block or inline span of the message.
+    pub code: tantivy::schema::Field,
+    /// Multi-valued: one value per markdown heading.
+    pub headings: tantivy::schema::Field,
+    /// Multi-valued: the info-string language of each fenced block.
+    pub code_lang: tantivy::schema::Field,
+    /// What a tool returned, indexed apart from what it was asked to do.
     pub tool_output: tantivy::schema::Field,
     pub thinking: tantivy::schema::Field,
     pub thinking_tokens: tantivy::schema::Field,
@@ -50,6 +72,21 @@ pub struct Fields {
     pub raw: tantivy::schema::Field,
 }
 
+/// Options for a full-text field: `TEXT | STORED` spelled out, with `analyzer` in place of
+/// `default`.
+///
+/// `WithFreqsAndPositions` is not optional for either analyzer. The `code` one emits an
+/// identifier's parts at the *same* position as the whole, which is what keeps phrases working
+/// — and what makes a query word that expands into several terms a positional query; and
+/// `SnippetGenerator` needs positions on any field it highlights.
+fn full_text_options(analyzer: &str) -> TextOptions {
+    TextOptions::default().set_stored().set_indexing_options(
+        TextFieldIndexing::default()
+            .set_tokenizer(analyzer)
+            .set_index_option(IndexRecordOption::WithFreqsAndPositions),
+    )
+}
+
 /// Options for the `tool_input` JSON field — copied verbatim from the verified-facts section
 /// of `docs/DESIGN.md`. `set_fast(Some("raw"))` is required for aggregations;
 /// `set_expand_dots_enabled()` is what makes `tool_input.command:x` parse.
@@ -58,8 +95,29 @@ fn tool_input_options() -> JsonObjectOptions {
         .set_stored()
         .set_indexing_options(
             TextFieldIndexing::default()
-                .set_tokenizer("default")
+                .set_tokenizer(CODE_ANALYZER)
                 .set_index_option(IndexRecordOption::WithFreqsAndPositions),
+        )
+        .set_fast(Some("raw"))
+        .set_expand_dots_enabled()
+}
+
+/// Options for the `bash_cmd` JSON field. Same shape as [`tool_input_options`] with two
+/// deliberate differences: the tokenizer is `raw` and positions are not kept.
+///
+/// `bash_cmd` holds words the shell grammar already split for us, and every one of them is an
+/// exact-match fact: `--release` must stay `--release` rather than becoming `release`, `Cargo`
+/// must not match `cargo`, and `bash_cmd.program:cargo` must mean "ran cargo", not "mentions
+/// cargo". The `default` tokenizer would strip the leading dashes, lowercase the value and
+/// split on punctuation, which loses all three. Nothing here is prose, so there are no phrases
+/// to search and `IndexRecordOption::Basic` is enough.
+fn bash_cmd_options() -> JsonObjectOptions {
+    JsonObjectOptions::default()
+        .set_stored()
+        .set_indexing_options(
+            TextFieldIndexing::default()
+                .set_tokenizer("raw")
+                .set_index_option(IndexRecordOption::Basic),
         )
         .set_fast(Some("raw"))
         .set_expand_dots_enabled()
@@ -93,13 +151,33 @@ pub fn build_schema() -> (Schema, Fields) {
     // Hierarchical project path, e.g. `/home/user/session-search`.
     let project_facet = sb.add_facet_field("project_facet", STORED);
     let tool_input = sb.add_json_field("tool_input", tool_input_options());
+    let bash_cmd = sb.add_json_field("bash_cmd", bash_cmd_options());
 
-    let text = sb.add_text_field("text", TEXT | STORED);
+    // What a reader saw, kept whole and never indexed. The retrieval fields below cannot be
+    // reassembled into it — the split drops link destinations, lifts fenced blocks out of the
+    // order they were written in and repeats every inline span — and `show`, `--context` and
+    // `--json` all have to print the message the transcript actually holds.
+    let body = sb.add_text_field("body", STORED);
+    // Prose gets prose analysis; code gets code analysis. `parse.rs` splits a markdown message
+    // between the two, and `markdown.rs` says which piece goes where. `text` carries one value
+    // per prose block: Tantivy separates the values of a field by a position gap, which is what
+    // stops a phrase matching across a code block that was lifted out from between them.
+    let text = sb.add_text_field("text", full_text_options(PROSE_ANALYZER));
+    let headings = sb.add_text_field("headings", full_text_options(PROSE_ANALYZER));
+    let code = sb.add_text_field("code", full_text_options(CODE_ANALYZER));
+    // The fence language is a facet value, never a word inside a sentence: one term, verbatim,
+    // and FAST so a terms aggregation can count it beside `tool_name`.
+    let code_lang = sb.add_text_field("code_lang", STRING | STORED | FAST);
     // What a tool returned, indexed apart from what it was asked to do. Always indexed — a
     // tool result is the record of what actually happened, and `--include-thinking` has no
-    // equivalent here.
-    let tool_output = sb.add_text_field("tool_output", TEXT | STORED);
-    let thinking = sb.add_text_field("thinking", TEXT | STORED);
+    // equivalent here. It takes the `code` analyzer, not `prose`: a result is diagnostics,
+    // paths and program output, never a markdown message, so there is no split to make and
+    // stemming `Serializes` into `serial` would only lose the identifiers in it.
+    let tool_output = sb.add_text_field("tool_output", full_text_options(CODE_ANALYZER));
+    // `thinking` stays on `code` for the same reason: it is prose and snippets interleaved
+    // with no marker separating them, so there is no split to make and the analyzer that keeps
+    // identifiers intact is the one that loses least.
+    let thinking = sb.add_text_field("thinking", full_text_options(CODE_ANALYZER));
     // Fast so it can be faceted and range-filtered; this is the only measure of reasoning that
     // survives on machines where the thinking text is stripped.
     let thinking_tokens = sb.add_u64_field("thinking_tokens", FAST | STORED | INDEXED);
@@ -137,7 +215,12 @@ pub fn build_schema() -> (Schema, Fields) {
         slug,
         project_facet,
         tool_input,
+        bash_cmd,
+        body,
         text,
+        code,
+        headings,
+        code_lang,
         tool_output,
         thinking,
         thinking_tokens,
@@ -208,9 +291,22 @@ pub fn doc_to_json(doc: &Doc, include_thinking: bool) -> Value {
     put_str(&mut o, "permission_mode", doc.permission_mode.as_deref());
     put_str(&mut o, "version", doc.version.as_deref());
     put_str(&mut o, "slug", doc.slug.as_deref());
-    put_str(&mut o, "text", Some(&doc.text));
+    put_str(&mut o, "body", Some(&doc.body));
     put_str(&mut o, "tool_output", doc.tool_output.as_deref());
     put_str(&mut o, "raw", Some(&doc.raw));
+
+    // Multi-valued fields: Tantivy adds one value per array element, and an empty array is the
+    // same as an absent key, so no emptiness check is needed beyond dropping blank entries.
+    let put_list = |o: &mut Map<String, Value>, key: &str, values: &[String]| {
+        let kept: Vec<&String> = values.iter().filter(|s| !s.trim().is_empty()).collect();
+        if !kept.is_empty() {
+            o.insert(key.to_string(), json!(kept));
+        }
+    };
+    put_list(&mut o, "text", &doc.text);
+    put_list(&mut o, "code", &doc.code);
+    put_list(&mut o, "headings", &doc.headings);
+    put_list(&mut o, "code_lang", &doc.code_langs);
 
     if let Some(facet) = doc.project.as_deref().and_then(facet_path) {
         o.insert("project_facet".to_string(), json!(facet));
@@ -228,6 +324,11 @@ pub fn doc_to_json(doc: &Doc, include_thinking: bool) -> Value {
         // Not gated on include_thinking: this is metadata about the turn, not thinking text,
         // and it is the only thing left when the text was stripped before it reached disk.
         o.insert("thinking_tokens".to_string(), json!(n));
+    }
+    // Only ever `Some` for a Bash call whose command parsed; an absent value must stay absent
+    // rather than becoming an empty object, so `bash_cmd.program:*` means "a Bash script ran".
+    if let Some(bash_cmd) = &doc.bash_cmd {
+        o.insert("bash_cmd".to_string(), bash_cmd.clone());
     }
     if include_thinking && let Some(t) = doc.thinking.as_deref().filter(|s| !s.is_empty()) {
         o.insert("thinking".to_string(), json!(t));
@@ -249,6 +350,7 @@ pub fn doc_to_json(doc: &Doc, include_thinking: bool) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::BTreeMap;
     use tantivy::TantivyDocument;
     use tantivy::schema::Value as _;
 
@@ -271,6 +373,7 @@ mod tests {
             tool_name: Some("Bash".into()),
             tool_use_id: Some("toolu_1".into()),
             tool_input: Some(json!({"command": "cargo build", "timeout": 600000})),
+            bash_cmd: Some(json!({"program": ["cargo"], "args": ["build"]})),
             is_error: true,
             is_sidechain: false,
             is_meta: false,
@@ -278,7 +381,11 @@ mod tests {
             permission_mode: Some("default".into()),
             version: Some("2.1.266".into()),
             slug: Some("wild-spinning-puppy".into()),
-            text: "Bash\ncargo build".into(),
+            body: "Bash\ncargo build\nCompiling tantivy v0.26.2\nFinished dev".into(),
+            text: vec!["Bash\ncargo build".into()],
+            code: vec!["Compiling tantivy v0.26.2".into(), "Finished dev".into()],
+            headings: Vec::new(),
+            code_langs: Vec::new(),
             tool_output: Some("Finished dev profile".into()),
             thinking: Some("hmm".into()),
             thinking_tokens: None,
@@ -310,7 +417,12 @@ mod tests {
             "slug",
             "project_facet",
             "tool_input",
+            "bash_cmd",
+            "body",
             "text",
+            "code",
+            "headings",
+            "code_lang",
             "tool_output",
             "thinking",
             "timestamp",
@@ -338,6 +450,23 @@ mod tests {
     }
 
     #[test]
+    fn bash_cmd_is_a_raw_tokenized_fast_json_field() {
+        let (schema, f) = build_schema();
+        let entry = schema.get_field_entry(f.bash_cmd);
+        let tantivy::schema::FieldType::JsonObject(opts) = entry.field_type() else {
+            panic!("bash_cmd must be a JSON field");
+        };
+        assert!(opts.is_stored());
+        assert!(opts.is_expand_dots_enabled());
+        assert_eq!(opts.get_fast_field_tokenizer_name(), Some("raw"));
+        let indexing = opts
+            .get_text_indexing_options()
+            .expect("bash_cmd must be indexed");
+        assert_eq!(indexing.tokenizer(), "raw", "exact-match facts, not prose");
+        assert_eq!(indexing.index_option(), IndexRecordOption::Basic);
+    }
+
+    #[test]
     fn doc_json_round_trips_through_parse_json() {
         let (schema, f) = build_schema();
         let value = doc_to_json(&sample(), true);
@@ -353,7 +482,58 @@ mod tests {
         assert!(doc.get_first(f.timestamp).unwrap().as_datetime().is_some());
         assert!(doc.get_first(f.project_facet).unwrap().as_facet().is_some());
         assert!(doc.get_first(f.tool_input).is_some());
+        assert!(doc.get_first(f.bash_cmd).is_some());
         assert!(doc.get_first(f.thinking).is_some());
+        // The body is stored whole, beside the fields the split produced from it.
+        assert_eq!(
+            first(f.body),
+            "Bash\ncargo build\nCompiling tantivy v0.26.2\nFinished dev"
+        );
+        // `text`, `code`, `headings` and `code_lang` are multi-valued: a JSON array becomes one
+        // value per element, not one value holding a rendered array.
+        assert_eq!(doc.get_all(f.code).count(), 2);
+        assert_eq!(
+            doc.get_first(f.code).unwrap().as_str(),
+            Some("Compiling tantivy v0.26.2")
+        );
+    }
+
+    #[test]
+    fn the_multi_valued_fields_round_trip_every_entry() {
+        let (schema, f) = build_schema();
+        let mut d = sample();
+        d.kind = DocKind::Message;
+        d.text = vec!["First para".into(), "Second para".into(), "  ".into()];
+        d.code = vec!["let a = 1;".into(), "let b = 2;".into(), "  ".into()];
+        d.headings = vec!["First".into(), "Second".into()];
+        d.code_langs = vec!["rust".into(), "bash".into()];
+        let value = doc_to_json(&d, false);
+        let doc = TantivyDocument::parse_json(&schema, &value.to_string()).unwrap();
+
+        // A blank entry is dropped rather than stored as an empty value.
+        let text: Vec<&str> = doc.get_all(f.text).filter_map(|v| v.as_str()).collect();
+        assert_eq!(text, ["First para", "Second para"]);
+        let code: Vec<&str> = doc.get_all(f.code).filter_map(|v| v.as_str()).collect();
+        assert_eq!(code, ["let a = 1;", "let b = 2;"]);
+        let heads: Vec<&str> = doc.get_all(f.headings).filter_map(|v| v.as_str()).collect();
+        assert_eq!(heads, ["First", "Second"]);
+        let langs: Vec<&str> = doc
+            .get_all(f.code_lang)
+            .filter_map(|v| v.as_str())
+            .collect();
+        assert_eq!(langs, ["rust", "bash"]);
+
+        // Empty vectors are omitted entirely, the way every other absent value is.
+        d.text.clear();
+        d.code.clear();
+        d.headings.clear();
+        d.code_langs.clear();
+        let value = doc_to_json(&d, false);
+        assert!(value.get("text").is_none());
+        assert!(value.get("code").is_none());
+        assert!(value.get("headings").is_none());
+        assert!(value.get("code_lang").is_none());
+        TantivyDocument::parse_json(&schema, &value.to_string()).unwrap();
     }
 
     #[test]
@@ -372,11 +552,13 @@ mod tests {
         d.timestamp_ms = None;
         d.project = None;
         d.tool_input = None;
+        d.bash_cmd = None;
         d.model = None;
         let value = doc_to_json(&d, true);
         assert!(value.get("timestamp").is_none());
         assert!(value.get("project_facet").is_none());
         assert!(value.get("tool_input").is_none());
+        assert!(value.get("bash_cmd").is_none());
         TantivyDocument::parse_json(&schema, &value.to_string()).unwrap();
     }
 
@@ -395,7 +577,6 @@ mod tests {
     /// never declared in the schema.
     #[test]
     fn tool_input_supports_subpath_queries_and_aggregations() {
-        use tantivy::Index;
         use tantivy::aggregation::AggregationCollector;
         use tantivy::aggregation::agg_req::Aggregations;
         use tantivy::collector::TopDocs;
@@ -407,7 +588,7 @@ mod tests {
             crate::parse::parse_whole(&fixture, &crate::parse::ParseOptions::default()).unwrap();
 
         let (schema, f) = build_schema();
-        let index = Index::create_in_ram(schema.clone());
+        let index = crate::tokenizer::create_in_ram(schema.clone());
         let mut writer = index.writer_with_num_threads(1, 15_000_000).unwrap();
         for doc in &out.docs {
             let json = doc_to_json(doc, false).to_string();
@@ -447,6 +628,116 @@ mod tests {
             .map(|b| b["key"].as_str().unwrap().to_string())
             .collect();
         assert_eq!(keys, vec!["cargo build".to_string()]);
+    }
+
+    /// The `bash_cmd` twin of the test above, and the reason it uses a different tokenizer:
+    /// the values are exact-match facts. Proven here, once, so nothing downstream has to guess:
+    ///
+    /// * `bash_cmd.program:cargo` parses through `QueryParser` and hits;
+    /// * a terms aggregation on `bash_cmd.program` — a subpath under a JSON field — buckets;
+    /// * `bash_cmd.args:"--release"` hits *exactly*, dashes and all;
+    /// * `bash_cmd.program:Cargo` does **not** hit `cargo`, i.e. the `raw` tokenizer really is
+    ///   applied to a JSON subpath by the query parser as well as by the indexer.
+    #[test]
+    fn bash_cmd_is_queryable_aggregatable_and_exact() {
+        use tantivy::aggregation::AggregationCollector;
+        use tantivy::aggregation::agg_req::Aggregations;
+        use tantivy::collector::{Count, TopDocs};
+        use tantivy::query::{AllQuery, QueryParser};
+
+        let commands = [
+            "cargo build --release",
+            "cd /tmp/x && cargo test -- --nocapture",
+            "git log --oneline -5 | head -20",
+        ];
+        let (schema, f) = build_schema();
+        // Through `tokenizer::create_in_ram`, not `Index::create_in_ram`: `text` is analyzed
+        // with `prose` now, and an unregistered analyzer fails at write time, not at open.
+        let index = crate::tokenizer::create_in_ram(schema.clone());
+        let mut writer = index.writer_with_num_threads(1, 15_000_000).unwrap();
+        for (i, command) in commands.iter().enumerate() {
+            let mut doc = sample();
+            doc.doc_id = format!("sess:-:{i}");
+            doc.seq = i as u64;
+            doc.tool_input = Some(json!({ "command": command }));
+            doc.bash_cmd = crate::bash::extract(command).map(|c| c.to_json());
+            assert!(doc.bash_cmd.is_some(), "{command:?} should parse");
+            let json = doc_to_json(&doc, false).to_string();
+            writer
+                .add_document(TantivyDocument::parse_json(&schema, &json).unwrap())
+                .unwrap();
+        }
+        writer.commit().unwrap();
+        let searcher = index.reader().unwrap().searcher();
+
+        let qp = QueryParser::for_index(&index, vec![f.text, f.tool_input]);
+        let count = |query: &str| -> usize {
+            let parsed = qp
+                .parse_query(query)
+                .unwrap_or_else(|e| panic!("{query}: {e}"));
+            searcher.search(&parsed, &Count).unwrap()
+        };
+
+        assert_eq!(count("bash_cmd.program:cargo"), 2, "two scripts run cargo");
+        assert_eq!(count("bash_cmd.program:cd"), 1);
+        assert_eq!(count("bash_cmd.program:head"), 1, "inside a pipeline");
+        // Quoted, because a bare leading `-` is negation in the query grammar.
+        assert_eq!(count(r#"bash_cmd.args:"--release""#), 1);
+        assert_eq!(count(r#"bash_cmd.args:"--oneline""#), 1);
+        assert_eq!(count(r#"bash_cmd.args:"-5""#), 1);
+
+        // The `raw` tokenizer, end to end: no lowercasing, no splitting on punctuation, and no
+        // stripping of leading dashes. If any of these ever hit, `--program` has started lying.
+        assert_eq!(
+            count("bash_cmd.program:Cargo"),
+            0,
+            "raw means case-sensitive"
+        );
+        assert_eq!(
+            count("bash_cmd.args:release"),
+            0,
+            "the dashes are part of the term"
+        );
+        assert_eq!(count("bash_cmd.args:oneline"), 0);
+        assert_eq!(count(r#"bash_cmd.args:"/tmp/x""#), 1, "a path is one term");
+        assert_eq!(count("bash_cmd.args:tmp"), 0, "...not three");
+
+        // ...and the query really did reach documents, not just parse.
+        let parsed = qp.parse_query("bash_cmd.program:cargo").unwrap();
+        let hits = searcher
+            .search(&parsed, &TopDocs::with_limit(10).order_by_score())
+            .unwrap();
+        assert_eq!(hits.len(), 2);
+
+        let aggs: Aggregations = serde_json::from_value(json!({
+            "p": { "terms": { "field": "bash_cmd.program", "size": 10 } },
+            "a": { "terms": { "field": "bash_cmd.args", "size": 10 } }
+        }))
+        .unwrap();
+        let collector = AggregationCollector::from_aggs(aggs, Default::default());
+        let res = searcher.search(&AllQuery, &collector).unwrap();
+        let buckets = serde_json::to_value(res).unwrap();
+        let counted = |key: &str| -> BTreeMap<String, u64> {
+            buckets[key]["buckets"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|b| {
+                    (
+                        b["key"].as_str().unwrap().to_string(),
+                        b["doc_count"].as_u64().unwrap(),
+                    )
+                })
+                .collect()
+        };
+        let programs = counted("p");
+        assert_eq!(programs.get("cargo"), Some(&2));
+        assert_eq!(programs.get("cd"), Some(&1));
+        assert_eq!(programs.get("git"), Some(&1));
+        assert_eq!(programs.get("head"), Some(&1));
+        let args = counted("a");
+        assert_eq!(args.get("--release"), Some(&1), "{args:?}");
+        assert_eq!(args.get("/tmp/x"), Some(&1));
     }
 
     #[test]

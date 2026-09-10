@@ -136,6 +136,8 @@ pub const SEARCH_PARAMS: &[&str] = &[
     "tool",
     "tool_input",
     "tool_output",
+    "lang",
+    "program",
     "min_thinking",
     "branch",
     "model",
@@ -223,6 +225,8 @@ impl SearchBody {
             tool: texts(p, "tool"),
             tool_input: texts(p, "tool_input"),
             tool_output: texts(p, "tool_output"),
+            lang: texts(p, "lang"),
+            program: texts(p, "program"),
             min_thinking: p.number::<u64>("min_thinking")?,
             branch: text(p, "branch"),
             model: text(p, "model"),
@@ -403,6 +407,8 @@ const NATIVE_FILTER_KEYS: &[&str] = &[
     "tool",
     "tool_input",
     "tool_output",
+    "lang",
+    "program",
     "min_thinking",
     "branch",
     "model",
@@ -418,9 +424,9 @@ const NATIVE_FILTER_KEYS: &[&str] = &[
 ];
 
 /// The `field` values the Search UI array form accepts, for the message a typo gets.
-const UI_FILTER_FIELDS: &str = "tool_name, tool, tool_output, tool_input.<path>, project, model, \
-     role, kind, agent_type, session_id, git_branch, branch, timestamp, thinking_tokens, \
-     is_error, is_sidechain";
+const UI_FILTER_FIELDS: &str = "tool_name, tool, tool_output, tool_input.<path>, code_lang, lang, \
+     bash_cmd.program, program, project, model, role, kind, agent_type, session_id, git_branch, \
+     branch, timestamp, thinking_tokens, is_error, is_sidechain";
 
 /// Either shape of `filters`: the Search UI array, or the native object the CLI flags spell.
 fn decode_filters(value: Option<Value>) -> Result<Filters, String> {
@@ -448,7 +454,9 @@ fn native_filters(map: Map<String, Value>) -> Result<Filters, String> {
         // A repeatable filter given one bare value is what everybody writes by hand, and
         // `serde` would answer it with "invalid type: string, expected a sequence".
         let value = match (key.as_str(), value) {
-            ("tool" | "tool_input" | "tool_output", v @ Value::String(_)) => Value::Array(vec![v]),
+            ("tool" | "tool_input" | "tool_output" | "lang" | "program", v @ Value::String(_)) => {
+                Value::Array(vec![v])
+            }
             (_, v) => v,
         };
         normalized.insert(key, value);
@@ -497,6 +505,20 @@ fn ui_filters(list: &[Value]) -> Result<Filters, String> {
                 check_type(field, kind, &["any"])?;
                 for value in values {
                     f.tool.push(as_text(field, value)?);
+                }
+            }
+            // Repeatable, ORed, like `tool`: a code block has one language and a command one
+            // program, so "all" is the same unsatisfiable ask and gets the same refusal.
+            "code_lang" | "lang" => {
+                check_type(field, kind, &["any"])?;
+                for value in values {
+                    f.lang.push(as_text(field, value)?);
+                }
+            }
+            "bash_cmd.program" | "program" => {
+                check_type(field, kind, &["any"])?;
+                for value in values {
+                    f.program.push(as_text(field, value)?);
                 }
             }
             // Repeatable, ANDed phrases.
@@ -1220,6 +1242,7 @@ mod tests {
             tool_name: Some("Bash".into()),
             tool_use_id: Some("toolu_1".into()),
             tool_input: Some(json!({ "command": "cargo test" })),
+            bash_cmd: Some(json!({ "program": ["cargo"], "args": ["test"] })),
             is_error: false,
             is_sidechain: false,
             is_meta: false,
@@ -1227,7 +1250,11 @@ mod tests {
             permission_mode: None,
             version: Some("2.1.266".into()),
             slug: None,
-            text: "cargo test".into(),
+            body: "Bash\ncargo test".into(),
+            text: vec!["Bash".into(), "cargo test".into()],
+            code: Vec::new(),
+            headings: Vec::new(),
+            code_langs: Vec::new(),
             tool_output: Some("test result: ok".into()),
             thinking: None,
             thinking_tokens: None,

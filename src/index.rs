@@ -51,7 +51,18 @@ use crate::schema::{Fields, build_schema, doc_to_json};
 const TANTIVY_SUBDIR: &str = "tantivy";
 const STATE_FILE: &str = "state.json";
 const SESSIONS_FILE: &str = "sessions.json";
-const STATE_VERSION: u32 = 2;
+/// Bumped whenever the *shape* of an indexed document changes, because the watermarks in
+/// `state.json` otherwise say "nothing changed" and no existing index would ever gain the new
+/// field. A mismatch makes [`load_state`] start from an empty state, which reindexes every
+/// file from byte zero.
+///
+/// 1 -> 2: `roots` and `thinking_indexed` joined the state file.
+/// 2 -> 3: the `bash_cmd` field. Existing indexes are fully reindexed on the next run.
+/// 3 -> 4: the markdown split. A carried tool-call document now holds `text` as a list of
+///         blocks with `body`, `code`, `headings` and `code_lang` beside it, so a state file
+///         written by an older version cannot be read back into one; and the schema gained
+///         those fields with two new analyzers besides.
+const STATE_VERSION: u32 = 4;
 
 /// Tantivy refuses a per-thread arena below this (`MEMORY_BUDGET_NUM_BYTES_MIN`).
 const MIN_HEAP_BYTES: usize = 15_000_000;
@@ -194,7 +205,11 @@ impl Job {
 ///
 /// If an index exists whose schema differs from the current one it cannot be read, so it is
 /// discarded and rebuilt — together with `state.json` and `sessions.json`, which would
-/// otherwise claim documents that no longer exist.
+/// otherwise claim documents that no longer exist. A field's tokenizer *name* is part of its
+/// schema, so changing the `code` analyzer's name — or moving a field onto it — triggers that
+/// rebuild by itself.
+///
+/// The returned index always has the `code` analyzer registered.
 pub fn open_or_create(index_dir: &Path) -> Result<(Index, Fields)> {
     let dir = index_dir.join(TANTIVY_SUBDIR);
     std::fs::create_dir_all(&dir)
@@ -226,6 +241,8 @@ pub fn open_or_create(index_dir: &Path) -> Result<(Index, Fields)> {
                 .with_context(|| format!("opening tantivy index at {}", dir.display()));
         }
     };
+    // Before any writer or `QueryParser` exists: both look the `code` analyzer up by name.
+    crate::tokenizer::register(&index);
     Ok((index, fields))
 }
 
@@ -1290,6 +1307,79 @@ mod tests {
         assert_eq!(stats.sessions, 0);
     }
 
+    /// The exact schema a build before the custom analyzers pinned: identical to today's but
+    /// for the tokenizer name on every full-text field. Round-tripping through JSON keeps the
+    /// two in step, so this test proves the *tokenizer* is what makes the old index unreadable
+    /// and not some unrelated drift.
+    fn schema_with_the_previous_tokenizer() -> tantivy::schema::Schema {
+        let (schema, _) = build_schema();
+        let mut json = serde_json::to_value(&schema).unwrap();
+        for field in json.as_array_mut().unwrap() {
+            if let Some(tokenizer) = field.pointer_mut("/options/indexing/tokenizer")
+                && (*tokenizer == crate::tokenizer::CODE_ANALYZER
+                    || *tokenizer == crate::tokenizer::PROSE_ANALYZER)
+            {
+                *tokenizer = serde_json::json!("default");
+            }
+        }
+        serde_json::from_value(json).unwrap()
+    }
+
+    /// A field's tokenizer name is part of the schema, so naming an analyzer on `text`,
+    /// `code`, `headings`, `tool_output`, `thinking` and `tool_input` makes every index an
+    /// older build wrote unreadable. The recovery has to be automatic — nobody is going to be told to delete a
+    /// directory — so `open_or_create` must notice, discard it, and hand back a clean index
+    /// that the next `run` refills.
+    #[test]
+    fn an_index_built_with_the_previous_tokenizer_is_discarded_and_reindexed() {
+        let fx = Fixture::new();
+        let expected = fx.expected();
+        let old = schema_with_the_previous_tokenizer();
+        assert_ne!(old, build_schema().0, "the old schema must actually differ");
+
+        // Plant exactly what the previous build left on disk: an index, its watermarks, and
+        // the session titles that describe documents about to disappear.
+        let dir = fx.index_dir.join(TANTIVY_SUBDIR);
+        std::fs::create_dir_all(&dir).unwrap();
+        let stale = Index::create_in_dir(&dir, old.clone()).unwrap();
+        let mut writer = stale.writer_with_num_threads(1, 15_000_000).unwrap();
+        let json = r#"{"doc_id":"stale","source_path":"/gone.jsonl","session_id":"gone","role":"user","kind":"message","text":"open_or_create","seq":0}"#;
+        writer
+            .add_document(tantivy::TantivyDocument::parse_json(&old, json).unwrap())
+            .unwrap();
+        writer.commit().unwrap();
+        drop(writer);
+        drop(stale);
+        std::fs::write(fx.index_dir.join(STATE_FILE), "{}").unwrap();
+        std::fs::write(fx.index_dir.join(SESSIONS_FILE), "{}").unwrap();
+
+        // Opening is not an error, and what comes back is today's schema with nothing in it.
+        let (index, _) = open_or_create(&fx.index_dir).unwrap();
+        assert_eq!(index.schema(), build_schema().0);
+        assert_eq!(
+            index.reader().unwrap().searcher().num_docs(),
+            0,
+            "the documents indexed under the old tokenizer are gone"
+        );
+        assert!(
+            index
+                .tokenizers()
+                .get(crate::tokenizer::CODE_ANALYZER)
+                .is_some()
+        );
+        assert!(
+            !fx.index_dir.join(STATE_FILE).exists(),
+            "stale watermarks would suppress the reindex"
+        );
+        assert!(!fx.index_dir.join(SESSIONS_FILE).exists());
+        drop(index);
+
+        // And the next ordinary run reindexes the transcripts from scratch, then settles.
+        assert_eq!(fx.index().docs_added, expected);
+        assert_eq!(fx.live(), expected);
+        assert_eq!(fx.index().docs_added, 0);
+    }
+
     #[test]
     fn open_or_create_is_idempotent_and_creates_its_directory() {
         let tmp = tempfile::tempdir().unwrap();
@@ -1379,12 +1469,16 @@ mod tests {
         let doc = &found.hits[0].doc;
         assert_eq!(doc.tool_name.as_deref(), Some("Bash"));
         assert_eq!(doc.tool_input.as_ref().unwrap()["command"], "cargo build");
-        assert!(doc.text.contains("cargo build"), "{:?}", doc.text);
+        assert!(
+            doc.text.iter().any(|t| t.contains("cargo build")),
+            "{:?}",
+            doc.text
+        );
         assert!(
             doc.tool_output
                 .as_deref()
                 .is_some_and(|o| o.contains("Finished")),
-            "{:?}",
+            "the result is carried as tool_output: {:?}",
             doc.tool_output
         );
 
@@ -1555,7 +1649,8 @@ mod tests {
         ));
     }
 
-    /// Every `text` currently in the index.
+    /// Every stored body currently in the index. `body` rather than `text`, which is one
+    /// value per prose block and would report only the first of them.
     fn indexed_texts(index_dir: &Path) -> Vec<String> {
         use tantivy::schema::Value as _;
         let (index, fields) = open_or_create(index_dir).unwrap();
@@ -1570,7 +1665,7 @@ mod tests {
             .into_iter()
             .map(|(_, address)| {
                 let doc: TantivyDocument = searcher.doc(address).unwrap();
-                doc.get_first(fields.text)
+                doc.get_first(fields.body)
                     .and_then(|v| v.as_str().map(str::to_string))
                     .unwrap_or_default()
             })
@@ -1731,7 +1826,9 @@ mod tests {
             "live indexing must converge on the one-shot result"
         );
         // Not just the same number of documents — the same documents.
-        let by_id = |dir: &Path| -> BTreeMap<String, String> { indexed_texts_by_id(dir) };
+        let by_id = |dir: &Path| -> BTreeMap<String, (String, String, String)> {
+            indexed_bodies_by_id(dir)
+        };
         assert_eq!(
             by_id(&live_dir),
             by_id(&once_dir),
@@ -1739,9 +1836,15 @@ mod tests {
         );
     }
 
-    /// Every document in an index, as `doc_id -> text`.
-    fn indexed_texts_by_id(index_dir: &Path) -> BTreeMap<String, String> {
-        use tantivy::schema::Value as _;
+    /// Every document in an index, as `doc_id -> (body, tool_output, bash_cmd)`.
+    ///
+    /// Read back through [`crate::search::doc_from_stored`], the one reader of the stored
+    /// payload, so the comparison covers the structured `bash_cmd` too: a tool call completed
+    /// across an incremental boundary is rebuilt from a carried document, and losing its
+    /// `bash_cmd` there would leave `--program` blind to exactly the live sessions people
+    /// search most. `body` stands in for the split halves: it is the whole a renderer prints,
+    /// and the split is a pure function of it.
+    fn indexed_bodies_by_id(index_dir: &Path) -> BTreeMap<String, (String, String, String)> {
         let (index, fields) = open_or_create(index_dir).unwrap();
         let searcher = index.reader().unwrap().searcher();
         let limit = (searcher.num_docs() as usize).max(1);
@@ -1754,13 +1857,17 @@ mod tests {
         found
             .into_iter()
             .map(|(_, address)| {
-                let doc: TantivyDocument = searcher.doc(address).unwrap();
-                let field = |f| {
-                    doc.get_first(f)
-                        .and_then(|v| v.as_str().map(str::to_string))
-                        .unwrap_or_default()
-                };
-                (field(fields.doc_id), field(fields.text))
+                let stored: TantivyDocument = searcher.doc(address).unwrap();
+                let doc = crate::search::doc_from_stored(&fields, &stored);
+                let bash_cmd = doc
+                    .bash_cmd
+                    .as_ref()
+                    .map(ToString::to_string)
+                    .unwrap_or_default();
+                (
+                    doc.doc_id,
+                    (doc.body, doc.tool_output.unwrap_or_default(), bash_cmd),
+                )
             })
             .collect()
     }
