@@ -3,6 +3,7 @@
 //! Module boundaries are pinned in `docs/DESIGN.md`; the input format is described in
 //! `docs/TRANSCRIPT-FORMAT.md`.
 
+pub mod bash;
 pub mod cli;
 pub mod context;
 pub mod discovery;
@@ -13,6 +14,7 @@ pub mod parse;
 pub mod schema;
 pub mod search;
 
+pub use bash::{BashCmd, extract};
 pub use discovery::{AgentMeta, TranscriptFile, default_root, discover};
 pub use index::{IndexOptions, IndexStats};
 pub use parse::{

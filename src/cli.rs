@@ -713,6 +713,9 @@ fn warn_unused_session_filters(f: &Filters) {
     if !f.tool_output.is_empty() {
         ignored.push("--tool-output");
     }
+    if !f.program.is_empty() {
+        ignored.push("--program");
+    }
     if f.model.is_some() {
         ignored.push("--model");
     }

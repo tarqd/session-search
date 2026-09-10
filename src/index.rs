@@ -51,7 +51,14 @@ use crate::schema::{Fields, build_schema, doc_to_json};
 const TANTIVY_SUBDIR: &str = "tantivy";
 const STATE_FILE: &str = "state.json";
 const SESSIONS_FILE: &str = "sessions.json";
-const STATE_VERSION: u32 = 2;
+/// Bumped whenever the *shape* of an indexed document changes, because the watermarks in
+/// `state.json` otherwise say "nothing changed" and no existing index would ever gain the new
+/// field. A mismatch makes [`load_state`] start from an empty state, which reindexes every
+/// file from byte zero.
+///
+/// 1 -> 2: `roots` and `thinking_indexed` joined the state file.
+/// 2 -> 3: the `bash_cmd` field. Existing indexes are fully reindexed on the next run.
+const STATE_VERSION: u32 = 3;
 
 /// Tantivy refuses a per-thread arena below this (`MEMORY_BUDGET_NUM_BYTES_MIN`).
 const MIN_HEAP_BYTES: usize = 15_000_000;
@@ -1731,7 +1738,8 @@ mod tests {
             "live indexing must converge on the one-shot result"
         );
         // Not just the same number of documents — the same documents.
-        let by_id = |dir: &Path| -> BTreeMap<String, String> { indexed_texts_by_id(dir) };
+        let by_id =
+            |dir: &Path| -> BTreeMap<String, (String, String)> { indexed_bodies_by_id(dir) };
         assert_eq!(
             by_id(&live_dir),
             by_id(&once_dir),
@@ -1739,9 +1747,14 @@ mod tests {
         );
     }
 
-    /// Every document in an index, as `doc_id -> text`.
-    fn indexed_texts_by_id(index_dir: &Path) -> BTreeMap<String, String> {
-        use tantivy::schema::Value as _;
+    /// Every document in an index, as `doc_id -> (text, bash_cmd)`.
+    ///
+    /// Read back through [`crate::search::doc_from_stored`], the one reader of the stored
+    /// payload, so the comparison covers the structured `bash_cmd` too: a tool call completed
+    /// across an incremental boundary is rebuilt from a carried document, and losing its
+    /// `bash_cmd` there would leave `--program` blind to exactly the live sessions people
+    /// search most.
+    fn indexed_bodies_by_id(index_dir: &Path) -> BTreeMap<String, (String, String)> {
         let (index, fields) = open_or_create(index_dir).unwrap();
         let searcher = index.reader().unwrap().searcher();
         let limit = (searcher.num_docs() as usize).max(1);
@@ -1754,13 +1767,14 @@ mod tests {
         found
             .into_iter()
             .map(|(_, address)| {
-                let doc: TantivyDocument = searcher.doc(address).unwrap();
-                let field = |f| {
-                    doc.get_first(f)
-                        .and_then(|v| v.as_str().map(str::to_string))
-                        .unwrap_or_default()
-                };
-                (field(fields.doc_id), field(fields.text))
+                let stored: TantivyDocument = searcher.doc(address).unwrap();
+                let doc = crate::search::doc_from_stored(&fields, &stored);
+                let bash_cmd = doc
+                    .bash_cmd
+                    .as_ref()
+                    .map(ToString::to_string)
+                    .unwrap_or_default();
+                (doc.doc_id, (doc.text, bash_cmd))
             })
             .collect()
     }

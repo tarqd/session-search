@@ -217,6 +217,7 @@ pub fn doc_json(d: &Doc) -> Value {
         "tool_name": d.tool_name,
         "tool_use_id": d.tool_use_id,
         "tool_input": d.tool_input,
+        "bash_cmd": d.bash_cmd,
         "is_error": d.is_error,
         "is_sidechain": d.is_sidechain,
         "is_meta": d.is_meta,
@@ -1057,6 +1058,7 @@ mod tests {
             tool_name: None,
             tool_use_id: None,
             tool_input: None,
+            bash_cmd: None,
             is_error: false,
             is_sidechain: false,
             is_meta: false,
@@ -1073,12 +1075,24 @@ mod tests {
     }
 
     fn tool_doc(seq: u64, tool: &str, input: Value, text: &str) -> Doc {
+        // Filled the way `parse::tool_call_doc` fills it, so the JSON rendering is exercised
+        // with the shape the index actually holds.
+        let bash_cmd = (tool == "Bash")
+            .then(|| {
+                input
+                    .get("command")
+                    .and_then(Value::as_str)
+                    .and_then(crate::bash::extract)
+                    .map(|c| c.to_json())
+            })
+            .flatten();
         Doc {
             kind: DocKind::ToolCall,
             role: "assistant".into(),
             tool_name: Some(tool.into()),
             tool_use_id: Some(format!("toolu_{seq}")),
             tool_input: Some(input),
+            bash_cmd,
             model: Some("claude-opus-5".into()),
             ..doc(seq, "assistant", text)
         }
@@ -1197,6 +1211,7 @@ mod tests {
             "tool_name",
             "tool_use_id",
             "tool_input",
+            "bash_cmd",
             "is_error",
             "is_sidechain",
             "is_meta",
@@ -1231,6 +1246,9 @@ mod tests {
         assert_eq!(hit["timestamp_ms"], T0 + 41_000);
         assert_eq!(hit["tool_name"], "Bash");
         assert_eq!(hit["tool_input"]["command"], "cargo build --release");
+        // The structured view rides along beside the raw input, verbatim.
+        assert_eq!(hit["bash_cmd"]["program"], json!(["cargo"]));
+        assert_eq!(hit["bash_cmd"]["args"], json!(["build", "--release"]));
         assert_eq!(hit["agent_id"], Value::Null);
         assert_eq!(hit["is_error"], false);
         assert_eq!(v["hits"][1]["kind"], "message");
