@@ -21,7 +21,7 @@ Each run also writes `target/eval/report.md` (§1), `target/eval/ablation.md` (�
 `target/eval/similar.md` (§3), `target/eval/facets.md` (§4), plus `corpus.md`, `hits.md` and
 `similar-hits.md`, which are the per-document listings a person grading a new query reads.
 
-**Taken at:** the review-fix commit on `claude/issues-21-23-26-workflow`, which is where these
+**Taken at:** the review-fix commit on `claude/issues-21-23-26-workflow-1lglrp`, which is where these
 numbers were last regenerated. `tests/fixtures/` is byte-identical to `cb810a1`, so the corpus and
 the grades are unchanged; three things in the harness and one in `src/` moved, and each one is
 visible in a table above:
