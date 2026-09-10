@@ -62,9 +62,11 @@ const SESSIONS_FILE: &str = "sessions.json";
 ///         blocks with `body`, `code`, `headings` and `code_lang` beside it, so a state file
 ///         written by an older version cannot be read back into one; and the schema gained
 ///         those fields with two new analyzers besides.
-/// 4 -> 5: `turn_seq` on every document and `open_turn_seq` in the carry. Without the bump an
-///         index built by an older binary would report `turn_seq = 0` for every document,
-///         which is worse than a rebuild.
+/// 4 -> 5: `turn_seq` on every document and `open_turn_seq` in the carry, and the
+///         `context_text` header built on top of them. Without the bump an index built by an
+///         older binary would report `turn_seq = 0` for every document and carry no header at
+///         all on the documents it had already written — a corpus half of which is findable by
+///         its context and half of which is not, which is worse than a rebuild.
 const STATE_VERSION: u32 = 5;
 
 /// Tantivy refuses a per-thread arena below this (`MEMORY_BUDGET_NUM_BYTES_MIN`).
@@ -507,24 +509,6 @@ fn consume(
         writer.delete_term(Term::from_field_text(fields.doc_id, &doc.doc_id));
         stats.docs_deleted += 1;
     }
-    for doc in out.docs.iter().chain(out.replacements.iter()) {
-        let json = doc_to_json(doc, opts.include_thinking).to_string();
-        match TantivyDocument::parse_json(schema, &json) {
-            Ok(td) => {
-                writer
-                    .add_document(td)
-                    .with_context(|| format!("indexing document {}", doc.doc_id))?;
-                stats.docs_added += 1;
-            }
-            // One unrepresentable document must not sink the run; `seq` still advances so the
-            // watermark stays consistent with what the parser numbered.
-            Err(err) => tracing::warn!(
-                doc_id = %doc.doc_id,
-                error = %err,
-                "document rejected by the schema; skipping"
-            ),
-        }
-    }
 
     let seq_base = match job.plan {
         Plan::Tail { seq_base, .. } => seq_base,
@@ -560,13 +544,41 @@ fn consume(
     // The first reset of a key this run replaces its entry outright — a full reparse already
     // recounted everything. Every other outcome merges.
     if is_reset && replaced.insert(key.clone()) {
-        sessions.insert(key, info);
+        sessions.insert(key.clone(), info);
     } else {
-        match sessions.entry(key) {
+        match sessions.entry(key.clone()) {
             Entry::Occupied(mut e) => merge_session(e.get_mut(), info),
             Entry::Vacant(e) => {
                 e.insert(info);
             }
+        }
+    }
+
+    // The documents are written *after* the merge, not before, because `context_text` is built
+    // from the merged row: a title or an opening prompt this very parse discovered would
+    // otherwise reach the header one run late, on a file that may never be appended to again.
+    // What the merge cannot fix is a `summary` record that arrives after the documents it
+    // titles were indexed — that title lands in `sessions.json`, which is the cheap JSON
+    // rewrite it was always meant to be, but not in their headers until the next `--full`.
+    // The opening prompt is in the header from the first parse, which is the half that
+    // matters.
+    let session = sessions.get(&key);
+    for doc in out.docs.iter().chain(out.replacements.iter()) {
+        let json = doc_to_json(doc, session, opts.include_thinking).to_string();
+        match TantivyDocument::parse_json(schema, &json) {
+            Ok(td) => {
+                writer
+                    .add_document(td)
+                    .with_context(|| format!("indexing document {}", doc.doc_id))?;
+                stats.docs_added += 1;
+            }
+            // One unrepresentable document must not sink the run; `seq` still advances so the
+            // watermark stays consistent with what the parser numbered.
+            Err(err) => tracing::warn!(
+                doc_id = %doc.doc_id,
+                error = %err,
+                "document rejected by the schema; skipping"
+            ),
         }
     }
     Ok(())
@@ -1938,6 +1950,64 @@ mod tests {
                 "  {key}: msgs={} tools={} title={:?} project={:?}",
                 info.messages, info.tool_calls, info.title, info.project
             );
+        }
+    }
+
+    /// Contextual BM25, through a real `run()`: a `Bash cargo build` document says nothing at
+    /// all about what it was for, and is retrieved anyway by a word that appears only in the
+    /// session's title and in the prompt that opened its turn.
+    ///
+    /// This is also where the composition is proven to be in the right place. The title comes
+    /// from a `summary` record and the opening prompt from a `user` record — neither of which
+    /// a tail parse can see — so the header is built from the row `merge_session` produces,
+    /// after the merge and before the documents are written.
+    #[test]
+    fn a_tool_call_is_retrievable_by_the_context_of_its_session() {
+        let summary =
+            r#"{"type":"summary","summary":"Tuning the markdown tokenizer","leafUuid":"u2"}"#;
+        let body = [
+            summary.to_string(),
+            user_line("u1", None, "make retrieval find fragments by their context"),
+            assistant_line("a1", "u1", "on it"),
+            tool_use_line("a2", "a1", "toolu_1", "cargo build"),
+            tool_result_line("u2", "a2", "toolu_1", "Finished dev profile"),
+        ]
+        .join("\n")
+            + "\n";
+        let fx = Fixture::with_body(&body);
+        fx.index();
+        assert_eq!(
+            fx.sessions()
+                .values()
+                .next()
+                .and_then(|s| s.title.clone())
+                .as_deref(),
+            Some("Tuning the markdown tokenizer")
+        );
+
+        let (index, fields) = open_or_create(&fx.index_dir).unwrap();
+        let hit_for = |query: &str| -> Option<crate::search::Hit> {
+            let req = crate::search::SearchRequest {
+                query: Some(query.to_string()),
+                ..crate::search::SearchRequest::default()
+            };
+            crate::search::search(&index, &fields, &req)
+                .unwrap()
+                .hits
+                .into_iter()
+                .find(|h| h.doc.tool_name.as_deref() == Some("Bash"))
+        };
+
+        // `tokenizer` is in the title only; `retrieval` in the opening prompt only; `proj` is
+        // the project's basename. None of the three is anywhere in the document itself.
+        for query in ["tokenizer", "retrieval", "proj"] {
+            let hit =
+                hit_for(query).unwrap_or_else(|| panic!("{query:?} did not reach the Bash call"));
+            assert!(!hit.doc.body.contains(query), "{}", hit.doc.body);
+            // The scaffolding decided the retrieval and shows up in none of the output: it is
+            // not stored, so there is nothing for `doc_from_stored` to hand back.
+            assert!(hit.doc.turn_prompt.is_none());
+            assert!(!hit.snippet.contains(query), "{}", hit.snippet);
         }
     }
 }
