@@ -9,6 +9,7 @@ pub mod context;
 pub mod discovery;
 pub mod format;
 pub mod index;
+pub mod media;
 pub mod model;
 pub mod parse;
 pub mod schema;
