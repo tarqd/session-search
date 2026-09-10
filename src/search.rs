@@ -15,7 +15,7 @@
 //! parse falls back to `parse_query_lenient`, and the errors that fallback discards are logged
 //! rather than swallowed — a typo'd field name must not look like an empty corpus.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::ops::Bound;
 use std::time::Instant;
 
@@ -30,7 +30,8 @@ use tantivy::query::{
 };
 use tantivy::schema::{Field, IndexRecordOption, OwnedValue, Schema, Term, Value as _};
 use tantivy::snippet::{Snippet, SnippetGenerator, collapse_overlapped_ranges};
-use tantivy::{DateTime, Searcher, TantivyDocument};
+use tantivy::tokenizer::{TextAnalyzer, Token, TokenStream};
+use tantivy::{DateTime, Score, Searcher, TantivyDocument};
 
 use crate::parse::{Doc, DocKind};
 use crate::schema::Fields;
@@ -221,21 +222,18 @@ pub fn search(
         }
     }
 
-    // One snippet generator per response; `create` only keeps the query terms of one field.
-    let mut snippets = SnippetGenerator::create(&searcher, &*query, f.text).ok();
-    if let Some(generator) = snippets.as_mut() {
-        generator.set_max_num_chars(req.snippet_chars.max(32));
-    }
+    // One snippet generator per response, per field: each only keeps the query's terms for
+    // its own field.
+    let raw_query = non_empty(req.query.as_deref()).unwrap_or_default();
+    let snippet_chars = req.snippet_chars.max(32);
+    let snippets = snippet_generator(&searcher, &*query, f.text, raw_query, snippet_chars).ok();
     // A doc matched *through* `thinking` stores its body in that field and leaves `text`
     // empty, so without a second generator the one thing `--include-thinking` is paid for is
     // the one thing never shown.
-    let mut thinking_snippets = req
+    let thinking_snippets = req
         .include_thinking
-        .then(|| SnippetGenerator::create(&searcher, &*query, f.thinking).ok())
+        .then(|| snippet_generator(&searcher, &*query, f.thinking, raw_query, snippet_chars).ok())
         .flatten();
-    if let Some(generator) = thinking_snippets.as_mut() {
-        generator.set_max_num_chars(req.snippet_chars.max(32));
-    }
 
     // `TopDocs::with_limit(0)` panics, so the collector always asks for at least one doc;
     // an explicit `--limit 0` still means "no hits, just totals and facets".
@@ -275,6 +273,81 @@ pub fn search(
         facets,
         elapsed_ms: started.elapsed().as_millis(),
     })
+}
+
+/// A snippet generator for `field`, driven by the *whole* terms of the query.
+///
+/// `SnippetGenerator::create` gives every term of the parsed query equal standing and scores a
+/// fragment by summing the hits in it, while the `code` analyzer turns one query word into an
+/// identifier *and each of its parts*. A paragraph that merely repeats the parts — `user` here,
+/// `email` there — therefore outscores the one line that actually holds `userEmail`, and the
+/// snippet shows everything except the reason the document matched.
+///
+/// Keeping only the whole forms fixes it. Every matching document contains them: the parts share
+/// the whole's position, so the phrase query the parser builds demands the whole form too.
+fn snippet_generator(
+    searcher: &Searcher,
+    query: &dyn Query,
+    field: Field,
+    raw_query: &str,
+    max_num_chars: usize,
+) -> anyhow::Result<SnippetGenerator> {
+    let tokenizer = searcher.index().tokenizer_for_field(field)?;
+    let parts = part_terms(&mut tokenizer.clone(), raw_query);
+
+    let mut terms: BTreeSet<&Term> = BTreeSet::new();
+    query.query_terms(&mut |term, _| {
+        if term.field() == field {
+            terms.insert(term);
+        }
+    });
+
+    let mut terms_text: BTreeMap<String, Score> = BTreeMap::new();
+    for term in terms {
+        let value = term.value();
+        let Some(text) = value.as_str() else {
+            continue;
+        };
+        if parts.contains(text) {
+            continue;
+        }
+        // Same weighting as `SnippetGenerator::create`: a rare term is worth more than a
+        // common one, and a term the corpus does not hold at all is worth nothing.
+        let doc_freq = searcher.doc_freq(term)?;
+        if doc_freq > 0 {
+            terms_text.insert(text.to_string(), 1.0 / (1.0 + doc_freq as Score));
+        }
+    }
+    Ok(SnippetGenerator::new(
+        terms_text,
+        tokenizer,
+        field,
+        max_num_chars,
+    ))
+}
+
+/// The terms `analyzer` emits as a *part* of some word of `raw_query` and never as a word in
+/// its own right.
+///
+/// The `code` analyzer emits the whole identifier first at each position and its parts after,
+/// so everything past the first token of a position is a part. A part that is also somebody's
+/// whole (`create` in `create open_or_create`) is not dropped.
+fn part_terms(analyzer: &mut TextAnalyzer, raw_query: &str) -> BTreeSet<String> {
+    let mut wholes: BTreeSet<String> = BTreeSet::new();
+    let mut parts: BTreeSet<String> = BTreeSet::new();
+    let mut seen = None;
+    analyzer
+        .token_stream(raw_query)
+        .process(&mut |token: &Token| {
+            if seen == Some(token.position) {
+                parts.insert(token.text.clone());
+            } else {
+                seen = Some(token.position);
+                wholes.insert(token.text.clone());
+            }
+        });
+    parts.retain(|part| !wholes.contains(part));
+    parts
 }
 
 /// Terms aggregation over any fast field, or any `tool_input.<path>`.
@@ -1059,8 +1132,9 @@ mod tests {
     fn a_part_of_an_identifier_finds_the_whole_identifier() {
         let (index, f) = index_docs(&identifier_docs());
 
-        // The doc's text is *only* `open_or_create`; the `default` tokenizer would index it as
-        // three words, but nothing would connect `create` to the identifier as a unit.
+        // The doc's text is *only* the identifier, so a hit can come from nothing but the
+        // analyzer. The `default` tokenizer would index `SnippetGenerator` as one opaque
+        // word, and `open_or_create` as three words sharing no term with `OpenOrCreate`.
         assert_eq!(texts(&search(&index, &f, &req("create")).unwrap()).len(), 2);
         assert!(
             texts(&search(&index, &f, &req("create")).unwrap())
@@ -1601,6 +1675,84 @@ mod tests {
             r.hits[0].snippet,
             "pub fn **open_or_create**(index_dir: &Path"
         );
+    }
+
+    /// The snippet must show the identifier that matched, not a paragraph that happens to
+    /// repeat its parts. `userEmail` expands to `useremail` + `user` + `email`, and the
+    /// prose ahead of it says `user` and `email` five times each.
+    #[test]
+    fn the_snippet_shows_the_identifier_and_not_a_crowd_of_its_parts() {
+        let mut d = blank_doc(1);
+        d.text = "The user asked for an email. Later the same user sent another email about \
+                  the user and the email. The user then wrote a third email, and the email \
+                  that the user sent after that was also about the user and the email they \
+                  had discussed. Deep at the end of the record sits the field userEmail."
+            .into();
+        let (index, f) = index_docs(&[d]);
+
+        for query in ["userEmail", "user_email"] {
+            let r = search(&index, &f, &req(query)).unwrap();
+            assert_eq!(r.total, 1, "{query:?}");
+            assert!(
+                r.hits[0].snippet.contains("**userEmail**"),
+                "{query:?} -> {:?}",
+                r.hits[0].snippet
+            );
+        }
+
+        // A part asked for on its own is still a part, and still highlights every occurrence.
+        let r = search(&index, &f, &req("email")).unwrap();
+        assert!(
+            r.hits[0].snippet.contains("an **email**"),
+            "{:?}",
+            r.hits[0].snippet
+        );
+    }
+
+    /// A trailing plural on an acronym is part of the acronym: `IDs` is one word, not `I` + `Ds`.
+    #[test]
+    fn a_pluralised_acronym_stays_one_word() {
+        let names = ["getIDs", "userIDs", "parseURLs", "HTTPServerError"];
+        let docs: Vec<Doc> = names
+            .iter()
+            .enumerate()
+            .map(|(i, name)| {
+                let mut d = blank_doc(i as u64);
+                d.text = (*name).to_string();
+                d
+            })
+            .collect();
+        let (index, f) = index_docs(&docs);
+
+        let mut hits = texts(&search(&index, &f, &req("ids")).unwrap());
+        hits.sort();
+        assert_eq!(hits, vec!["getIDs", "userIDs"]);
+        assert_eq!(
+            texts(&search(&index, &f, &req("urls")).unwrap()),
+            vec!["parseURLs"]
+        );
+        // The rule that makes that work must not stop an acronym meeting a real word.
+        assert_eq!(
+            texts(&search(&index, &f, &req("server")).unwrap()),
+            vec!["HTTPServerError"]
+        );
+    }
+
+    /// A hash is indexed whole and never in pieces, so a single hex character finds nothing.
+    #[test]
+    fn a_hash_contributes_no_single_character_terms() {
+        let (index, f) = index_docs(&identifier_docs());
+        assert_eq!(
+            texts(&search(&index, &f, &req(HEX64)).unwrap()),
+            vec![HEX64]
+        );
+        for junk in ["f", "d", "0", "86"] {
+            assert_eq!(
+                search(&index, &f, &req(junk)).unwrap().total,
+                0,
+                "{junk:?} matched something"
+            );
+        }
     }
 
     #[test]

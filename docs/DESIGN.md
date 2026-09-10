@@ -80,11 +80,12 @@ intended: facets show whole commands/paths, search matches words inside them.
 
 `text`, `thinking` and `tool_input` are all indexed with one registered analyzer named `code`.
 Transcripts are mostly identifiers, paths and shell, and the stock `default` analyzer answers
-badly for them: `create` misses `open_or_create`, `snippet` misses `SnippetGenerator`, and every
+badly for them: `snippet` misses `SnippetGenerator`, which it indexes as one opaque word;
+`OpenOrCreate` and `open_or_create` share no term, so neither spelling finds the other; and every
 sha256 is discarded by the 40-byte `RemoveLongFilter`.
 
 ```
-RegexTokenizer(r"\w+")  ->  SplitIdentifiers  ->  LowerCaser  ->  RemoveLongFilter::limit(255)
+WordTokenizer  ->  SplitIdentifiers  ->  LowerCaser  ->  RemoveLongFilter::limit(255)
 ```
 
 `SplitIdentifiers` emits, for each token, **the whole identifier and each of its parts at the
@@ -98,7 +99,9 @@ cargo            -> cargo                                 (a plain word emits on
 ```
 
 Parts break on `_`, on a case boundary (`parseTs`, and `HTTPServer` -> `HTTP`, `Server`), and on
-a letter/digit boundary. Three consequences are load-bearing:
+a letter/digit boundary. An acronym only ends where a real word begins, so a lone trailing `s`
+stays with it (`getIDs` -> `get`, `IDs`) and a search for `ids` finds it. Four consequences are
+load-bearing:
 
 - **The whole form is the separator-free lowercasing, not the verbatim one.** `QueryParser` turns
   a query word that yields several tokens into a `PhraseQuery` over `(position, term)` pairs, so
@@ -106,18 +109,34 @@ a letter/digit boundary. Three consequences are load-bearing:
   therefore matches an identifier only when both sides produce the same set of terms. Collapsing
   `open_or_create` and `OpenOrCreate` to the same `openorcreate` + parts is exactly what makes
   each spelling find the other; keeping the verbatim form would break that in one direction.
-- **The base tokenizer is a `\w+` `RegexTokenizer`, not `SimpleTokenizer`.** `SimpleTokenizer`
-  splits on `_` before any filter can see it, which would leave an underscore-aware filter dead
-  and make `OpenOrCreate` unable to find `open_or_create`. `\w+` is otherwise the same rule, so
-  `src/index.rs` still yields `src`, `index`, `rs`.
-- **The 255-byte length limit is deliberate.** The stock 40 silently drops every hash and long
-  generated identifier; at 255 a pasted sha256 finds the document it came from.
+- **The base tokenizer is hand-written, not `SimpleTokenizer` and not a regex.**
+  `SimpleTokenizer` splits on `_` before any filter can see it, which would leave an
+  underscore-aware filter dead and make `OpenOrCreate` unable to find `open_or_create`. A `\w+`
+  `RegexTokenizer` draws the right boundaries but runs the regex engine once per token and
+  clones the compiled regex per field value — measured at roughly fourteen times the scan cost
+  of `SimpleTokenizer` over real transcript text, and the dominant part of the analyzer's bill.
+  `WordTokenizer` scans `char_indices` for runs of letters, digits and `_` instead, at
+  `SimpleTokenizer` speed, so `src/index.rs` still yields `src`, `index`, `rs`.
+- **The 255-byte length limit is deliberate, and hashes are never split.** The stock 40 silently
+  drops every hash and long generated identifier; at 255 a pasted sha256 finds the document it
+  came from. But a hash is not a name: a run of eight or more hex digits mixing letters and
+  digits, or any token that shatters into a crowd of one- and two-character fragments, is
+  emitted whole and alone. Splitting a sha256 into 41 fragments would put single characters in
+  the dictionary (`f` matching every hash in the corpus) and inflate the BM25 field length of
+  every document holding one, since Tantivy counts tokens rather than positions.
 
 A field's tokenizer *name* is part of the schema, so **changing this analyzer forces a full
 reindex**: `index::open_or_create` sees `SchemaError`, discards the index together with
 `state.json` and `sessions.json`, and the next run refills it. Changing the analyzer's *behaviour*
 without changing its name does **not** trip that check — bump the registered name too, or the
 old terms stay on disk.
+
+Snippets are generated from the **whole** terms of the query only (`search::snippet_generator`).
+`SnippetGenerator::create` weighs every term of the parsed query alike and scores a fragment by
+summing its hits, so for a query word that expands into an identifier plus its parts, a paragraph
+repeating the parts (`user` here, `email` there) outscores the one line holding `userEmail` and
+the snippet shows everything except the reason the document matched. Dropping the parts is safe:
+they share the whole's position, so every matching document contains the whole form too.
 
 `tokenizer::register(&index)` must run on every path that opens or creates an `Index`, before any
 document is added and before any query is parsed: the writer and `QueryParser` both look the
