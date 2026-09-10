@@ -4,7 +4,8 @@
 //! `parse.rs` splits a markdown message into its prose and its code (see `markdown.rs`) so each
 //! half can have the analyzer it wants: `text` and `headings` are `prose`, while `code`,
 //! `thinking` and `tool_input` are `code`. The rest of this module is the `code` analyzer;
-//! [`prose_analyzer`] is four stock filters and is documented at its definition.
+//! [`prose_analyzer`] is that same analyzer with an English stemmer on the end, and is
+//! documented at its definition.
 //!
 //! Transcripts are mostly code, paths and shell, and the stock `default` analyzer answers badly
 //! for them: it indexes `SnippetGenerator` as one opaque blob, so `snippet` never finds it; it
@@ -60,8 +61,8 @@ use std::str::CharIndices;
 
 use tantivy::Index;
 use tantivy::tokenizer::{
-    Language, LowerCaser, RemoveLongFilter, SimpleTokenizer, Stemmer, TextAnalyzer, Token,
-    TokenFilter, TokenStream, Tokenizer,
+    Language, LowerCaser, RemoveLongFilter, Stemmer, TextAnalyzer, Token, TokenFilter, TokenStream,
+    Tokenizer,
 };
 
 /// The name the analyzer is registered under, and the name the schema refers to.
@@ -92,18 +93,28 @@ pub fn code_analyzer() -> TextAnalyzer {
 
 /// Build the `prose` analyzer: the one the *other* half of a message wants.
 ///
-/// `text` and `headings` hold English, so they get English treatment — `SimpleTokenizer`, a
-/// 255-byte length limit for symmetry with `code`, lowercasing, and an English stemmer, so
-/// `compiling` finds `compiled`. Stemming is exactly what must never touch a snippet: it turns
-/// `Serializes` into `serial` and `parses` into `pars`, terms no reader would type. Splitting
-/// prose and code into separate fields is what lets each have the analyzer it wants.
+/// It is the `code` analyzer plus an English stemmer, and the stemmer is the whole difference:
+/// `compiling` finds `compiled`. Stemming is exactly what must never touch a snippet — it
+/// turns `Serializes` into `serial` and `parses` into `pars`, terms no reader would type —
+/// which is why the two analyzers exist and why a message is split between their two fields.
 ///
-/// The `LowerCaser` runs before the stemmer because `Stemmer` matches on lowercase input.
+/// What it does **not** drop is identifier splitting. Only fenced blocks and inline spans are
+/// routed to `code`; a sentence that names `SnippetGenerator` without backticks stays here, as
+/// does every attachment, `system` record and tool call, none of which is markdown to split at
+/// all. Tokenizing those the stock way would index `SnippetGenerator` as one opaque word again
+/// and leave `snippet` unable to find it — the exact hole [`code_analyzer`] was written to
+/// close. So prose keeps the whole-plus-parts trick and merely stems what comes out of it: the
+/// parts share the whole's position either way, so phrases still work, and a plain English
+/// word emits once, stemmed, exactly as before.
+///
+/// The `LowerCaser` runs before the stemmer because `Stemmer` matches on lowercase input, and
+/// `RemoveLongFilter` runs last so a token is measured as it will be indexed.
 pub fn prose_analyzer() -> TextAnalyzer {
-    TextAnalyzer::builder(SimpleTokenizer::default())
-        .filter(RemoveLongFilter::limit(MAX_TOKEN_BYTES))
+    TextAnalyzer::builder(WordTokenizer::default())
+        .filter(SplitIdentifiers)
         .filter(LowerCaser)
         .filter(Stemmer::new(Language::English))
+        .filter(RemoveLongFilter::limit(MAX_TOKEN_BYTES))
         .build()
 }
 
@@ -663,11 +674,22 @@ mod tests {
     }
 
     #[test]
-    fn the_prose_analyzer_leaves_identifiers_whole() {
-        // `SimpleTokenizer` splits on `_`, and nothing puts the parts back together: prose is
-        // not where an identifier search is served, `code` is.
-        assert_eq!(prose("open_or_create"), vec!["open", "or", "creat"]);
-        assert_eq!(prose("SnippetGenerator"), vec!["snippetgener"]);
+    fn the_prose_analyzer_splits_identifiers_too() {
+        // Prose is full of identifiers nobody fenced or backticked, and every attachment,
+        // `system` record and tool call lands in a prose field whole. Losing the split here
+        // would lose `snippet` -> `SnippetGenerator` for all of them.
+        assert_eq!(
+            prose("open_or_create"),
+            vec!["openorcr", "open", "or", "creat"]
+        );
+        assert_eq!(
+            prose("SnippetGenerator"),
+            vec!["snippetgener", "snippet", "generat"]
+        );
+        // Both spellings of one name still produce the same terms, stemmed.
+        assert_eq!(prose("openOrCreate"), prose("open_or_create"));
+        // A plain word is emitted once, and stemmed.
+        assert_eq!(prose("Indexes"), vec!["index"]);
     }
 
     #[test]

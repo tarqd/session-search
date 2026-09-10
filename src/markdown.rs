@@ -14,20 +14,25 @@
 //! | paragraph, list item, table cell, blockquote, link text, image alt, raw HTML | `text` |
 //! | fenced or indented code block | one `code` entry (+ its info word in `code_langs`) |
 //! | inline `` `span` `` | one `code` entry **and** stays in `text` |
-//! | heading | one `headings` entry **and** a line of `text` |
+//! | heading | one `headings` entry **and** an entry of `text` |
 //!
 //! Two of those routings are worth stating out loud:
 //!
-//! * A heading is prose, and `text` is what `show` prints, so routing headings *only* to
-//!   their own field would delete every section title from the rendered transcript. It is
-//!   cheap to carry in both: headings are short, and the boosted `headings` field is what
-//!   makes the ranking difference.
+//! * A heading is prose, so routing it *only* to its own field would take the section title
+//!   out of the sentence flow a `text` query searches. It is cheap to carry in both: headings
+//!   are short, and the boosted `headings` field is what makes the ranking difference.
 //! * Raw HTML is kept as text rather than dropped. A message that opens with
 //!   `<system-reminder>` is one HTML block to a markdown parser, so dropping HTML would
 //!   silently unindex the whole of it.
 //!
 //! Link *destinations* are dropped: a URL is not prose, and `tool_input` already carries the
 //! paths anyone searches for.
+//!
+//! Prose comes back as one entry *per block*, never as one joined string. Lifting a fence out
+//! of the middle of a message would otherwise close the gap it left and make the sentence
+//! before it adjacent to the sentence after it, so a phrase query would match across text that
+//! was never adjacent. Tantivy separates the values of a multi-valued field by a position gap,
+//! which is exactly the gap the removed block should leave behind.
 //!
 //! Malformed input is not a special case — an unclosed fence, a stray `|`, a heading with no
 //! text — because pulldown-cmark is a total function over `&str`: every `Start` it emits is
@@ -38,8 +43,13 @@ use pulldown_cmark::{CodeBlockKind, Event, Options, Parser, Tag, TagEnd};
 /// The typed pieces of one markdown body. Every field may be empty.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct MarkdownParts {
-    /// Prose, one block per line, in document order.
-    pub text: String,
+    /// Prose, **one entry per block**, in document order.
+    ///
+    /// One entry per block rather than one joined string, because the blocks are no longer
+    /// adjacent once the code between them has been routed elsewhere: Tantivy puts a position
+    /// gap between the values of a multi-valued field, so a phrase cannot run from the end of
+    /// one paragraph into the start of the next across a fence that was lifted out.
+    pub text: Vec<String>,
     /// One entry per code block, plus one per inline span.
     pub code: Vec<String>,
     /// One entry per heading, in document order.
@@ -61,8 +71,6 @@ pub fn split(markdown: &str) -> MarkdownParts {
     options.insert(Options::ENABLE_STRIKETHROUGH);
 
     let mut out = MarkdownParts::default();
-    // Prose blocks that have been closed, joined at the end.
-    let mut lines: Vec<String> = Vec::new();
     // The prose block being built, or the heading being built.
     let mut block = String::new();
     // The code block being built.
@@ -72,7 +80,7 @@ pub fn split(markdown: &str) -> MarkdownParts {
     for event in Parser::new_ext(markdown, options) {
         match event {
             Event::Start(Tag::CodeBlock(kind)) => {
-                flush(&mut block, &mut lines);
+                flush(&mut block, &mut out.text);
                 in_code = true;
                 code.clear();
                 if let CodeBlockKind::Fenced(info) = kind
@@ -90,13 +98,13 @@ pub fn split(markdown: &str) -> MarkdownParts {
                     out.code.push(body.to_string());
                 }
             }
-            Event::Start(Tag::Heading { .. }) => flush(&mut block, &mut lines),
+            Event::Start(Tag::Heading { .. }) => flush(&mut block, &mut out.text),
             Event::End(TagEnd::Heading(_)) => {
                 let heading = block.trim().to_string();
                 block.clear();
                 if !heading.is_empty() {
                     out.headings.push(heading.clone());
-                    lines.push(heading);
+                    out.text.push(heading);
                 }
             }
             // An inline span is code *and* prose: it is the identifier a `code` search wants,
@@ -131,20 +139,19 @@ pub fn split(markdown: &str) -> MarkdownParts {
                 | TagEnd::TableRow
                 | TagEnd::BlockQuote(_)
                 | TagEnd::HtmlBlock,
-            ) => flush(&mut block, &mut lines),
+            ) => flush(&mut block, &mut out.text),
             _ => {}
         }
     }
-    flush(&mut block, &mut lines);
-    out.text = lines.join("\n");
+    flush(&mut block, &mut out.text);
     out
 }
 
 /// Close the block being built, keeping it only if it holds something.
-fn flush(block: &mut String, lines: &mut Vec<String>) {
+fn flush(block: &mut String, blocks: &mut Vec<String>) {
     let trimmed = block.trim();
     if !trimmed.is_empty() {
-        lines.push(trimmed.to_string());
+        blocks.push(trimmed.to_string());
     }
     block.clear();
 }
@@ -187,34 +194,37 @@ pub fn open_or_create(dir: &Path) -> Result<Index> {
 > A quoted remark about tantivy.
 ";
 
+    /// The prose blocks as one string, for the assertions that only care that a phrase
+    /// survived the split and not which block it landed in.
+    fn prose(parts: &MarkdownParts) -> String {
+        parts.text.join("\n")
+    }
+
     #[test]
     fn a_sample_body_splits_into_prose_code_and_headings() {
         let parts = split(SAMPLE);
+        let text = prose(&parts);
 
         assert_eq!(parts.headings, ["Indexing notes", "Steps"]);
         assert_eq!(parts.code_langs, ["rust"]);
 
         // Prose keeps the sentences, the list items, the table cells, the link *text* and the
         // blockquote — and the headings, which `show` prints.
-        assert!(parts.text.contains("Indexing notes"));
-        assert!(parts.text.contains("had already compiled the schema"));
-        assert!(parts.text.contains("run cargo build"));
-        assert!(parts.text.contains("read the design doc"));
-        assert!(parts.text.contains("tokenizer"));
-        assert!(parts.text.contains("A quoted remark about tantivy."));
+        assert!(text.contains("Indexing notes"));
+        assert!(text.contains("had already compiled the schema"));
+        assert!(text.contains("run cargo build"));
+        assert!(text.contains("read the design doc"));
+        assert!(text.contains("tokenizer"));
+        assert!(text.contains("A quoted remark about tantivy."));
         // ...but not the link destination, and not the fenced block.
-        assert!(!parts.text.contains("docs/DESIGN.md"), "{:?}", parts.text);
-        assert!(
-            !parts.text.contains("Index::open_in_dir"),
-            "{:?}",
-            parts.text
-        );
+        assert!(!text.contains("docs/DESIGN.md"), "{:?}", parts.text);
+        assert!(!text.contains("Index::open_in_dir"), "{:?}", parts.text);
 
         // The fence is one entry; the inline spans are entries of their own and stay in prose.
         assert_eq!(parts.code.len(), 3, "{:?}", parts.code);
         assert!(parts.code.contains(&"open_or_create".to_string()));
         assert!(parts.code.contains(&"cargo build".to_string()));
-        assert!(parts.text.contains("open_or_create"));
+        assert!(text.contains("open_or_create"));
         let fence = parts
             .code
             .iter()
@@ -227,7 +237,7 @@ pub fn open_or_create(dir: &Path) -> Result<Index> {
     #[test]
     fn an_indented_block_is_code_with_no_language() {
         let parts = split("intro\n\n    let x = 1;\n    let y = 2;\n");
-        assert_eq!(parts.text, "intro");
+        assert_eq!(parts.text, ["intro"]);
         assert_eq!(parts.code, ["let x = 1;\nlet y = 2;"]);
         assert!(parts.code_langs.is_empty());
     }
@@ -249,7 +259,7 @@ pub fn open_or_create(dir: &Path) -> Result<Index> {
     #[test]
     fn an_unclosed_fence_does_not_panic_and_keeps_its_body() {
         let parts = split("before\n\n```rust\nfn main() {}\nstill inside\n");
-        assert_eq!(parts.text, "before");
+        assert_eq!(parts.text, ["before"]);
         assert_eq!(parts.code, ["fn main() {}\nstill inside"]);
         assert_eq!(parts.code_langs, ["rust"]);
     }
@@ -296,7 +306,7 @@ pub fn open_or_create(dir: &Path) -> Result<Index> {
     #[test]
     fn plain_prose_passes_through_unchanged_except_for_block_joins() {
         let parts = split("just a sentence, no markup at all.");
-        assert_eq!(parts.text, "just a sentence, no markup at all.");
+        assert_eq!(parts.text, ["just a sentence, no markup at all."]);
         assert!(parts.code.is_empty());
         assert!(parts.headings.is_empty());
     }
@@ -306,7 +316,7 @@ pub fn open_or_create(dir: &Path) -> Result<Index> {
         // A markdown parser sees this as one HTML block; dropping HTML would unindex it all.
         let parts = split("<system-reminder>\nthe budget is 15000 tokens\n</system-reminder>");
         assert!(
-            parts.text.contains("the budget is 15000 tokens"),
+            prose(&parts).contains("the budget is 15000 tokens"),
             "{parts:?}"
         );
         assert!(parts.code.is_empty());
@@ -315,12 +325,33 @@ pub fn open_or_create(dir: &Path) -> Result<Index> {
     #[test]
     fn image_alt_text_is_kept_and_its_url_is_not() {
         let parts = split("![a flame graph of the indexer](/tmp/flame.svg)");
-        assert_eq!(parts.text, "a flame graph of the indexer");
+        assert_eq!(parts.text, ["a flame graph of the indexer"]);
     }
 
     #[test]
-    fn blocks_are_joined_with_newlines_and_never_run_together() {
+    fn each_prose_block_is_its_own_entry() {
         let parts = split("first para\n\nsecond para\n\n- item one\n- item two\n");
-        assert_eq!(parts.text, "first para\nsecond para\nitem one\nitem two");
+        assert_eq!(
+            parts.text,
+            ["first para", "second para", "item one", "item two"]
+        );
+    }
+
+    /// The reason the entries stay separate: what sat between two of them is gone, and the
+    /// position gap a multi-valued field inserts is what stands in for it.
+    #[test]
+    fn a_removed_block_leaves_the_prose_on_either_side_of_it_in_separate_entries() {
+        let parts = split(
+            "Call it before the writer exists.\n\n```rust\nlet x = 1;\n```\n\nThen re-run the tests.",
+        );
+        assert_eq!(
+            parts.text,
+            [
+                "Call it before the writer exists.",
+                "Then re-run the tests."
+            ]
+        );
+        // The same for a heading, which is prose *and* a heading.
+        assert_eq!(split("# Title one\n\nAlpha ends here.").text.len(), 2);
     }
 }

@@ -20,7 +20,9 @@ errors. A CLI now; an `mcp` subcommand serving the same operations over stdio ne
   Assistant **thinking is stored but not indexed** — `--include-thinking` opts in, default off.
 - **A message body is split by kind before it is indexed.** Its prose goes to `text`, its
   fenced blocks and inline spans to `code`, its headings to `headings` — because prose and code
-  want opposite analysis. See "The markdown split" below.
+  want opposite analysis. The body it was written as is kept whole in `body`, stored and never
+  indexed, because the split cannot be undone and `body` is what every renderer prints. See
+  "The markdown split" below.
 - **Incremental one-shot indexing** keyed on (size, mtime, byte offset) per file.
   The read commands (`search`, `facets`, `show`, `sessions`) auto-refresh unless `--no-refresh`;
   `stats` never opens the index at all. `--include-thinking` is an *index-time* choice — turning
@@ -86,12 +88,19 @@ Two registered analyzers, one per kind of text:
 | analyzer | fields | pipeline |
 | --- | --- | --- |
 | `code` | `code`, `thinking`, `tool_input` | `WordTokenizer -> SplitIdentifiers -> LowerCaser -> RemoveLongFilter(255)` |
-| `prose` | `text`, `headings` | `SimpleTokenizer -> RemoveLongFilter(255) -> LowerCaser -> Stemmer(English)` |
+| `prose` | `text`, `headings` | `WordTokenizer -> SplitIdentifiers -> LowerCaser -> Stemmer(English) -> RemoveLongFilter(255)` |
 
-`prose` is four stock filters and needs no defending: it stems, so `compiling` finds `compiled`.
-Stemming is exactly what must never touch a snippet — it turns `Serializes` into `serial` and
-`parses` into `pars`, terms nobody types — which is why the two halves of a message are indexed
-in separate fields rather than under one compromise analyzer. `thinking` keeps `code`: it is
+`prose` is `code` plus an English stemmer, and the stemmer is the whole difference: `compiling`
+finds `compiled`. Stemming is exactly what must never touch a snippet — it turns `Serializes`
+into `serial` and `parses` into `pars`, terms nobody types — which is why the two halves of a
+message are indexed in separate fields rather than under one compromise analyzer.
+
+What `prose` does **not** drop is identifier splitting. Only fenced blocks and inline spans are
+routed to `code`; a sentence naming `SnippetGenerator` without backticks stays in `text`, as do
+attachments, `system` records and a tool call's name and input — none of which is markdown to
+split at all. Tokenizing those the stock way would index `SnippetGenerator` as one opaque word
+and leave `snippet` unable to find it, which is the hole the `code` analyzer exists to close.
+A plain English word still emits once, stemmed. `thinking` keeps `code`: it is
 prose and snippets interleaved with no marker between them, so there is no split to make, and
 the analyzer that keeps identifiers intact loses least. `tool_input` keeps `code` for the same
 reason it always had it — its values are commands and paths.
@@ -180,13 +189,17 @@ and routes each event:
 | paragraph, list item, table cell, blockquote, link text, image alt, raw HTML | `text` |
 | fenced or indented code block | one `code` entry, its info word in `code_langs` |
 | inline `` `span` `` | one `code` entry **and** stays in `text` |
-| heading | one `headings` entry **and** a line of `text` |
+| heading | one `headings` entry **and** an entry of `text` |
 
-Prose blocks are joined with newlines. Three routings are deliberate:
+`text` is **one entry per prose block**, never one joined string. Lifting a fence out of the
+middle of a message would otherwise close the gap it left, making the sentence before it
+adjacent to the sentence after it, and a phrase query would match across text that was never
+adjacent. Tantivy separates the values of a multi-valued field by a position gap, which is
+exactly the gap a removed block should leave behind. Three routings are deliberate:
 
-- **A heading is also prose.** `show` prints `text`, so routing headings only to their own field
-  would delete every section title from the rendered transcript. Headings are short, and the
-  boost on `headings` is what makes the ranking difference, not exclusivity.
+- **A heading is also prose.** Routing headings only to their own field would take the section
+  title out of the sentence flow a `text` query searches. Headings are short, and the boost on
+  `headings` is what makes the ranking difference, not exclusivity.
 - **Raw HTML is text, not dropped.** A turn that opens with `<system-reminder>` is one HTML block
   to a markdown parser; dropping HTML would silently unindex the whole of it.
 - **Link destinations are dropped.** A URL is not prose, and `tool_input` already carries the
@@ -202,11 +215,18 @@ cap a body *before* splitting it.
   mean nothing of the sort. Its name and input strings stay in `text` as they always were; its
   **output** moves to `code`, and so do the `old_string` / `new_string` / `content` leaves of an
   `Edit`/`Write`/`MultiEdit`, which are file contents (the key decides, at any depth);
-- attachments and `system` records stay whole in `text`;
+- attachments, `system` records and a non-text `user` payload stay whole in `text` — one value,
+  unsplit. They are not markdown, and the `prose` analyzer splits identifiers, so a rendered
+  file, a diagnostic or a hook's output is still searchable by the parts of the names in it;
 - `max_text_bytes` still bounds one document's body: a message is truncated *before* the split,
   and a tool call spends the same budget across `text` then `code`. `ParseOutput::replacements`
   appends a late result as the last `code` entry against that same budget, so a completed tail
-  parse stays byte-identical to a whole-file one.
+  parse stays byte-identical to a whole-file one;
+- every doc also carries `body`: the message's markdown as it was written (after the cap), or a
+  tool call's name, input strings and output in the order they were built. It is what `show`,
+  `--context` and `--json` print. The indexed halves cannot be reassembled into it — the split
+  drops link destinations, repeats every inline span in both halves, and knows nothing of where
+  a fence sat relative to the paragraphs around it.
 
 ## Layout
 
@@ -301,8 +321,9 @@ pub struct Doc {
     pub permission_mode: Option<String>,
     pub version: Option<String>,
     pub slug: Option<String>,
-    pub text: String,            // the prose half of the body: a message's markdown minus its
-                                 // code blocks, or a tool call's name + input strings
+    pub body: String,            // the body as written: what every renderer prints. Stored only
+    pub text: Vec<String>,       // the prose half, ONE ENTRY PER BLOCK: a message's markdown
+                                 // minus its code blocks, or a tool call's name + input strings
     pub code: Vec<String>,       // the code half: one entry per code block or inline span of a
                                  // message, or a tool call's OUTPUT and file-content inputs
     pub headings: Vec<String>,   // a message's markdown headings (also present in `text`)
@@ -424,7 +445,8 @@ Field names and options:
 | `session_id`, `agent_id`, `agent_type`, `project`, `git_branch`, `role`, `kind`, `model`, `tool_name`, `entrypoint`, `permission_mode`, `version`, `slug` | `STRING \| STORED \| FAST` |
 | `project_facet` | `FacetOptions` — hierarchical, `/home/user/session-search` |
 | `tool_input` | JSON, indexed with the `code` tokenizer + `set_fast(Some("raw"))` + `set_expand_dots_enabled()` + stored |
-| `text` | stored, indexed with the `prose` tokenizer, `WithFreqsAndPositions` (`TEXT \| STORED` but for the tokenizer) |
+| `body` | `STORED` only — the body as it was written, which is what gets rendered |
+| `text` | stored, indexed with the `prose` tokenizer, `WithFreqsAndPositions` (`TEXT \| STORED` but for the tokenizer); **multi-valued** — one value per prose block, so a position gap stands where a code block was lifted out |
 | `headings` | same as `text`; **multi-valued** — one value per markdown heading |
 | `code` | same options, but the `code` tokenizer; **multi-valued** — one value per code block or inline span |
 | `code_lang` | `STRING \| STORED \| FAST`; **multi-valued** — the info word of each fence, lowercased |
@@ -501,8 +523,12 @@ pub struct FacetCount { pub value: String, pub count: u64 }
 pub struct FacetResult {
     pub field: String, pub values: Vec<FacetCount>,
     pub matching_docs: u64,      // docs matching query+filters; NOT the sum of `values`
-    pub docs_with_value: u64,    // of those, the ones carrying a value for this field
-    pub other_docs: u64,         // sum_other_doc_count: docs outside the returned buckets
+    pub docs_with_value: u64,    // of those, the DOCUMENTS carrying a value for this field —
+                                 // a second Count over `query AND ExistsQuery(field)`, because
+                                 // summing the buckets counts values, and `code_lang` is
+                                 // multi-valued: one answer with a rust fence and a bash fence
+                                 // is one document in two buckets
+    pub other_docs: u64,         // sum_other_doc_count: values outside the returned buckets
     pub distinct: Option<u64>,   // approximate distinct values (cardinality agg)
 }
 impl FacetResult {
@@ -572,9 +598,10 @@ pub fn session_list(w: &mut impl Write, s: &[SessionInfo], o: &OutputOpts) -> an
 pub fn stats(w: &mut impl Write, s: &IndexStats, o: &OutputOpts) -> anyhow::Result<()>;
 ```
 
-Anything that prints a document's body prints `text` **then** its `code` entries, in that
-order — the two halves are one body, and printing `text` alone would show a tool call with no
-output. `doc_json` carries `code`, `headings` and `code_lang` alongside `text`.
+Anything that prints a document's body prints its stored `body`: the split is for retrieval and
+cannot be undone, so rendering from `text` + `code` would print every inline span twice and move
+a fenced block to the end of the message. `doc_json` carries `body`, `text`, `code`, `headings`
+and `code_lang`.
 
 ## CLI surface
 

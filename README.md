@@ -156,9 +156,11 @@ session you are sitting in.
 The query is a real query language, not a substring match: `"quoted phrases"`, `AND`/`OR`/`NOT`
 and `field:value` all work. A message is split before it is indexed: its prose is analyzed as
 English, so `compiling` finds `compiled`, while its code blocks, its inline spans and every tool
-result go through a code-aware analyzer, so an identifier is findable by any of its parts and by
-any of its spellings — `create`, `openOrCreate` and `OpenOrCreate` all find `open_or_create`, and
-`"open_or_create"` in quotes is still an exact phrase. Markdown headings are indexed once more on
+result go through an analyzer that never stems. Both halves split identifiers, so a name is
+findable by any of its parts and by any of its spellings wherever it was written — `create`,
+`openOrCreate` and `OpenOrCreate` all find `open_or_create`, in a fence or in a sentence — and
+`"open_or_create"` in quotes is still an exact phrase. A phrase never runs across a code block
+that was lifted out from between two paragraphs. Markdown headings are indexed once more on
 their own and count double, so a hit in a section title outranks the same word in a paragraph.
 There is no fuzzy operator — Tantivy 0.26 reads `~` as phrase slop,
 not edit distance, so `widget~1` is not a near-miss search. A query that fails to parse is
@@ -731,9 +733,10 @@ session-search search "aggregation" -t Bash --limit 1 --json --facets tool_name
 (Pretty-printed here; the real output is a single line. `snippet`, `source_path`, `text` and
 `tool_input.command` are truncated with `…` for width — they are complete in the actual output.
 This capture, and the search results above it, predate the prose/code split described under
-[Documents](#documents): a hit object now also carries `code`, `headings` and `code_lang`, a tool
-call's output is in `code` rather than at the end of `text`, and a snippet is highlighted out of
-one of those fields rather than out of their concatenation.)
+[Documents](#documents): a hit object now also carries `body`, `code`, `headings` and
+`code_lang`, `text` is a list of prose blocks rather than a string, a tool call's output is in
+`code` rather than at the end of `text`, and a snippet is highlighted out of one of those fields
+rather than out of their concatenation.)
 
 ---
 
@@ -757,13 +760,15 @@ merge and old ones are reclaimed.
 One document per message, one per tool call. That granularity is what makes hits precise and
 facets meaningful — a hit points at the exact turn, not at a 400-line session.
 
-A document's body is not one field. A message is markdown, so it is split before indexing: its
-prose goes to `text` (analyzed as English, stemmed), its fenced blocks and inline spans to `code`
-(analyzed as code, never stemmed), its headings to `headings` (prose, and worth double), and each
-fence's language to `code_lang`, which is a facet like `tool_name`. A tool call is not markdown
-and is never parsed as one: its name and input strings are `text`, while its **output** — and the
-file content of an `Edit` or `Write` — is `code`. Everything printed by `show`, and every
-`--json` document, carries both halves.
+A document's body is not one indexed field. A message is markdown, so it is split before
+indexing: its prose goes to `text` (analyzed as English, stemmed — one value per block, so no
+phrase runs across a block that was removed from between two others), its fenced blocks and
+inline spans to `code` (never stemmed), its headings to `headings` (prose, and worth double), and
+each fence's language to `code_lang`, which is a facet like `tool_name`. A tool call is not
+markdown and is never parsed as one: its name and input strings are `text`, while its **output**
+— and the file content of an `Edit` or `Write` — is `code`. The body as it was written is kept
+whole beside them in `body`, stored and never indexed: that is what `show`, `--context` and
+`--json` print, so a message reads exactly as it was written rather than as prose-then-code.
 
 The index for this project's own development history:
 

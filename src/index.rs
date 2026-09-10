@@ -51,7 +51,10 @@ use crate::schema::{Fields, build_schema, doc_to_json};
 const TANTIVY_SUBDIR: &str = "tantivy";
 const STATE_FILE: &str = "state.json";
 const SESSIONS_FILE: &str = "sessions.json";
-const STATE_VERSION: u32 = 1;
+/// Bumped when the shape of what `state.json` carries changes. A carried tool-call document
+/// holds `text` as a list of blocks and a `body` beside it, so a file written by version 1
+/// cannot be read back into one — and a version mismatch reindexes, which is what that needs.
+const STATE_VERSION: u32 = 2;
 
 /// Tantivy refuses a per-thread arena below this (`MEMORY_BUDGET_NUM_BYTES_MIN`).
 const MIN_HEAP_BYTES: usize = 15_000_000;
@@ -1488,7 +1491,8 @@ mod tests {
         ));
     }
 
-    /// Every `text` currently in the index.
+    /// Every stored body currently in the index. `body` rather than `text`, which is one
+    /// value per prose block and would report only the first of them.
     fn indexed_texts(index_dir: &Path) -> Vec<String> {
         use tantivy::schema::Value as _;
         let (index, fields) = open_or_create(index_dir).unwrap();
@@ -1503,7 +1507,7 @@ mod tests {
             .into_iter()
             .map(|(_, address)| {
                 let doc: TantivyDocument = searcher.doc(address).unwrap();
-                doc.get_first(fields.text)
+                doc.get_first(fields.body)
                     .and_then(|v| v.as_str().map(str::to_string))
                     .unwrap_or_default()
             })
@@ -1693,7 +1697,7 @@ mod tests {
                         .and_then(|v| v.as_str().map(str::to_string))
                         .unwrap_or_default()
                 };
-                (field(fields.doc_id), field(fields.text))
+                (field(fields.doc_id), field(fields.body))
             })
             .collect()
     }

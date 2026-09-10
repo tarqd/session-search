@@ -205,6 +205,7 @@ pub fn doc_json(d: &Doc) -> Value {
         "permission_mode": d.permission_mode,
         "version": d.version,
         "slug": d.slug,
+        "body": d.body,
         "text": d.text,
         "code": d.code,
         "headings": d.headings,
@@ -761,21 +762,20 @@ fn is_control_char(c: char) -> bool {
     !c.is_whitespace() && (c.is_control() || ('\u{80}'..='\u{9f}').contains(&c))
 }
 
-/// Whitespace collapsed onto one line, control characters neutralised, then truncated to `max`
-/// visible characters.
-/// Everything of a document a reader would have seen before the body was split in two: the
-/// prose, then the code blocks under it.
+/// Everything of a document a reader would have seen, in the order the transcript holds it.
 ///
-/// `parse.rs` moves a message's fenced blocks and a tool call's output out of `text` and into
-/// `code`, so anything that prints `text` alone now prints a tool call with no output and an
-/// answer with no snippet in it. Order matches the source: prose first, code after.
+/// The stored `body` is that text verbatim, which is why it exists: `parse.rs` splits a
+/// message into prose and code for *retrieval*, and that split cannot be undone. It drops link
+/// destinations, repeats every inline span in both halves, and would print a message's fenced
+/// blocks after the paragraph that follows them rather than where they were written.
+///
+/// The join below is the fallback for a [`Doc`] that carries no `body` — one built by hand in
+/// a test, or read back from an index written before the field existed.
 fn body(d: &Doc) -> String {
-    if d.code.is_empty() {
-        return d.text.clone();
+    if !d.body.is_empty() {
+        return d.body.clone();
     }
-    let mut out =
-        String::with_capacity(d.text.len() + d.code.iter().map(String::len).sum::<usize>());
-    out.push_str(d.text.trim_end());
+    let mut out = d.text.join("\n");
     for block in &d.code {
         if !out.is_empty() {
             out.push('\n');
@@ -785,6 +785,8 @@ fn body(d: &Doc) -> String {
     out
 }
 
+/// Whitespace collapsed onto one line, control characters neutralised, then truncated to `max`
+/// visible characters.
 fn one_line(s: &str, max: usize) -> String {
     let flat = s.split_whitespace().collect::<Vec<_>>().join(" ");
     truncate(&sanitize_controls(&flat), max)
@@ -1028,7 +1030,8 @@ mod tests {
             permission_mode: None,
             version: Some("2.1.266".into()),
             slug: Some("wild-spinning-puppy".into()),
-            text: text.into(),
+            body: text.into(),
+            text: vec![text.into()],
             code: Vec::new(),
             headings: Vec::new(),
             code_langs: Vec::new(),
@@ -1288,7 +1291,8 @@ mod tests {
         let view = render(|w| session_view(w, &[doc(1, "user", "hello")], &json_opts()));
         let v: Value = serde_json::from_str(&view).unwrap();
         assert_eq!(v["count"], 1);
-        assert_eq!(v["docs"][0]["text"], "hello");
+        assert_eq!(v["docs"][0]["body"], "hello");
+        assert_eq!(v["docs"][0]["text"][0], "hello");
     }
 
     // -- human rendering ----------------------------------------------------
@@ -1457,14 +1461,18 @@ mod tests {
         assert!(out.len() < long.len() + 4_000);
     }
 
-    /// The body of a document is spread over `text` and `code`, and `show` prints both — a
-    /// tool call with no output on screen, or an answer with the snippet cut out of it, would
-    /// be a regression in what the command displays.
+    /// A document is indexed as prose and code in separate fields, but it is *rendered* from
+    /// the body it was written as: a tool call with no output on screen, or an answer with its
+    /// code cut out of it, would be a regression in what the command displays.
     #[test]
-    fn session_view_prints_the_code_after_the_prose() {
-        let mut answer = doc(1, "assistant", "Use the helper:");
-        answer.code = vec!["pub fn open_or_create(dir: &Path) {}".into()];
-        answer.headings = vec!["The fix".into()];
+    fn session_view_prints_the_body_as_it_was_written() {
+        let source = "## The fix\n\nCall `register` first:\n\n```rust\npub fn open_or_create(dir: &Path) {}\n```\n\nThen re-run `cargo test`.";
+        let mut answer = doc(1, "assistant", "");
+        let parts = crate::markdown::split(source);
+        answer.body = source.to_string();
+        answer.text = parts.text;
+        answer.code = parts.code;
+        answer.headings = parts.headings;
         let mut call = tool_doc(
             2,
             "Bash",
@@ -1472,18 +1480,25 @@ mod tests {
             "Bash\ncargo test",
         );
         call.code = vec!["error: test failed".into()];
+        call.body = "Bash\ncargo test\nerror: test failed".into();
 
-        let out = render(|w| session_view(w, &[answer, call], &plain()));
-        assert!(out.contains("Use the helper:"), "{out}");
+        let out = render(|w| session_view(w, &[answer], &plain()));
+        assert!(out.contains("Call `register` first:"), "{out}");
         assert!(out.contains("pub fn open_or_create"), "{out}");
+        // Source order, not "all prose, then all code": the fenced block sits between the
+        // paragraph that introduces it and the one that follows it...
+        let fence = out.find("pub fn open_or_create").unwrap();
+        assert!(out.find("Call `register` first:").unwrap() < fence, "{out}");
+        assert!(out.find("Then re-run").unwrap() > fence, "{out}");
+        // ...and the inline span is printed once, inside its sentence, not again as a block.
+        assert_eq!(out.matches("cargo test").count(), 1, "{out}");
+
+        // A tool call has no source markdown, so its body is its name, its input and then its
+        // output — which is the order it was built in, and all of it is on screen.
+        let out = render(|w| session_view(w, &[call], &plain()));
         assert!(out.contains("error: test failed"), "{out}");
-        // Prose first, code after it.
         assert!(
-            out.find("Use the helper:") < out.find("pub fn open_or_create"),
-            "{out}"
-        );
-        assert!(
-            out.find("cargo test") < out.find("error: test failed"),
+            out.rfind("cargo test").unwrap() < out.find("error: test failed").unwrap(),
             "{out}"
         );
     }
@@ -1496,6 +1511,8 @@ mod tests {
         d.headings = vec!["The fix".into()];
         d.code_langs = vec!["rust".into()];
         let v = doc_json(&d);
+        assert_eq!(v["body"], "Use the helper:");
+        assert_eq!(v["text"][0], "Use the helper:");
         assert_eq!(v["code"][0], "pub fn open_or_create(dir: &Path) {}");
         assert_eq!(v["headings"][0], "The fix");
         assert_eq!(v["code_lang"][0], "rust");

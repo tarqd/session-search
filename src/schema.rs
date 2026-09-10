@@ -5,10 +5,11 @@
 //! * `tool_input` is a JSON field that is **indexed and fast**, with dots expanded, which is
 //!   what makes `tool_input.command:cargo` filtering *and* a terms aggregation over parameter
 //!   keys that were never declared in the schema both work.
-//! * a message's body is spread over three fields rather than one. `text` and `headings` hold
-//!   its prose and are analyzed as English; `code` holds its snippets and is analyzed as code;
-//!   `code_lang` holds the fence languages as facet values. `parse.rs` does the splitting and
-//!   `markdown.rs` decides what goes where.
+//! * a message's body is spread over three *indexed* fields rather than one. `text` and
+//!   `headings` hold its prose and are analyzed as English; `code` holds its snippets and is
+//!   analyzed as code; `code_lang` holds the fence languages as facet values. `parse.rs` does
+//!   the splitting and `markdown.rs` decides what goes where. Beside them, `body` keeps the
+//!   body as it was written, stored and never indexed, because that is what gets rendered.
 
 use serde_json::{Map, Value, json};
 use tantivy::schema::{
@@ -44,6 +45,9 @@ pub struct Fields {
 
     pub project_facet: tantivy::schema::Field,
     pub tool_input: tantivy::schema::Field,
+    /// Stored only: the body as a reader saw it, which is what every renderer prints.
+    pub body: tantivy::schema::Field,
+    /// Multi-valued: one value per prose block of the message.
     pub text: tantivy::schema::Field,
     /// Multi-valued: one value per code block or inline span of the message.
     pub code: tantivy::schema::Field,
@@ -119,8 +123,15 @@ pub fn build_schema() -> (Schema, Fields) {
     let project_facet = sb.add_facet_field("project_facet", STORED);
     let tool_input = sb.add_json_field("tool_input", tool_input_options());
 
+    // What a reader saw, kept whole and never indexed. The retrieval fields below cannot be
+    // reassembled into it — the split drops link destinations, lifts fenced blocks out of the
+    // order they were written in and repeats every inline span — and `show`, `--context` and
+    // `--json` all have to print the message the transcript actually holds.
+    let body = sb.add_text_field("body", STORED);
     // Prose gets prose analysis; code gets code analysis. `parse.rs` splits a markdown message
-    // between the two, and `markdown.rs` says which piece goes where.
+    // between the two, and `markdown.rs` says which piece goes where. `text` carries one value
+    // per prose block: Tantivy separates the values of a field by a position gap, which is what
+    // stops a phrase matching across a code block that was lifted out from between them.
     let text = sb.add_text_field("text", full_text_options(PROSE_ANALYZER));
     let headings = sb.add_text_field("headings", full_text_options(PROSE_ANALYZER));
     let code = sb.add_text_field("code", full_text_options(CODE_ANALYZER));
@@ -165,6 +176,7 @@ pub fn build_schema() -> (Schema, Fields) {
         slug,
         project_facet,
         tool_input,
+        body,
         text,
         code,
         headings,
@@ -237,7 +249,7 @@ pub fn doc_to_json(doc: &Doc, include_thinking: bool) -> Value {
     put_str(&mut o, "permission_mode", doc.permission_mode.as_deref());
     put_str(&mut o, "version", doc.version.as_deref());
     put_str(&mut o, "slug", doc.slug.as_deref());
-    put_str(&mut o, "text", Some(&doc.text));
+    put_str(&mut o, "body", Some(&doc.body));
     put_str(&mut o, "raw", Some(&doc.raw));
 
     // Multi-valued fields: Tantivy adds one value per array element, and an empty array is the
@@ -248,6 +260,7 @@ pub fn doc_to_json(doc: &Doc, include_thinking: bool) -> Value {
             o.insert(key.to_string(), json!(kept));
         }
     };
+    put_list(&mut o, "text", &doc.text);
     put_list(&mut o, "code", &doc.code);
     put_list(&mut o, "headings", &doc.headings);
     put_list(&mut o, "code_lang", &doc.code_langs);
@@ -313,7 +326,8 @@ mod tests {
             permission_mode: Some("default".into()),
             version: Some("2.1.266".into()),
             slug: Some("wild-spinning-puppy".into()),
-            text: "Bash\ncargo build".into(),
+            body: "Bash\ncargo build\nCompiling tantivy v0.26.2\nFinished dev".into(),
+            text: vec!["Bash\ncargo build".into()],
             code: vec!["Compiling tantivy v0.26.2".into(), "Finished dev".into()],
             headings: Vec::new(),
             code_langs: Vec::new(),
@@ -346,6 +360,7 @@ mod tests {
             "slug",
             "project_facet",
             "tool_input",
+            "body",
             "text",
             "code",
             "headings",
@@ -392,8 +407,13 @@ mod tests {
         assert!(doc.get_first(f.project_facet).unwrap().as_facet().is_some());
         assert!(doc.get_first(f.tool_input).is_some());
         assert!(doc.get_first(f.thinking).is_some());
-        // `code`, `headings` and `code_lang` are multi-valued: a JSON array becomes one value
-        // per element, not one value holding a rendered array.
+        // The body is stored whole, beside the fields the split produced from it.
+        assert_eq!(
+            first(f.body),
+            "Bash\ncargo build\nCompiling tantivy v0.26.2\nFinished dev"
+        );
+        // `text`, `code`, `headings` and `code_lang` are multi-valued: a JSON array becomes one
+        // value per element, not one value holding a rendered array.
         assert_eq!(doc.get_all(f.code).count(), 2);
         assert_eq!(
             doc.get_first(f.code).unwrap().as_str(),
@@ -406,6 +426,7 @@ mod tests {
         let (schema, f) = build_schema();
         let mut d = sample();
         d.kind = DocKind::Message;
+        d.text = vec!["First para".into(), "Second para".into(), "  ".into()];
         d.code = vec!["let a = 1;".into(), "let b = 2;".into(), "  ".into()];
         d.headings = vec!["First".into(), "Second".into()];
         d.code_langs = vec!["rust".into(), "bash".into()];
@@ -413,6 +434,8 @@ mod tests {
         let doc = TantivyDocument::parse_json(&schema, &value.to_string()).unwrap();
 
         // A blank entry is dropped rather than stored as an empty value.
+        let text: Vec<&str> = doc.get_all(f.text).filter_map(|v| v.as_str()).collect();
+        assert_eq!(text, ["First para", "Second para"]);
         let code: Vec<&str> = doc.get_all(f.code).filter_map(|v| v.as_str()).collect();
         assert_eq!(code, ["let a = 1;", "let b = 2;"]);
         let heads: Vec<&str> = doc.get_all(f.headings).filter_map(|v| v.as_str()).collect();
@@ -424,10 +447,12 @@ mod tests {
         assert_eq!(langs, ["rust", "bash"]);
 
         // Empty vectors are omitted entirely, the way every other absent value is.
+        d.text.clear();
         d.code.clear();
         d.headings.clear();
         d.code_langs.clear();
         let value = doc_to_json(&d, false);
+        assert!(value.get("text").is_none());
         assert!(value.get("code").is_none());
         assert!(value.get("headings").is_none());
         assert!(value.get("code_lang").is_none());

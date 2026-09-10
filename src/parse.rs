@@ -82,12 +82,26 @@ pub struct Doc {
     pub permission_mode: Option<String>,
     pub version: Option<String>,
     pub slug: Option<String>,
-    /// The indexed body, prose only: for a message the markdown minus its code blocks, for a
-    /// tool call the tool name and its input strings. Analyzed as English.
-    pub text: String,
+    /// The body as a reader saw it: a message's original markdown, or a tool call's name,
+    /// input strings and output. Stored, never indexed — it is what `show`, `--context` and
+    /// `--json` render.
+    ///
+    /// The retrieval fields below cannot be reassembled into it: the split drops link
+    /// destinations, repeats every inline span in both halves, and keeps no record of where a
+    /// fence sat among the paragraphs it was written between.
+    #[serde(default)]
+    pub body: String,
+    /// The indexed prose, **one entry per block**: for a message the markdown minus its code
+    /// blocks, for a tool call the tool name and its input strings. Analyzed as English.
+    ///
+    /// One entry per block, not one joined string, so that Tantivy's position gap stands where
+    /// a code block was lifted out and no phrase can match across it.
+    #[serde(default)]
+    pub text: Vec<String>,
     /// The code half of the body, one entry per code block or inline span of a message, and the
-    /// tool *output* of a tool call. Analyzed as code. `#[serde(default)]` on this and the two
-    /// below so a `state.json` carried over from a build without them still loads.
+    /// tool *output* of a tool call. Analyzed as code. `#[serde(default)]` on this and its
+    /// neighbours so a `state.json` carried over from a build without them still loads — and
+    /// `STATE_VERSION` is bumped when a field changes shape, which `text` just did.
     #[serde(default)]
     pub code: Vec<String>,
     /// A message's markdown headings, one entry each. Also present in `text`.
@@ -783,9 +797,13 @@ impl<'a> Parser<'a> {
                 continue;
             };
             let mut doc = doc.clone();
-            let used = doc.text.len() + doc.code.iter().map(String::len).sum::<usize>();
+            let used = doc.text.iter().map(String::len).sum::<usize>()
+                + doc.code.iter().map(String::len).sum::<usize>();
             let remaining = self.opts.max_text_bytes.saturating_sub(used);
             doc.code.extend(entry(&outcome.text, remaining));
+            // The rendered body is assembled from the same two halves, so it has to be
+            // reassembled here too or `show` would print the completed call without its result.
+            doc.body = rendered_body(&doc.text.join("\n"), &doc.code);
             doc.is_error = outcome.is_error;
             out.push(doc);
         }
@@ -1227,6 +1245,7 @@ impl<'a> Parser<'a> {
             slug: common
                 .and_then(|c| c.slug.clone())
                 .or_else(|| self.session.slug.clone()),
+            body: p.body,
             text: p.text,
             code: p.code,
             headings: p.headings,
@@ -1242,7 +1261,8 @@ impl<'a> Parser<'a> {
 struct PartialDoc {
     kind: DocKind,
     role: String,
-    text: String,
+    body: String,
+    text: Vec<String>,
     code: Vec<String>,
     headings: Vec<String>,
     code_langs: Vec<String>,
@@ -1262,7 +1282,8 @@ impl PartialDoc {
         PartialDoc {
             kind: DocKind::Message,
             role: role.to_string(),
-            text,
+            body: text.clone(),
+            text: entry(&text, usize::MAX).into_iter().collect(),
             code: Vec::new(),
             headings: Vec::new(),
             code_langs: Vec::new(),
@@ -1283,10 +1304,12 @@ impl PartialDoc {
     /// that budget instead of each getting one. Truncating markdown can cut a fence in half;
     /// `markdown::split` treats an unclosed fence as a closed one.
     fn markdown(role: &str, body: &str, cap: usize) -> PartialDoc {
-        let parts = crate::markdown::split(&truncate(body, cap));
+        let body = truncate(body, cap);
+        let parts = crate::markdown::split(&body);
         PartialDoc {
             kind: DocKind::Message,
             role: role.to_string(),
+            body,
             text: parts.text,
             code: parts.code,
             headings: parts.headings,
@@ -1312,7 +1335,8 @@ impl PartialDoc {
         PartialDoc {
             kind: DocKind::ToolCall,
             role: "assistant".to_string(),
-            text,
+            body: rendered_body(&text, &code),
+            text: entry(&text, usize::MAX).into_iter().collect(),
             code,
             headings: Vec::new(),
             code_langs: Vec::new(),
@@ -1387,7 +1411,7 @@ fn ids_from_path(path: &Path) -> FileIds {
 
 /// A copy of a document small enough to sit in `state.json` until its result arrives.
 fn carryable(doc: &Doc) -> Option<Box<Doc>> {
-    (doc.text.len() + doc.raw.len() <= PENDING_DOC_CAP).then(|| Box::new(doc.clone()))
+    (doc.body.len() + doc.raw.len() <= PENDING_DOC_CAP).then(|| Box::new(doc.clone()))
 }
 
 /// The last `cap` elements, in order. Used to bound what one file's [`ParseCarry`] persists.
@@ -1509,6 +1533,22 @@ fn input_leaves(v: &Value) -> (Vec<String>, Vec<String>) {
     (words, code)
 }
 
+/// A tool call as a reader sees it: its name and input strings, then each `code` entry — the
+/// file contents it carried and its output — on a line of its own.
+///
+/// A tool call has no source markdown to keep, so its `body` is assembled from the same two
+/// halves that are indexed, in the order they were built.
+fn rendered_body(text: &str, code: &[String]) -> String {
+    let mut out = text.trim_end().to_string();
+    for block in code {
+        if !out.is_empty() {
+            out.push('\n');
+        }
+        out.push_str(block);
+    }
+    out
+}
+
 /// `text` truncated to `max` bytes as a one-element vector, or nothing when it is blank.
 ///
 /// The multi-valued fields hold real content or no value at all: a blank entry would cost a
@@ -1593,8 +1633,14 @@ mod tests {
         parse_whole(&path, &ParseOptions::default()).expect("body must parse")
     }
 
-    fn texts(out: &ParseOutput) -> Vec<&str> {
-        out.docs.iter().map(|d| d.text.as_str()).collect()
+    fn texts(out: &ParseOutput) -> Vec<String> {
+        out.docs.iter().map(text_of).collect()
+    }
+
+    /// The prose half of a document as one string. `text` is one entry per block, so the
+    /// assertions that only care *that* a sentence was indexed join them back up.
+    fn text_of(d: &Doc) -> String {
+        d.text.join("\n")
     }
 
     /// The `code` half of a document as one string. Tool output and file contents live there
@@ -1610,7 +1656,7 @@ mod tests {
         let (out, _) = parse("nul_and_partial.jsonl");
         assert!(out.errors.is_empty(), "{:?}", out.errors);
         assert!(
-            texts(&out).contains(&"padded line answer"),
+            texts(&out).iter().any(|t| t == "padded line answer"),
             "the NUL-padded line must be parsed: {:?}",
             texts(&out)
         );
@@ -1656,7 +1702,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(tail.docs.len(), 1);
-        assert_eq!(tail.docs[0].text, "truncated prompt");
+        assert_eq!(tail.docs[0].text, ["truncated prompt"]);
         assert_eq!(tail.docs[0].seq, seq_base);
         assert_eq!(offset3, std::fs::metadata(&live).unwrap().len());
     }
@@ -1740,7 +1786,7 @@ mod tests {
             .iter()
             .find(|d| d.thinking.is_some())
             .expect("a thinking doc");
-        assert_eq!(thinking.text, "");
+        assert!(thinking.text.is_empty());
         assert!(
             thinking
                 .thinking
@@ -1749,7 +1795,9 @@ mod tests {
                 .contains("secret reasoning")
         );
         assert!(
-            !out.docs.iter().any(|d| d.text.contains("secret reasoning")),
+            !out.docs
+                .iter()
+                .any(|d| text_of(d).contains("secret reasoning")),
             "thinking must never leak into the indexed text"
         );
     }
@@ -1766,7 +1814,7 @@ mod tests {
         assert_eq!(bash.tool_name.as_deref(), Some("Bash"));
         assert_eq!(bash.tool_input.as_ref().unwrap()["command"], "cargo build");
         assert!(
-            bash.text.contains("cargo build"),
+            text_of(bash).contains("cargo build"),
             "input is indexed as text"
         );
         assert!(
@@ -1775,7 +1823,7 @@ mod tests {
             bash.code
         );
         assert!(
-            !bash.text.contains("Compiling session-search"),
+            !text_of(bash).contains("Compiling session-search"),
             "...and only as code"
         );
         assert!(!bash.is_error);
@@ -1814,11 +1862,11 @@ mod tests {
         assert_eq!(doc.code.len(), 2, "{:?}", doc.code);
         assert!(doc.code.iter().any(|c| c.contains("pub fn open_or_create")));
         assert!(doc.code.contains(&"open_or_create".to_string()));
-        assert!(!doc.text.contains("pub fn"), "{:?}", doc.text);
-        // The prose keeps the sentence — including the heading, which `show` prints.
-        assert!(doc.text.starts_with("The fix"), "{:?}", doc.text);
+        assert!(!text_of(doc).contains("pub fn"), "{:?}", doc.text);
+        // The prose keeps the sentence — and the heading, which is prose as well as a heading.
+        assert!(doc.text.first().unwrap() == "The fix", "{:?}", doc.text);
         assert!(
-            doc.text.contains("had already compiled it"),
+            text_of(doc).contains("had already compiled it"),
             "{:?}",
             doc.text
         );
@@ -1841,13 +1889,13 @@ mod tests {
             "u.jsonl",
             &format!("{}\n", line("run this:\n\n```bash\ncargo test\n```")),
         );
-        assert_eq!(out.docs[0].text, "run this:");
+        assert_eq!(out.docs[0].text, ["run this:"]);
         assert_eq!(out.docs[0].code, ["cargo test"]);
         assert_eq!(out.docs[0].code_langs, ["bash"]);
 
         let plain = "please make the tantivy schema faster";
         let out = parse_body(dir.path(), "p.jsonl", &format!("{}\n", line(plain)));
-        assert_eq!(out.docs[0].text, plain);
+        assert_eq!(out.docs[0].text, [plain]);
         assert!(out.docs[0].code.is_empty());
     }
 
@@ -1881,9 +1929,13 @@ mod tests {
         assert!(call.headings.is_empty(), "`# rebuild` is not a heading");
         assert!(call.code_langs.is_empty());
         // The name and the input strings are the text, verbatim, exactly as before.
-        assert!(call.text.starts_with("Bash\n"), "{:?}", call.text);
-        assert!(call.text.contains("# rebuild"), "{:?}", call.text);
-        assert!(call.text.contains("*.rs > /tmp/list"), "{:?}", call.text);
+        assert!(text_of(call).starts_with("Bash\n"), "{:?}", call.text);
+        assert!(text_of(call).contains("# rebuild"), "{:?}", call.text);
+        assert!(
+            text_of(call).contains("*.rs > /tmp/list"),
+            "{:?}",
+            call.text
+        );
         // The output is the code, and only the code.
         assert_eq!(call.code, ["# 3 files"]);
     }
@@ -1915,8 +1967,8 @@ mod tests {
         };
 
         let edit = call("t1");
-        assert!(edit.text.contains("/home/user/session-search/src/index.rs"));
-        assert!(!edit.text.contains("openOrCreate"), "{:?}", edit.text);
+        assert!(text_of(edit).contains("/home/user/session-search/src/index.rs"));
+        assert!(!text_of(edit).contains("openOrCreate"), "{:?}", edit.text);
         // Leaf order follows the JSON object's key order, which `serde_json` sorts.
         assert_eq!(
             edit.code,
@@ -1924,7 +1976,7 @@ mod tests {
         );
         // A `MultiEdit` nests its payloads one level deeper; the key still decides.
         let multi = call("t2");
-        assert!(multi.text.contains("/tmp/a.rs"));
+        assert!(text_of(multi).contains("/tmp/a.rs"));
         assert_eq!(multi.code, ["let x\nlet mut x"]);
     }
 
@@ -1933,8 +1985,8 @@ mod tests {
         let (out, _) = parse("union_types.jsonl");
         assert!(out.errors.is_empty());
         let t = texts(&out);
-        assert!(t.contains(&"a string prompt"));
-        assert!(t.contains(&"an array prompt"));
+        assert!(t.iter().any(|t| t == "a string prompt"));
+        assert!(t.iter().any(|t| t == "an array prompt"));
         assert!(
             t.iter().any(|s| s.contains("weird")),
             "non-union content is still kept"
@@ -1995,7 +2047,7 @@ mod tests {
         let (out, _) = parse("attachments.jsonl");
         let sys = out.docs.iter().find(|d| d.role == "system").unwrap();
         assert!(sys.is_meta);
-        assert!(sys.text.contains("compact_boundary"));
+        assert!(text_of(sys).contains("compact_boundary"));
     }
 
     #[test]
@@ -2243,13 +2295,13 @@ mod tests {
         let inline = out
             .docs
             .iter()
-            .find(|d| d.text.contains("sidechain says hi"))
+            .find(|d| text_of(d).contains("sidechain says hi"))
             .unwrap();
         assert!(inline.is_sidechain, "the record itself said so");
         assert_eq!(inline.agent_id.as_deref(), Some("aDEADBEEF"));
 
         for text in ["main turn one", "main turn two"] {
-            let doc = out.docs.iter().find(|d| d.text == text).unwrap();
+            let doc = out.docs.iter().find(|d| d.text == [text]).unwrap();
             assert!(!doc.is_sidechain, "{text}: {doc:?}");
             assert!(doc.agent_id.is_none(), "{text}: {doc:?}");
             assert!(doc.agent_type.is_none(), "{text}: {doc:?}");
@@ -2280,7 +2332,7 @@ mod tests {
         assert!(
             out.docs
                 .iter()
-                .find(|d| d.text.contains("THE SUMMARY"))
+                .find(|d| text_of(d).contains("THE SUMMARY"))
                 .unwrap()
                 .is_meta
         );

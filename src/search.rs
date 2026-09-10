@@ -134,9 +134,11 @@ pub struct FacetResult {
     pub values: Vec<FacetCount>,
     /// Documents matching the query and filters. **Not** the sum of `values`.
     pub matching_docs: u64,
-    /// Of those, the ones that actually carry a value for this field.
+    /// Of those, the ones that actually carry a value for this field. Documents, not values:
+    /// a document with two fence languages counts once here and twice in `values`.
     pub docs_with_value: u64,
-    /// Documents whose value fell outside the returned buckets (`sum_other_doc_count`).
+    /// Values that fell outside the returned buckets (`sum_other_doc_count`) — one document
+    /// per value, except on a multi-valued field, where one document can contribute several.
     pub other_docs: u64,
     /// Approximate count of distinct values (HyperLogLog), over the matching set.
     pub distinct: Option<u64>,
@@ -225,7 +227,14 @@ pub fn search(
         for (i, name) in facet_fields.iter().enumerate() {
             facets.insert(
                 (*name).to_string(),
-                facet_result_from(&as_json, i, name, req.facet_top, total as u64),
+                facet_result_from(
+                    &as_json,
+                    i,
+                    name,
+                    req.facet_top,
+                    total as u64,
+                    count_docs_with_value(&searcher, &*query, name),
+                ),
             );
         }
     }
@@ -378,6 +387,7 @@ pub fn facets(
         field,
         req.facet_top,
         matching as u64,
+        count_docs_with_value(&searcher, &*query, field),
     ))
 }
 
@@ -721,6 +731,26 @@ fn agg_collector(fields: &[&str], top: usize) -> AggregationCollector {
     AggregationCollector::from_aggs(aggs, Default::default())
 }
 
+/// Documents matching `query` that carry at least one value for `field`.
+///
+/// Summing the bucket counts answers a different question, and the two only agree while every
+/// value is single-valued. `code_lang` is not: one answer with a `rust` fence and a `bash`
+/// fence contributes to two buckets, so the sum can exceed the number of documents that
+/// matched and the printed line would claim more documents than the search found.
+/// `ExistsQuery` counts documents, whatever the arity of the field.
+fn count_docs_with_value(searcher: &Searcher, query: &dyn Query, field: &str) -> u64 {
+    // `json_subpaths` matters when the facet *is* a JSON field rather than one of its paths:
+    // `tool_input` carries values only inside its subpaths.
+    let exists = ExistsQuery::new(field.to_string(), true);
+    let both = BooleanQuery::new(vec![
+        (Occur::Must, query.box_clone()),
+        (Occur::Must, Box::new(exists) as Box<dyn Query>),
+    ]);
+    // The aggregation already succeeded on this field, so the count cannot fail for a reason
+    // the caller could act on; a facet is not worth failing a whole search for either way.
+    searcher.search(&both, &Count).unwrap_or(0) as u64
+}
+
 /// Assemble the buckets and the counts needed to read them, for facet `i` of a request.
 fn facet_result_from(
     result: &Value,
@@ -728,6 +758,7 @@ fn facet_result_from(
     field: &str,
     top: usize,
     matching_docs: u64,
+    docs_with_value: u64,
 ) -> FacetResult {
     let values = buckets_from(result, &agg_key(i), top);
     let other_docs = result
@@ -744,7 +775,7 @@ fn facet_result_from(
         .map(|v| v.round() as u64);
     FacetResult {
         field: field.to_string(),
-        docs_with_value: values.iter().map(|f| f.count).sum::<u64>() + other_docs,
+        docs_with_value,
         matching_docs,
         other_docs,
         distinct,
@@ -829,8 +860,11 @@ fn render_snippet(snippet: &Snippet) -> String {
 /// A tool call whose input was empty, and an orphaned tool result, both carry their whole body
 /// in `code`; showing a blank line for them would hide the document the search just returned.
 fn fallback_body(doc: &Doc) -> String {
-    if !doc.text.trim().is_empty() {
-        return doc.text.clone();
+    if !doc.body.trim().is_empty() {
+        return doc.body.clone();
+    }
+    if !doc.text.is_empty() {
+        return doc.text.join("\n");
     }
     if !doc.code.is_empty() {
         return doc.code.join("\n");
@@ -881,7 +915,7 @@ pub fn doc_from_stored(f: &Fields, stored: &TantivyDocument) -> Doc {
     };
     let u = |field: Field| -> Option<u64> { stored.get_first(field).and_then(|v| v.as_u64()) };
     let flag = |field: Field| -> bool { u(field).unwrap_or(0) != 0 };
-    // The three multi-valued fields: `get_first` would silently keep one code block of five.
+    // The four multi-valued fields: `get_first` would silently keep one code block of five.
     let list = |field: Field| -> Vec<String> {
         stored
             .get_all(field)
@@ -928,7 +962,8 @@ pub fn doc_from_stored(f: &Fields, stored: &TantivyDocument) -> Doc {
         permission_mode: s(f.permission_mode),
         version: s(f.version),
         slug: s(f.slug),
-        text: s(f.text).unwrap_or_default(),
+        body: s(f.body).unwrap_or_default(),
+        text: list(f.text),
         code: list(f.code),
         headings: list(f.headings),
         code_langs: list(f.code_lang),
@@ -1034,7 +1069,8 @@ pub(crate) mod testkit {
             permission_mode: None,
             version: Some("2.1.266".into()),
             slug: None,
-            text: String::new(),
+            body: String::new(),
+            text: Vec::new(),
             code: Vec::new(),
             headings: Vec::new(),
             code_langs: Vec::new(),
@@ -1063,7 +1099,7 @@ pub(crate) mod testkit {
         let mut docs = Vec::new();
 
         let mut d = blank_doc(0);
-        d.text = "please make the tantivy schema faster".into();
+        d.text = vec!["please make the tantivy schema faster".into()];
         docs.push(d);
 
         // Tool calls are shaped the way `parse::tool_call_doc` shapes them: the name and the
@@ -1075,7 +1111,7 @@ pub(crate) mod testkit {
         d.tool_name = Some("Bash".into());
         d.tool_use_id = Some("toolu_1".into());
         d.tool_input = Some(json!({"command": "cargo build --release", "timeout": 600000}));
-        d.text = "Bash\ncargo build --release".into();
+        d.text = vec!["Bash\ncargo build --release".into()];
         d.code = vec!["Compiling tantivy v0.26.2".into()];
         docs.push(d);
 
@@ -1085,7 +1121,7 @@ pub(crate) mod testkit {
         d.model = Some("claude-opus-5".into());
         d.tool_name = Some("Read".into());
         d.tool_input = Some(json!({"file_path": "/home/user/session-search/src/index.rs"}));
-        d.text = "Read\n/home/user/session-search/src/index.rs".into();
+        d.text = vec!["Read\n/home/user/session-search/src/index.rs".into()];
         d.code = vec!["pub fn open_or_create(index_dir: &Path)".into()];
         docs.push(d);
 
@@ -1094,13 +1130,13 @@ pub(crate) mod testkit {
         d.role = "assistant".into();
         d.tool_name = Some("Bash".into());
         d.tool_input = Some(json!({"command": "cargo test"}));
-        d.text = "Bash\ncargo test".into();
+        d.text = vec!["Bash\ncargo test".into()];
         d.code = vec!["error: test failed".into()];
         d.is_error = true;
         docs.push(d);
 
         let mut d = blank_doc(4);
-        d.text = "a sidechain turn about tantivy".into();
+        d.text = vec!["a sidechain turn about tantivy".into()];
         d.is_sidechain = true;
         d.agent_id = Some("a10845c5ff9c7d4ec".into());
         d.agent_type = Some("Explore".into());
@@ -1111,7 +1147,7 @@ pub(crate) mod testkit {
         docs.push(d);
 
         let mut d = blank_doc(5);
-        d.text = "an older turn in another project".into();
+        d.text = vec!["an older turn in another project".into()];
         d.project = Some("/home/user/other-project".into());
         d.git_branch = Some("wip".into());
         d.timestamp_ms = Some(
@@ -1125,13 +1161,13 @@ pub(crate) mod testkit {
         docs.push(d);
 
         let mut d = blank_doc(6);
-        d.text = "nested project below the search root".into();
+        d.text = vec!["nested project below the search root".into()];
         d.project = Some("/home/user/session-search/sub/dir".into());
         docs.push(d);
 
         let mut d = blank_doc(7);
         d.role = "assistant".into();
-        d.text = "the visible answer".into();
+        d.text = vec!["the visible answer".into()];
         d.thinking = Some("a private deliberation about parsnips".into());
         docs.push(d);
 
@@ -1139,7 +1175,7 @@ pub(crate) mod testkit {
     }
 
     pub fn texts(r: &SearchResponse) -> Vec<String> {
-        r.hits.iter().map(|h| h.doc.text.clone()).collect()
+        r.hits.iter().map(|h| h.doc.text.join("\n")).collect()
     }
 }
 
@@ -1175,7 +1211,7 @@ mod tests {
             .enumerate()
             .map(|(i, name)| {
                 let mut d = blank_doc(i as u64);
-                d.text = (*name).to_string();
+                d.text = vec![(*name).to_string()];
                 d.code = vec![(*name).to_string()];
                 d
             })
@@ -1230,11 +1266,11 @@ mod tests {
     fn a_phrase_still_matches_across_and_inside_identifiers() {
         let mut docs = identifier_docs();
         let mut d = blank_doc(90);
-        d.text = "pub fn open_or_create(index_dir: &Path)".into();
+        d.text = vec!["pub fn open_or_create(index_dir: &Path)".into()];
         docs.push(d);
         let mut d = blank_doc(91);
         // The same words, in the wrong order: a phrase must not match this.
-        d.text = "create or open".into();
+        d.text = vec!["create or open".into()];
         docs.push(d);
         let (index, f) = index_docs(&docs);
 
@@ -1274,7 +1310,7 @@ mod tests {
             d.tool_use_id = Some(format!("toolu_{i}"));
             // Near-unique, like real shell commands.
             d.tool_input = Some(json!({ "command": format!("cargo test --test case_{i}") }));
-            d.text = format!("cargo test --test case_{i}");
+            d.text = vec![format!("cargo test --test case_{i}")];
             docs.push(d);
         }
         let (index, fields) = index_docs(&docs);
@@ -1314,7 +1350,7 @@ mod tests {
             d.role = "assistant".into();
             d.tool_name = Some(if i % 2 == 0 { "Bash" } else { "Read" }.into());
             d.tool_use_id = Some(format!("toolu_{i}"));
-            d.text = "tool call".into();
+            d.text = vec!["tool call".into()];
             docs.push(d);
         }
         let (index, fields) = index_docs(&docs);
@@ -1370,7 +1406,13 @@ mod tests {
         let (index, f) = index_docs(&corpus());
         let r = search(&index, &f, &req(r#""cargo build""#)).unwrap();
         assert_eq!(r.total, 1, "{:?}", texts(&r));
-        assert!(r.hits[0].doc.text.starts_with("Bash\ncargo build"));
+        assert!(
+            r.hits[0]
+                .doc
+                .text
+                .join("\n")
+                .starts_with("Bash\ncargo build")
+        );
         // The words exist in two docs, but not adjacent in that order in the second.
         let r = search(&index, &f, &req(r#""build cargo""#)).unwrap();
         assert_eq!(r.total, 0);
@@ -1481,7 +1523,7 @@ mod tests {
         let mut other = blank_doc(9);
         other.session_id = "bbbb3333-4444".into();
         other.doc_id = "bbbb3333-4444:-:9".into();
-        other.text = "a turn in a different session".into();
+        other.text = vec!["a turn in a different session".into()];
         docs.push(other);
         let (index, f) = index_docs(&docs);
 
@@ -1555,7 +1597,7 @@ mod tests {
         r0.filters.until = Some("2024-12-31".into());
         let r = search(&index, &f, &r0).unwrap();
         assert_eq!(r.total, 1, "{:?}", texts(&r));
-        assert!(r.hits[0].doc.text.contains("older turn"));
+        assert!(r.hits[0].doc.text.join("\n").contains("older turn"));
 
         let mut r1 = SearchRequest::default();
         r1.filters.since = Some("2025-01-01".into());
@@ -1784,7 +1826,7 @@ mod tests {
             .enumerate()
             .map(|(i, name)| {
                 let mut d = blank_doc(i as u64);
-                d.text = (*name).to_string();
+                d.text = vec![(*name).to_string()];
                 d.code = vec![(*name).to_string()];
                 d
             })
@@ -1812,11 +1854,80 @@ mod tests {
         let parts = crate::markdown::split(body);
         let mut d = blank_doc(seq);
         d.role = "assistant".into();
+        d.body = body.to_string();
         d.text = parts.text;
         d.code = parts.code;
         d.headings = parts.headings;
         d.code_langs = parts.code_langs;
         d
+    }
+
+    /// Lifting the code out of a message must not make the prose on either side of it
+    /// adjacent: the words either side of a fence were never next to each other, and a phrase
+    /// query that says they were is a false positive nothing in the transcript supports.
+    #[test]
+    fn a_phrase_does_not_match_across_a_block_the_split_removed() {
+        let docs = vec![
+            markdown_doc(
+                0,
+                "Call it before the writer exists.\n\n```rust\nlet x = 1;\n```\n\nThen re-run the tests.",
+            ),
+            markdown_doc(1, "# Title one\n\nAlpha ends here."),
+            markdown_doc(2, "the writer exists and nothing else does"),
+        ];
+        let (index, f) = index_docs(&docs);
+
+        assert_eq!(
+            search(&index, &f, &req(r#""exists then""#)).unwrap().total,
+            0
+        );
+        assert_eq!(
+            search(&index, &f, &req(r#""the writer exists then re-run""#))
+                .unwrap()
+                .total,
+            0
+        );
+        assert_eq!(search(&index, &f, &req(r#""one alpha""#)).unwrap().total, 0);
+        // ...while a phrase *inside* one block still matches, in both documents holding it,
+        // which is what the gap must not cost.
+        assert_eq!(
+            search(&index, &f, &req(r#""the writer exists""#))
+                .unwrap()
+                .total,
+            2
+        );
+    }
+
+    /// Only fenced blocks and inline spans reach `code`. Everything else a transcript carries
+    /// — an unfenced identifier in a sentence, an attachment's file contents, a `system`
+    /// notice, a tool call's name and input — is indexed as prose, so prose has to keep
+    /// finding an identifier by its parts or those documents lose identifier search entirely.
+    #[test]
+    fn an_unfenced_identifier_is_still_found_by_one_of_its_parts() {
+        let mut turn = markdown_doc(0, "It called openOrCreate on a closed SnippetGenerator.");
+        turn.role = "user".into();
+        let mut attachment = blank_doc(1);
+        attachment.role = "attachment".into();
+        attachment.text = vec!["pub fn open_or_create(dir: &Path) -> Result<Index>".into()];
+        let mut system = blank_doc(2);
+        system.role = "system".into();
+        system.text = vec!["hook ran: parseTs2Ms failed".into()];
+        let (index, f) = index_docs(&[turn, attachment, system]);
+
+        for (query, role) in [
+            ("snippet", "user"),
+            ("generator", "user"),
+            ("open_or_create", "user"),
+            ("openOrCreate", "attachment"),
+            ("create", "attachment"),
+            ("parse", "system"),
+        ] {
+            let hits = search(&index, &f, &req(query)).unwrap().hits;
+            assert!(
+                hits.iter().any(|h| h.doc.role == role),
+                "{query:?} did not reach the {role} document"
+            );
+        }
     }
 
     /// The whole point of the split: `text` is stemmed English and `code` is not.
@@ -1857,7 +1968,11 @@ mod tests {
             "Here is the function that opens it.\n\n```rust\npub fn open_or_create(dir: &Path) {}\n```",
         );
         assert_eq!(d.code_langs, ["rust"]);
-        assert!(!d.text.contains("open_or_create"), "{:?}", d.text);
+        assert!(
+            !d.text.join("\n").contains("open_or_create"),
+            "{:?}",
+            d.text
+        );
         let (index, f) = index_docs(&[d]);
 
         for query in ["create", "OpenOrCreate", "open_or_create", "openorcreate"] {
@@ -1895,7 +2010,15 @@ mod tests {
         assert_eq!(counts.get("python"), Some(&1));
         assert_eq!(counts.get("bash"), Some(&1));
         assert_eq!(r.matching_docs, 5, "all five documents matched");
-        assert_eq!(r.docs_with_value, 5, "four documents, five values");
+        // Four documents hold five values between them, and `docs_with_value` counts
+        // documents: the fifth document has no fence at all, and the one with two fences is
+        // one document however many buckets it lands in.
+        assert_eq!(r.docs_with_value, 4, "four documents, five values");
+        assert_eq!(
+            r.values.iter().map(|v| v.count).sum::<u64>(),
+            5,
+            "the buckets count values"
+        );
 
         // And the same field filters, case-insensitively, the way `--tool` does.
         let mut only_rust = SearchRequest::default();
@@ -1944,12 +2067,12 @@ mod tests {
         assert_eq!(hit.doc.kind, DocKind::ToolCall);
         assert_eq!(hit.doc.tool_name.as_deref(), Some("Bash"));
         assert!(
-            hit.doc.text.contains("cargo build"),
+            hit.doc.text.join("\n").contains("cargo build"),
             "the input is still text: {:?}",
             hit.doc.text
         );
         assert!(
-            !hit.doc.text.contains("Compiling"),
+            !hit.doc.text.join("\n").contains("Compiling"),
             "the output is not: {:?}",
             hit.doc.text
         );
@@ -1986,7 +2109,7 @@ mod tests {
         };
         let r = search(&index, &f, &r0).unwrap();
         assert_eq!(r.total, 1);
-        assert_eq!(r.hits[0].doc.text, "the visible answer");
+        assert_eq!(r.hits[0].doc.text, ["the visible answer"]);
     }
 
     #[test]
@@ -2196,7 +2319,7 @@ mod tests {
 
         // And a thinking-only doc with no highlight still shows its head rather than nothing.
         let mut docs = corpus();
-        docs[7].text = String::new();
+        docs[7].text = Vec::new();
         let (index, f) = index_docs(&docs);
         let mut r1 = SearchRequest::default();
         r1.filters.role = Some("assistant".into());
