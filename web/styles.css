@@ -36,6 +36,9 @@
   --add: #12683f;
   --del: #a5232f;
   --mark: #ffe08a;
+  /* The model's own colour: warm, distinct from the accent a person's turn takes and from
+     every tool group, so "who is speaking" is answerable from the avatar alone. */
+  --model: #a8492a;
   --radius: 6px;
   --mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, "Liberation Mono",
     "DejaVu Sans Mono", monospace;
@@ -43,6 +46,7 @@
 
   /* Extensions to the contract's list, all derived from the palette above: the tinted grounds
      a diff and an error block need, and the few non-colour constants used more than twice. */
+  --model-dim: #f7e6df;
   --add-bg: #e2f5ea;
   --del-bg: #fce8ea;
   --err-bg: #fdecee;
@@ -74,7 +78,9 @@
     --add: #57c98d;
     --del: #ff7a89;
     --mark: #5c4a12;
+    --model: #e0916b;
 
+    --model-dim: #33201a;
     --add-bg: #12271c;
     --del-bg: #2c1418;
     --err-bg: #2a1417;
@@ -102,7 +108,9 @@
   --add: #57c98d;
   --del: #ff7a89;
   --mark: #5c4a12;
+  --model: #e0916b;
 
+  --model-dim: #33201a;
   --add-bg: #12271c;
   --del-bg: #2c1418;
   --err-bg: #2a1417;
@@ -674,40 +682,71 @@ pre {
 }
 
 /* ── Result card ────────────────────────────────────────────────────────────────────────
- * Fifty of these are on screen at once, so identity lives in a fixed left column: the eye
- * runs down one edge to find "the Bash calls" without reading a single body. The head spans
- * every row so that column stays whole however many blocks the body grows.
+ * A hit is a moment in a conversation, so the card is one: a quiet filing line naming the
+ * project and the time, and under it the turn itself, drawn by exactly the same rules that
+ * draw it inside a session. There is no second, denser presentation of a turn for lists —
+ * a reader who learns to read one card has learned to read the drawer too.
  */
 .ss-card {
-  display: grid;
-  grid-template-columns: 8.5rem minmax(0, 1fr);
-  column-gap: 0.9rem;
-  row-gap: 0.4rem;
-  padding: 0.6rem 0.75rem;
-  background: var(--panel);
-  border: 1px solid var(--line);
-  border-radius: var(--radius);
-}
-
-.ss-card > * {
-  grid-column: 2;
-  min-width: 0;
-}
-
-.ss-card > .ss-card-head {
-  grid-column: 1;
-  /* Pinned to the first row rather than spanned across all of them: a `span 99` would create
-     98 empty implicit rows, and `row-gap` applies between empty tracks too, so every card
-     would carry forty rems of blank space under it. */
-  grid-row: 1;
   display: flex;
   flex-direction: column;
-  align-items: flex-start;
-  gap: 0.3rem;
+  gap: 0.45rem;
+  padding: 0.7rem 0.85rem;
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: 10px;
 }
 
 .ss-card:hover {
   border-color: color-mix(in srgb, var(--accent) 30%, var(--line));
+}
+
+/* The card `j`/`k` are standing on. There is no second selection style, so this is also what
+   an invisible selection would cost: `j` would look broken. */
+.ss-card.ss-focus {
+  border-color: var(--accent);
+  box-shadow: 0 0 0 1px var(--accent);
+}
+
+/* Project, branch, time, session. Present on every card and interesting on almost none of
+   them, so it is sized and coloured to be found on purpose rather than read by accident. */
+.ss-card-ctx {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.15rem 0.6rem;
+  min-width: 0;
+  padding-bottom: 0.35rem;
+  border-bottom: 1px solid var(--line);
+  color: var(--ink-faint);
+  font-family: var(--mono);
+  font-size: var(--fs-sm);
+  line-height: 1.5;
+}
+
+.ss-card-ctx > * {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+/* The match count on a grouped card's filing line, pushed to the far end: it is the one
+   number on that line a reader is scanning for, and it is not part of the filing. */
+.ss-ctx-hits {
+  margin-left: auto;
+}
+
+.ss-card-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.35rem;
+  padding-left: 2.35rem;
+}
+
+/* A failed call tints the whole card's left edge; the badge shouting alone is easy to miss
+   in a list of fifty, and this is the one state worth finding without reading. */
+.ss-card[data-error] {
+  border-color: color-mix(in srgb, var(--err) 35%, var(--line));
 }
 
 .ss-card-body {
@@ -717,8 +756,7 @@ pre {
   gap: 0.4rem;
 }
 
-/* Project, branch, model, time. Present on every card and interesting on almost none of
-   them, so it is sized and coloured to be found on purpose rather than read by accident. */
+/* Metadata rows the tool renderers still emit: chips under a Bash call, a path under a Read. */
 .ss-meta {
   display: flex;
   flex-wrap: wrap;
@@ -742,6 +780,510 @@ pre {
 
 .ss-meta a:hover {
   color: var(--accent);
+}
+
+/* ── The conversation ───────────────────────────────────────────────────────────────────
+ * Every turn — in a card, in a widened thread, in the drawer — is an avatar in a fixed left
+ * column and its content in the rest. That column is the whole reason a session scrolls
+ * readably: the eye runs down one edge and sees who was talking and what ran, without
+ * reading a word. Inside a run of turns the column carries a rail so the run reads as one
+ * conversation rather than as a stack of unrelated blocks.
+ */
+.ss-conv {
+  display: flex;
+  flex-direction: column;
+}
+
+.ss-turn {
+  position: relative;
+  display: grid;
+  grid-template-columns: 1.75rem minmax(0, 1fr);
+  column-gap: 0.65rem;
+  padding: 0.3rem 0;
+  min-width: 0;
+}
+
+.ss-turn-main {
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 0.35rem;
+}
+
+.ss-turn-rail {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 0.3rem;
+}
+
+/* The rail, drawn per turn rather than once down the container: the first and last turns
+   have to stop it at their own avatar, and a single line on `.ss-conv` cannot know where
+   those are without measuring. */
+.ss-conv > .ss-turn::before {
+  content: "";
+  position: absolute;
+  left: 0.875rem;
+  top: 0;
+  bottom: 0;
+  width: 1px;
+  background: var(--line);
+}
+
+.ss-conv > .ss-turn:first-child::before {
+  top: 1.15rem;
+}
+
+.ss-conv > .ss-turn:last-child::before {
+  bottom: calc(100% - 1.15rem);
+}
+
+/* Inside a request the rail is drawn once, on the container, rather than per turn: the run is
+   turns *and* gaps and *and* hosts that fill in when a gap is opened, and a per-child line
+   would have to know which of those is last — a question that changes every time something is
+   expanded. One line from the first avatar to the last node cannot get that wrong. */
+.ss-request > .ss-turn::before {
+  content: none;
+}
+
+.ss-request {
+  position: relative;
+}
+
+.ss-request::before {
+  content: "";
+  position: absolute;
+  left: 0.875rem;
+  top: 1.15rem;
+  bottom: 1.15rem;
+  width: 1px;
+  background: var(--line);
+}
+
+.ss-avatar {
+  position: relative;
+  z-index: 1;
+  width: 1.75rem;
+  height: 1.75rem;
+  flex: none;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border: 1px solid var(--line);
+  border-radius: 50%;
+  background: var(--panel);
+  color: var(--ink-faint);
+}
+
+/* Who spoke. `user` takes the accent because a search almost always starts from "what did I
+   ask"; the model gets the warm token, and the two are never the same hue as a tool. */
+.ss-avatar[data-role="user"] {
+  border-color: color-mix(in srgb, var(--accent) 45%, transparent);
+  background: var(--accent-dim);
+  color: var(--accent);
+}
+
+.ss-avatar[data-role="assistant"] {
+  border-color: color-mix(in srgb, var(--model) 45%, transparent);
+  background: var(--model-dim);
+  color: var(--model);
+}
+
+/* A tool is a square, not a circle: at 28px the shape is readable before the colour is, and
+   "something ran" is a different kind of event from "someone spoke". */
+.ss-avatar-tool {
+  border-radius: 7px;
+  border-color: color-mix(in srgb, var(--tool-accent, var(--line)) 35%, var(--line));
+  background: var(--panel);
+  color: var(--tool-accent, var(--ink-dim));
+}
+
+.ss-turn[data-error] .ss-avatar-tool {
+  border-color: color-mix(in srgb, var(--err) 45%, transparent);
+  background: var(--err-bg);
+  color: var(--err);
+}
+
+.ss-turn-head {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 0.5rem;
+  min-width: 0;
+}
+
+.ss-who {
+  font-weight: 600;
+  font-size: var(--fs-base);
+  color: var(--ink);
+}
+
+.ss-turn-model,
+.ss-when {
+  font-family: var(--mono);
+  font-size: var(--fs-sm);
+  color: var(--ink-faint);
+}
+
+/* The focused turn — the one the hit is on — inside a window of its neighbours. */
+.ss-turn.ss-focus > .ss-turn-main {
+  position: relative;
+}
+
+.ss-turn.ss-focus > .ss-turn-main::before {
+  content: "";
+  position: absolute;
+  inset: -0.3rem -0.5rem;
+  border-radius: 8px;
+  background: color-mix(in srgb, var(--accent) 7%, transparent);
+  pointer-events: none;
+}
+
+/* ── The request a hit happened under ───────────────────────────────────────────────────
+ * Every document carries the `seq` and the opening of the human turn it happened under, so a
+ * card can lead with what was being asked without a second request. That framing is most of
+ * what makes a result readable: a `cargo test` that failed means one thing under "ship the
+ * release" and another under "reproduce the flake", and the command alone says neither.
+ */
+.ss-request {
+  min-width: 0;
+}
+
+.ss-turn-request .ss-bubble {
+  /* The stored copy is an opening, not the turn: quieter than a bubble in a conversation
+     being read, so the hit below it stays the loudest thing on the card. */
+  background: var(--panel-2);
+  border-color: var(--line);
+}
+
+/* A run of turns nobody has asked for yet. It is a rule across the column with its count
+   sitting on it — the shape of "there is more here", and the same shape whether the count is
+   known (above a hit, where `prompt_seq` says exactly) or not (below it, where nothing does). */
+.ss-gap {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  width: 100%;
+  min-width: 0;
+  padding: 0.25rem 0 0.25rem 2.4rem;
+  border: 0;
+  background: none;
+  color: var(--ink-faint);
+  font-family: var(--mono);
+  font-size: var(--fs-sm);
+  text-align: left;
+  cursor: pointer;
+}
+
+.ss-gap:hover:not([disabled]) {
+  color: var(--accent);
+}
+
+.ss-gap[disabled] {
+  cursor: default;
+}
+
+.ss-gap-rule {
+  flex: none;
+  width: 1.1rem;
+  border-top: 1px dashed var(--line);
+}
+
+.ss-gap:hover:not([disabled]) .ss-gap-rule {
+  border-top-color: color-mix(in srgb, var(--accent) 45%, var(--line));
+}
+
+.ss-gap-label {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* ── What was said ──────────────────────────────────────────────────────────────────────
+ * The one deliberate break from "transcript content is mono": a paragraph a person typed
+ * and a paragraph a model wrote are prose, and prose set in a monospace column at 13px is
+ * the single thing that made the old view read as a log file rather than as a conversation.
+ * Code, commands, paths, diffs and terminal output stay mono, because in those the column
+ * alignment carries meaning.
+ */
+.ss-bubble {
+  min-width: 0;
+  /* Shrink-wrapped to the measure its text is set to, rather than stretched across a 2000px
+     window: a bubble with sixty characters in it and nine hundred pixels of empty ground to
+     its right does not read as something a person said. */
+  width: fit-content;
+  max-width: 100%;
+  padding: 0.5rem 0.7rem;
+  border: 1px solid color-mix(in srgb, var(--accent) 22%, var(--line));
+  border-radius: 10px;
+  border-top-left-radius: 3px;
+  background: color-mix(in srgb, var(--accent-dim) 60%, var(--panel));
+}
+
+.ss-prose {
+  min-width: 0;
+}
+
+.ss-md {
+  min-width: 0;
+  font-family: var(--sans);
+  font-size: var(--fs-md);
+  line-height: 1.62;
+  /* A comfortable measure, but never wider than the column it is in. Long prose set to the
+     full width of a 2000px window is unreadable in a way no amount of styling fixes. */
+  max-width: 76ch;
+}
+
+.ss-md > :first-child {
+  margin-top: 0;
+}
+
+.ss-md > :last-child {
+  margin-bottom: 0;
+}
+
+.ss-md p {
+  margin: 0 0 0.6em;
+}
+
+.ss-md h1,
+.ss-md h2,
+.ss-md h3,
+.ss-md h4,
+.ss-md h5,
+.ss-md h6 {
+  margin: 1em 0 0.4em;
+  font-size: 1em;
+  font-weight: 650;
+  line-height: 1.35;
+}
+
+.ss-md h1,
+.ss-md h2 {
+  font-size: 1.08em;
+}
+
+.ss-md ul,
+.ss-md ol {
+  margin: 0.4em 0 0.6em;
+  padding-left: 1.35em;
+}
+
+.ss-md li {
+  margin: 0.15em 0;
+}
+
+.ss-md blockquote {
+  margin: 0.5em 0;
+  padding: 0.1em 0 0.1em 0.8em;
+  border-left: 2px solid var(--line);
+  color: var(--ink-dim);
+}
+
+.ss-md hr {
+  margin: 0.9em 0;
+  border: 0;
+  border-top: 1px solid var(--line);
+}
+
+/* Inline code inside prose: a chip, not a block. The block form of `.ss-code` is a `<pre>`,
+   and the two share a class because `markdown.js` emits one name for both. */
+code.ss-code {
+  display: inline;
+  max-height: none;
+  padding: 0.05em 0.32em;
+  border-radius: 4px;
+  font-size: 0.92em;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+/* A `system` or `attachment` record: part of the transcript, not part of the conversation.
+   An environment block or a system reminder is often the longest thing in a session and is
+   never the thing being looked for, so it is set smaller and quieter than a turn — visible,
+   searchable, and not competing with what was actually said. */
+.ss-turn[data-role="system"] .ss-md,
+.ss-turn[data-role="attachment"] .ss-md {
+  color: var(--ink-dim);
+  font-size: var(--fs-base);
+}
+
+.ss-turn[data-role="system"] .ss-who,
+.ss-turn[data-role="attachment"] .ss-who {
+  color: var(--ink-faint);
+  font-weight: 500;
+}
+
+/* ── The activity row ───────────────────────────────────────────────────────────────────
+ * A tool call collapsed to one line: what ran, and the one parameter that identifies it.
+ * This is what makes a six-hundred-turn session scrollable — the old view laid every
+ * parameter of every call out as a table, which is the same information at a length nobody
+ * reads. The body is not built until the row is opened.
+ */
+.ss-act-wrap {
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 0.35rem;
+}
+
+.ss-act {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  width: 100%;
+  min-width: 0;
+  padding: 0.3rem 0.5rem;
+  border: 1px solid transparent;
+  border-radius: 7px;
+  background: var(--panel-2);
+  color: var(--ink-dim);
+  font-family: var(--mono);
+  font-size: var(--fs-base);
+  text-align: left;
+  cursor: pointer;
+}
+
+.ss-act:hover {
+  border-color: color-mix(in srgb, var(--tool-accent, var(--accent)) 35%, var(--line));
+}
+
+.ss-act-tool {
+  flex: none;
+  font-weight: 600;
+  color: var(--tool-accent, var(--ink));
+}
+
+/* The identifying parameter. It takes whatever width is left and clips, because the row is
+   one line by construction: two-line rows re-introduce the wall the row replaced. */
+.ss-act-arg {
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+  color: var(--ink);
+}
+
+.ss-act-flag {
+  flex: none;
+  padding: 0 0.3rem;
+  border-radius: 3px;
+  background: var(--err-bg);
+  color: var(--err);
+  font-size: var(--fs-sm);
+}
+
+.ss-act[data-error] .ss-act-tool {
+  color: var(--err);
+}
+
+.ss-act-chevron {
+  flex: none;
+  color: var(--ink-faint);
+  transition: transform 0.12s ease;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .ss-act-chevron {
+    transition: none;
+  }
+}
+
+.ss-act[aria-expanded="true"] .ss-act-chevron {
+  transform: rotate(90deg);
+}
+
+.ss-act[aria-expanded="true"] {
+  border-color: color-mix(in srgb, var(--tool-accent, var(--accent)) 35%, var(--line));
+}
+
+.ss-act-body {
+  display: flex;
+  flex-direction: column;
+  gap: 0.4rem;
+  padding-left: 0.5rem;
+  border-left: 2px solid color-mix(in srgb, var(--tool-accent, var(--line)) 30%, var(--line));
+}
+
+/* ── Thinking ───────────────────────────────────────────────────────────────────────────
+ * Behind a disclosure, and open only when the match is in it. Thinking is long, it is the
+ * model's scratch work, and presenting it inline beside the turn invites reading it as
+ * something that was said.
+ */
+.ss-think {
+  min-width: 0;
+}
+
+.ss-think > summary {
+  display: flex;
+  align-items: center;
+  gap: 0.4rem;
+  padding: 0.15rem 0;
+  color: var(--ink-faint);
+  font-size: var(--fs-sm);
+  cursor: pointer;
+  list-style: none;
+}
+
+.ss-think > summary::-webkit-details-marker {
+  display: none;
+}
+
+.ss-think > summary:hover {
+  color: var(--ink-dim);
+}
+
+.ss-think-body {
+  margin-top: 0.3rem;
+  padding-left: 0.6rem;
+  border-left: 2px solid var(--line);
+  color: var(--ink-dim);
+  font-style: italic;
+}
+
+.ss-think-body .ss-md {
+  font-style: italic;
+}
+
+/* ── Per-turn tools ─────────────────────────────────────────────────────────────────────
+ * "raw JSON" is the graceful-degradation floor and has to be one press from every turn, but
+ * a captioned control on every one of four hundred turns is a row of chrome between every
+ * turn and the next — which is the space a conversation is supposed to not have. So it sits
+ * in the gutter under the avatar, where the rail already reserves the width, and appears on
+ * hover and on focus. `focus-within` is not optional politeness here: it is the difference
+ * between the floor existing and the floor existing for mouse users.
+ */
+.ss-turn-tools {
+  display: flex;
+  opacity: 0;
+}
+
+.ss-raw {
+  padding: 0.15rem;
+  border-color: transparent;
+  background: none;
+  color: var(--ink-faint);
+}
+
+.ss-raw[aria-pressed="true"] {
+  border-color: var(--line);
+  background: var(--panel-2);
+  color: var(--ink);
+}
+
+.ss-turn:hover .ss-turn-tools,
+.ss-turn:focus-within .ss-turn-tools,
+.ss-turn.ss-focus .ss-turn-tools {
+  opacity: 1;
+}
+
+@media (hover: none) {
+  /* No hover to reveal it with; a permanently dim control beats an unreachable one. */
+  .ss-turn-tools {
+    opacity: 0.6;
+  }
 }
 
 /* ── Badges ─────────────────────────────────────────────────────────────────────────────── */
@@ -782,7 +1324,10 @@ pre {
 }
 
 /* `toolMeta` hands back an accent per tool; it arrives either as a token name in
-   `data-accent` or as a colour in `--tool-accent`, and either way one rule below reads it. */
+   `data-accent` or as a colour in `--tool-accent`, and either way one rule below reads it.
+   The `[data-accent]` table further down carries no element selector on purpose: a badge, an
+   avatar and an activity row are three views of the same tool and must not need three
+   copies of the same colour decision. */
 .ss-badge-tool {
   color: var(--tool-accent, var(--ink));
   border-color: color-mix(in srgb, var(--tool-accent, var(--line)) 40%, var(--line));
@@ -790,19 +1335,19 @@ pre {
 }
 
 /* The four `app.js` puts on the snippet label ("matched in what the tool printed"). */
-.ss-badge-tool[data-accent="accent"] {
+[data-accent="accent"] {
   --tool-accent: var(--accent);
 }
 
-.ss-badge-tool[data-accent="ok"] {
+[data-accent="ok"] {
   --tool-accent: var(--ok);
 }
 
-.ss-badge-tool[data-accent="warn"] {
+[data-accent="warn"] {
   --tool-accent: var(--warn);
 }
 
-.ss-badge-tool[data-accent="err"] {
+[data-accent="err"] {
   --tool-accent: var(--err);
 }
 
@@ -813,45 +1358,45 @@ pre {
    A reader scanning a session is looking for the group, and ten hand-picked hues at badge size
    are ten shades of the same thing. Every value derives from a theme token, so the dark
    palette needs no second table. */
-.ss-badge-tool[data-accent="run"] {
+[data-accent="run"] {
   --tool-accent: var(--ok);
 }
 
-.ss-badge-tool[data-accent="read"] {
+[data-accent="read"] {
   --tool-accent: var(--accent);
 }
 
-.ss-badge-tool[data-accent="find"] {
+[data-accent="find"] {
   --tool-accent: color-mix(in srgb, var(--accent) 65%, var(--ok));
 }
 
-.ss-badge-tool[data-accent="write"] {
+[data-accent="write"] {
   --tool-accent: var(--warn);
 }
 
-.ss-badge-tool[data-accent="edit"] {
+[data-accent="edit"] {
   --tool-accent: color-mix(in srgb, var(--warn) 70%, var(--err));
 }
 
-.ss-badge-tool[data-accent="web"] {
+[data-accent="web"] {
   --tool-accent: color-mix(in srgb, var(--accent) 55%, var(--err));
 }
 
-.ss-badge-tool[data-accent="agent"] {
+[data-accent="agent"] {
   --tool-accent: color-mix(in srgb, var(--err) 70%, var(--accent));
 }
 
-.ss-badge-tool[data-accent="plan"] {
+[data-accent="plan"] {
   --tool-accent: var(--ink-dim);
 }
 
 /* An MCP tool and a tool this build has never heard of are the two "we do not know what this
    does" cases, and they read as exactly that: no colour claim, just legible. */
-.ss-badge-tool[data-accent="mcp"] {
+[data-accent="mcp"] {
   --tool-accent: color-mix(in srgb, var(--ink-dim) 70%, var(--accent));
 }
 
-.ss-badge-tool[data-accent="tool"] {
+[data-accent="tool"] {
   --tool-accent: var(--ink-faint);
 }
 
@@ -884,9 +1429,12 @@ pre {
   font-weight: 600;
 }
 
-/* ── The excerpt ────────────────────────────────────────────────────────────────────────
- * The server sends escaped text with `<em>` around the matched spans; the mark has to be the
- * loudest thing in the card without turning the card into a highlighter.
+/* ── The excerpt and the marks ──────────────────────────────────────────────────────────
+ * Two highlighters share this page and they must look identical, because a reader cannot be
+ * asked to know which one they are looking at. The server sends escaped text with `<em>`
+ * around the spans it actually matched; `highlight.js` wraps `<mark class="ss-hit">` around
+ * the same words everywhere else, using a port of the index's own tokenizer. One rule below
+ * paints both.
  */
 .ss-snippet {
   margin: 0;
@@ -903,12 +1451,61 @@ pre {
 
 .ss-snippet em,
 .ss-snippet mark,
+mark.ss-hit,
 mark {
   padding: 0 1px;
   background: var(--mark);
   color: var(--ink);
   border-radius: 2px;
   font-style: normal;
+}
+
+/* The one the match-stepper is standing on. It has to be findable in a screenful of yellow,
+   so it takes the accent rather than a louder yellow — a second shade of the same hue reads
+   as "slightly different" rather than as "this one". */
+mark.ss-hit-on {
+  background: var(--accent);
+  color: var(--panel);
+  box-shadow: 0 0 0 2px color-mix(in srgb, var(--accent) 35%, transparent);
+}
+
+/* The server's excerpt, which is a quotation from a longer body and is framed as one. The
+   label says which body it was cut from — what a turn said, what a command printed, what the
+   model was thinking — because those are four different claims about what happened. */
+.ss-excerpt {
+  min-width: 0;
+  padding: 0.35rem 0 0.35rem 0.6rem;
+  border-left: 2px solid color-mix(in srgb, var(--mark) 70%, var(--line));
+}
+
+.ss-excerpt-label {
+  display: block;
+  margin-bottom: 0.25rem;
+  color: var(--ink-faint);
+  font-size: var(--fs-sm);
+}
+
+.ss-excerpt[data-field="thinking"] {
+  border-left-color: color-mix(in srgb, var(--accent) 45%, var(--line));
+}
+
+.ss-excerpt[data-field="tool_output"] {
+  border-left-color: color-mix(in srgb, var(--warn) 50%, var(--line));
+}
+
+/* "3 matches", on a collapsed row: what is inside a thing you have not opened. Counted from
+   the text rather than from the DOM, which is the only way a row that has not been built can
+   say it. */
+.ss-hits {
+  flex: none;
+  padding: 0 0.35rem;
+  border-radius: 999px;
+  background: var(--mark);
+  color: var(--ink);
+  font-family: var(--mono);
+  font-size: var(--fs-sm);
+  line-height: 1.6;
+  white-space: nowrap;
 }
 
 /* ── Content blocks ─────────────────────────────────────────────────────────────────────
@@ -1152,51 +1749,16 @@ mark {
   background: var(--panel-2);
 }
 
-/* ── Expanded thread ────────────────────────────────────────────────────────────────────
- * The window of neighbouring turns opened inside a card. The spine down the left is what
- * makes it read as a nested conversation instead of as more cards that happen to be indented.
+/* ── An expanded thread ─────────────────────────────────────────────────────────────────
+ * The window a card opens onto its own neighbours. It is the same `.ss-conv` the drawer
+ * draws, indented under the card's avatar column so it reads as "around this turn" rather
+ * than as a second, unrelated list.
  */
-.ss-thread {
-  display: flex;
-  flex-direction: column;
-  gap: 0.4rem;
-  margin: 0.15rem 0 0.1rem;
-  padding-left: 0.75rem;
-  border-left: 2px solid var(--line);
-}
-
-.ss-thread-turn {
-  position: relative;
-  padding: 0.3rem 0.45rem;
-  background: var(--bg);
-  border: 1px solid var(--line);
-  border-radius: var(--radius);
-  font-size: var(--fs-sm);
-}
-
-/* A node on the spine, drawn rather than written, so it cannot collide with text a renderer
-   put at the start of the turn. */
-.ss-thread-turn::before {
-  content: "";
-  position: absolute;
-  left: -1.03rem;
-  top: 0.75rem;
-  width: 6px;
-  height: 6px;
-  background: var(--line);
-  border-radius: 50%;
-}
-
-/* The turn that actually matched. Without it an expanded window of seven turns loses the one
-   the reader searched for, which is the only reason the window exists. */
-.ss-focus {
-  background: var(--panel);
-  border-color: color-mix(in srgb, var(--accent) 45%, var(--line));
-  box-shadow: inset 3px 0 0 var(--accent);
-}
-
-.ss-focus::before {
-  background: var(--accent);
+.ss-results > .ss-card > div > .ss-conv,
+.ss-card .ss-conv {
+  margin-top: 0.2rem;
+  padding: 0.35rem 0 0.35rem 0.6rem;
+  border-top: 1px solid var(--line);
 }
 
 /* ── Pager ──────────────────────────────────────────────────────────────────────────────── */
@@ -1365,6 +1927,23 @@ mark {
   border-bottom: 1px solid var(--line);
 }
 
+/* Match count and the two steppers. Empty — and so zero-width — on a filter-only browse,
+   which has no query terms to step through. */
+.ss-drawer-nav {
+  display: flex;
+  align-items: center;
+  gap: 0.3rem;
+  margin-left: auto;
+  color: var(--ink-faint);
+  font-family: var(--mono);
+  font-size: var(--fs-sm);
+  white-space: nowrap;
+}
+
+.ss-drawer-nav:empty {
+  display: none;
+}
+
 .ss-drawer-title {
   margin: 0;
   min-width: 0;
@@ -1456,16 +2035,58 @@ mark {
   }
 
   .ss-card {
-    grid-template-columns: minmax(0, 1fr);
-    row-gap: 0.35rem;
+    padding: 0.55rem 0.6rem;
   }
 
-  .ss-card > .ss-card-head {
-    grid-column: 1;
-    grid-row: auto;
-    flex-direction: row;
-    flex-wrap: wrap;
-    align-items: center;
+  /* The avatar column narrows but never goes away: it is what says who spoke, and at 400px
+     that question is harder to answer, not easier. The rail moves with it. */
+  .ss-turn {
+    grid-template-columns: 1.4rem minmax(0, 1fr);
+    column-gap: 0.5rem;
+  }
+
+  .ss-avatar {
+    width: 1.4rem;
+    height: 1.4rem;
+  }
+
+  .ss-conv > .ss-turn::before {
+    left: 0.7rem;
+  }
+
+  .ss-conv > .ss-turn:first-child::before {
+    top: 1rem;
+  }
+
+  .ss-conv > .ss-turn:last-child::before {
+    bottom: calc(100% - 1rem);
+  }
+
+  /* The match count on a grouped card's filing line, pushed to the far end: it is the one
+   number on that line a reader is scanning for, and it is not part of the filing. */
+.ss-ctx-hits {
+  margin-left: auto;
+}
+
+.ss-card-actions {
+    padding-left: 0;
+  }
+
+  .ss-gap {
+    padding-left: 1.9rem;
+  }
+
+  .ss-request::before {
+    left: 0.7rem;
+    top: 1rem;
+    bottom: 1rem;
+  }
+
+  /* At 400px the row has room for the tool, the argument and one more thing; a pill reading
+     "14 matches" takes the argument's width, and the argument is the point of the row. */
+  .ss-hits {
+    font-size: 0.6875rem;
+    padding: 0 0.25rem;
   }
 
   .ss-facets {

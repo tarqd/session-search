@@ -13,7 +13,8 @@
 // * **One string is HTML.** `text.snippet` (or `tool_output.snippet`, or `thinking.snippet`)
 //   arrives escaped-then-marked-up from the server and is the only value handed to `el`'s
 //   `html` prop. Everything else — text a model wrote, a path, a tool parameter — goes through
-//   `text`, `renderMarkdown` or the renderers in `tools.js`.
+//   `text`, `renderMarkdown` or the renderers in `tools.js`. The block holding a server
+//   snippet carries `data-marked`, which is how `highlight.js` knows to leave it alone.
 
 import {
   basename,
@@ -23,14 +24,16 @@ import {
   dirname,
   el,
   fmtBytes,
+  fmtClock,
   fmtCount,
   fmtTime,
   frag,
   iconFor,
   relTime,
 } from "./dom.js";
+import { countMarks, isEmptyPlan, markMatches, matchRanges, parseQuery } from "./highlight.js";
 import { renderMarkdown } from "./markdown.js";
-import { renderToolCall, renderToolResult, toolMeta } from "./tools.js";
+import { renderToolCall, renderToolResult, toolMeta, toolSummary } from "./tools.js";
 
 // ─── Constants ────────────────────────────────────────────────────────────────────────────
 
@@ -66,12 +69,16 @@ const SESSION_LIMIT = 400;
 
 const SORTS = ["relevance", "newest", "oldest"];
 
+/** The result units. `turn` is one card per request; `none` is one per document. */
+const GROUPS = ["turn", "none"];
+
 // ─── Element handles ──────────────────────────────────────────────────────────────────────
 
 const byId = (id) => document.getElementById(id);
 
 const qEl = byId("q");
 const sortEl = byId("sort");
+const groupEl = byId("group");
 const refreshEl = byId("refresh");
 const statsEl = byId("stats");
 const facetsEl = byId("facets");
@@ -83,6 +90,7 @@ const drawerEl = byId("drawer");
 const drawerBodyEl = byId("drawer-body");
 const drawerTitleEl = byId("drawer-title");
 const drawerCloseEl = byId("drawer-close");
+const drawerNavEl = byId("drawer-nav");
 const emptyEl = byId("empty");
 const errorEl = byId("error");
 const themeEl = byId("theme");
@@ -108,10 +116,19 @@ const state = {
   page: 1,
   size: 20,
   sort: "relevance",
+  /// The result unit. Grouped by default: a transcript answers a question many times over,
+  /// and a flat list makes the reader do the grouping by eye from the session ids.
+  group: "turn",
   includeThinking: false,
   filters: {
     tool: [],
     tool_input: [],
+    // One turn, as the pair the index keys turns by. `turn_seq` is a per-file ordinal and two
+    // transcripts can share a session id, so the path travels with it or neither does — the
+    // server refuses half of the pair rather than answering a wider search than was asked.
+    turn_of: "",
+    turn_seq: "",
+    session: "",
     project: "",
     model: "",
     role: "",
@@ -121,6 +138,9 @@ const state = {
     since: "",
     until: "",
     errors_only: false,
+    // The default scope is the conversation: attachments, `system` records and meta turns are
+    // in the index but out of the way. `renderNotes` says how many that hid, every time.
+    all_records: false,
     sidechain: "any", // any | exclude | only
   },
 };
@@ -145,13 +165,15 @@ function stateToParams() {
   if (state.q) p.set("q", state.q);
   if (state.page > 1) p.set("page", String(state.page));
   if (state.sort !== "relevance") p.set("sort", state.sort);
+  if (state.group !== "turn") p.set("group", state.group);
   if (state.size !== 20) p.set("size", String(state.size));
   for (const tool of state.filters.tool) p.append("tool", tool);
   for (const ti of state.filters.tool_input) p.append("tool_input", ti);
-  for (const key of ["project", "model", "role", "kind", "agent_type", "branch", "since", "until"]) {
+  for (const key of ["turn_of", "turn_seq", "session", "project", "model", "role", "kind", "agent_type", "branch", "since", "until"]) {
     if (state.filters[key]) p.set(key, state.filters[key]);
   }
   if (state.filters.errors_only) p.set("errors_only", "1");
+  if (state.filters.all_records) p.set("all_records", "1");
   if (state.filters.sidechain !== "any") p.set("sidechain", state.filters.sidechain);
   if (state.includeThinking) p.set("include_thinking", "1");
   return p;
@@ -165,13 +187,16 @@ function applyParams(p) {
   // which would answer the whole search with a 400 about a control the reader cannot see.
   const sort = p.get("sort") || "relevance";
   state.sort = SORTS.includes(sort) ? sort : "relevance";
+  const group = p.get("group") || "turn";
+  state.group = GROUPS.includes(group) ? group : "turn";
   state.includeThinking = p.get("include_thinking") === "1";
   state.filters.tool = p.getAll("tool").filter(Boolean);
   state.filters.tool_input = p.getAll("tool_input").filter(Boolean);
-  for (const key of ["project", "model", "role", "kind", "agent_type", "branch", "since", "until"]) {
+  for (const key of ["turn_of", "turn_seq", "session", "project", "model", "role", "kind", "agent_type", "branch", "since", "until"]) {
     state.filters[key] = p.get(key) || "";
   }
   state.filters.errors_only = p.get("errors_only") === "1";
+  state.filters.all_records = p.get("all_records") === "1";
   const side = p.get("sidechain") || "any";
   state.filters.sidechain = ["any", "exclude", "only"].includes(side) ? side : "any";
 }
@@ -248,10 +273,11 @@ function searchBody() {
   const filters = {};
   if (f.tool.length) filters.tool = f.tool;
   if (f.tool_input.length) filters.tool_input = f.tool_input;
-  for (const key of ["project", "model", "role", "kind", "agent_type", "branch", "since", "until"]) {
+  for (const key of ["turn_of", "turn_seq", "session", "project", "model", "role", "kind", "agent_type", "branch", "since", "until"]) {
     if (f[key]) filters[key] = f[key];
   }
   if (f.errors_only) filters.errors_only = true;
+  if (f.all_records) filters.all_records = true;
   if (f.sidechain === "exclude") filters.no_sidechains = true;
   if (f.sidechain === "only") filters.sidechains_only = true;
 
@@ -271,6 +297,9 @@ function searchBody() {
         ? []
         : [{ field: "timestamp", direction: state.sort === "newest" ? "desc" : "asc" }],
     includeThinking: state.includeThinking,
+    // Omitted rather than sent as false: absent is the flat shape a stock Search UI
+    // connector expects, and saying so explicitly would only be a longer way to agree.
+    ...(state.group === "turn" ? { groupByTurn: true } : {}),
   };
 }
 
@@ -330,6 +359,9 @@ const searchSoon = debounce(() => search({ push: false }), TYPE_DEBOUNCE_MS);
 // ─── Rendering: the whole response ────────────────────────────────────────────────────────
 
 function render(data) {
+  // Before anything is drawn: every turn rendered from here on — in a card now, in a thread
+  // or a drawer minutes later — marks the words of the search that produced them.
+  markPlan = parseQuery(state.q);
   renderNotes(data);
   renderChips();
   renderFacets(data.facets || {});
@@ -342,16 +374,27 @@ function renderSummary(data) {
   const total = Number(data.totalResults) || 0;
   const from = Number(data.pagingStart) || 0;
   const to = Number(data.pagingEnd) || 0;
-  const elapsed = data.info && Number.isFinite(data.info.elapsedMs) ? `${data.info.elapsedMs} ms` : "";
+  const info = data.info || {};
+  const elapsed = Number.isFinite(info.elapsedMs) ? `${info.elapsedMs} ms` : "";
   if (total === 0) {
     summaryEl.replaceChildren();
     return;
   }
-  // The total is the whole matching set, not the page: `pagingStart`/`pagingEnd` say which
-  // slice is on screen, and reporting only the slice would understate the corpus by 20x.
+  // `totalResults` counts whatever the server grouped by, and the two totals are different
+  // questions: "how much of my work touched this" is requests, "how many times" is documents.
+  // Naming both is the only way neither gets mistaken for the other.
+  const grouped = info.grouped === true;
+  const docs = Number(info.totalDocuments);
   summaryEl.replaceChildren(
     el("strong", { text: fmtCount(total) }),
-    ` ${total === 1 ? "document" : "documents"} matched`,
+    grouped
+      ? ` ${total === 1 ? "turn" : "turns"} matched`
+      : ` ${total === 1 ? "document" : "documents"} matched`,
+    grouped && Number.isFinite(docs)
+      ? ` · ${fmtCount(docs)} ${docs === 1 ? "document" : "documents"} in them`
+      : "",
+    // The total is the whole matching set, not the page: `pagingStart`/`pagingEnd` say which
+    // slice is on screen, and reporting only the slice would understate the corpus by 20x.
     from ? ` · showing ${fmtCount(from)}–${fmtCount(to)}` : "",
     elapsed ? ` · ${elapsed}` : "",
   );
@@ -396,6 +439,34 @@ function renderNotes(data) {
     );
   }
 
+  // What the default scope refused. Never inferred from the result list — the server counts
+  // it — because a list a fifth shorter than the corpus can support is exactly the kind of
+  // omission a reader discovers by failing to find something.
+  const hidden = data.info && Number(data.info.hidden);
+  if (Number.isFinite(hidden) && hidden > 0) {
+    notes.push(
+      el(
+        "p",
+        { class: "ss-hint" },
+        `${fmtCount(hidden)} more ${hidden === 1 ? "document" : "documents"} matched and are not shown: attachments, `,
+        el("code", { text: "system" }),
+        " records and meta turns — the transcript's apparatus rather than its conversation. ",
+        el("button", {
+          class: "ss-more",
+          type: "button",
+          text: "include them",
+          on: {
+            click: () => {
+              state.filters.all_records = true;
+              syncControls();
+              search({ push: true });
+            },
+          },
+        }),
+      ),
+    );
+  }
+
   if (state.includeThinking && indexStats && indexStats.thinking_indexed === false) {
     notes.push(
       el(
@@ -430,6 +501,19 @@ function activeFilters() {
       remove: () => (f.tool_input = f.tool_input.filter((p) => p !== pair)),
     });
   }
+  // One chip for the pair: half of it is not a narrower search but a wider one, so they come
+  // off together.
+  if (f.turn_of && f.turn_seq) {
+    chips.push({
+      label: "one turn",
+      remove: () => {
+        f.turn_of = "";
+        f.turn_seq = "";
+      },
+    });
+  } else if (f.session) {
+    chips.push({ label: `session: ${clampText(f.session, 12)}`, remove: () => (f.session = "") });
+  }
   for (const [key, label] of [
     ["project", "project"],
     ["model", "model"],
@@ -443,6 +527,9 @@ function activeFilters() {
     if (f[key]) chips.push({ label: `${label}: ${f[key]}`, remove: () => (f[key] = "") });
   }
   if (f.errors_only) chips.push({ label: "errors only", remove: () => (f.errors_only = false) });
+  if (f.all_records) {
+    chips.push({ label: "including attachments", remove: () => (f.all_records = false) });
+  }
   if (f.sidechain === "exclude") chips.push({ label: "no sidechains", remove: () => (f.sidechain = "any") });
   if (f.sidechain === "only") chips.push({ label: "sidechains only", remove: () => (f.sidechain = "any") });
   if (state.includeThinking) {
@@ -493,10 +580,11 @@ function renderChips() {
 function clearFilters() {
   state.filters.tool = [];
   state.filters.tool_input = [];
-  for (const key of ["project", "model", "role", "kind", "agent_type", "branch", "since", "until"]) {
+  for (const key of ["turn_of", "turn_seq", "session", "project", "model", "role", "kind", "agent_type", "branch", "since", "until"]) {
     state.filters[key] = "";
   }
   state.filters.errors_only = false;
+  state.filters.all_records = false;
   state.filters.sidechain = "any";
   state.includeThinking = false;
 }
@@ -644,6 +732,44 @@ function displayValue(field, value) {
 }
 
 // ─── Rendering: results ───────────────────────────────────────────────────────────────────
+//
+// A transcript is a conversation, so it is drawn as one: a column of turns down a rail, the
+// person's words in a bubble, the model's as prose, and each tool call as a single collapsed
+// line that says what it did. The alternative — every parameter of every call laid out as a
+// table under every hit — is the same information and unreadable at the length a real session
+// runs to, because nothing in it is smaller than anything else.
+//
+// What the search adds to that reading is emphasis. `_meta.snippetField` says which body the
+// words were found in, and `highlight.js` marks them again in every turn drawn afterwards, so
+// a session opened from a hit shows where the query is throughout rather than in one line.
+
+/** What the current query marks. Rebuilt per search, so anything drawn later marks the same
+ *  words — a thread widened twice, a drawer opened three clicks after the search. */
+let markPlan = parseQuery("");
+
+/** Mark `node` in place and hand it back, so it can be used inline in an `el(...)` call. */
+function highlight(node) {
+  markMatches(node, markPlan);
+  return node;
+}
+
+/** Body text rendered in full inside a result card; past it the card shows the excerpt. */
+const CARD_BODY_MAX = 1200;
+/** And for a `system` or `attachment` record, which is routinely a whole environment block
+ *  and is never what a card is being scanned for. */
+const CARD_NOTE_MAX = 500;
+/** And inside a thread or the drawer, where the reader asked for the turn itself. */
+const TURN_BODY_MAX = 20000;
+/** Text scanned when counting matches for a collapsed row. A `tool_output` reaches 1 MiB and
+ *  the drawer asks this of four hundred turns, so the count is of a prefix and says so. */
+const SCAN_MAX = 200000;
+
+const SPEAKERS = {
+  user: { who: "You", icon: "user" },
+  assistant: { who: "Claude", icon: "spark" },
+  system: { who: "System", icon: "gear" },
+  attachment: { who: "Attachment", icon: "file" },
+};
 
 function renderResults(data) {
   const results = Array.isArray(data.results) ? data.results : [];
@@ -653,91 +779,59 @@ function renderResults(data) {
     return;
   }
   emptyEl.hidden = true;
+  // One card shape serves both units. The server collapses a turn to its best-scoring
+  // document and says how many it stood in for, so a grouped card is a flat card that also
+  // knows what it is standing in front of — there is no second `_meta` shape to read wrong.
   resultsEl.replaceChildren(...results.map((result, i) => renderCard(result, i)));
 }
 
 /**
- * One hit.
+ * One hit: the turn it matched, drawn as it was said, under a line of where and when.
  *
- * The rendered body is `_meta.doc` — a whole `ApiDoc` — rather than the flattened `{raw}`
+ * The rendered turn is `_meta.doc` — a whole `ApiDoc` — rather than the flattened `{raw}`
  * fields beside it. Those exist so a stock Search UI result template works against this server
  * without knowing anything about transcripts; this UI knows about transcripts.
  */
 function renderCard(result, index) {
-  const doc = (result._meta && result._meta.doc) || {};
   const meta = result._meta || {};
+  const doc = meta.doc || {};
+  const excerpt = excerptOf(result, meta);
+  const turn = turnOf(doc, meta);
+  // Other documents of this turn that matched and were folded into this one. Zero unless the
+  // search is grouped, and counted server-side against the whole matched set — so it is what
+  // the anchor stands in for, not what happened to fit on the page.
+  const collapsed = Number(meta.collapsed) || 0;
 
-  const threadHost = el("div");
-  const rawHost = el("div");
-  let windowSize = 0;
+  // The turn as the card shows it. Once the gap above or below it is opened the loaded run
+  // contains this same turn, marked as the focused one, and showing both says it twice.
+  const hitNode = renderTurn(doc, { excerpt, bodyMax: noteLike(doc) ? CARD_NOTE_MAX : CARD_BODY_MAX });
 
-  const expandBtn = el("button", {
-    class: "ss-more",
-    type: "button",
-    text: "expand",
-    on: { click: () => expand() },
-  });
-  const collapseBtn = el("button", {
-    class: "ss-more",
-    type: "button",
-    text: "collapse",
-    hidden: true,
-    on: {
-      click: () => {
-        windowSize = 0;
-        threadHost.replaceChildren();
-        collapseBtn.hidden = true;
-        expandBtn.textContent = "expand";
-      },
-    },
-  });
+  const before = el("div");
+  const after = el("div");
 
-  async function expand() {
-    if (!Number.isFinite(Number(doc.seq)) || !doc.session_id) {
-      // `seq` is what a window is centred on; without it there is nothing to expand around,
-      // and letting the request go would spend a round trip to be told the same thing.
-      threadHost.replaceChildren(
-        el("p", {
-          class: "ss-hint",
-          text: "this hit carries no session and seq, so there is no position in a transcript to expand around",
-        }),
-      );
-      return;
-    }
-    // The first press opens a small window and each further press widens it, which is how you
-    // read outwards from a hit without reloading the whole session into the page.
-    windowSize = windowSize === 0 ? WINDOW_START : windowSize + WINDOW_STEP;
-    expandBtn.disabled = true;
-    expandBtn.textContent = "loading…";
-    threadHost.replaceChildren(el("div", { class: "ss-loading" }, el("span", { class: "ss-spinner" }), "loading turns…"));
-    try {
-      const data = await fetchAround(doc, windowSize, windowSize, false);
-      const docs = Array.isArray(data.docs) ? data.docs : [];
-      threadHost.replaceChildren(
-        el(
-          "div",
-          { class: "ss-thread" },
-          ...docs.map((turn) =>
-            renderTurn(turn, { focused: turn.doc_id === doc.doc_id, card: false }),
-          ),
-        ),
-      );
-      collapseBtn.hidden = false;
-      expandBtn.textContent = `wider (±${windowSize + WINDOW_STEP})`;
-    } catch (err) {
-      if (err === SUPERSEDED) return;
-      windowSize = Math.max(0, windowSize - WINDOW_STEP);
-      threadHost.replaceChildren(el("p", { class: "ss-err", text: failureText(err) }));
-      expandBtn.textContent = windowSize ? `wider (±${windowSize + WINDOW_STEP})` : "expand";
-    } finally {
-      expandBtn.disabled = false;
-      // Whatever happened above, the button must stop claiming to be loading — a control stuck
-      // on "loading…" reads as a hung request rather than as one that already came back.
-      if (expandBtn.textContent === "loading…") {
-        expandBtn.textContent = windowSize ? `wider (±${windowSize + WINDOW_STEP})` : "expand";
-      }
-    }
-  }
+  const conv = el(
+    "div",
+    { class: "ss-conv ss-request" },
+    // What was being asked. Suppressed when the search is already scoped to one turn: every
+    // card would then repeat the same instruction, which is the chip's job and not twenty
+    // cards'.
+    state.filters.turn_of ? null : openerTurn(turn),
+    turn.hiddenBefore > 0
+      ? turnGap(doc, {
+          host: before,
+          direction: "before",
+          count: turn.hiddenBefore,
+          label:
+            turn.hiddenBefore === 1
+              ? "1 turn between the request and this"
+              : `${fmtCount(turn.hiddenBefore)} turns between the request and this`,
+        })
+      : null,
+    before,
+    hitNode,
+    after,
+    turnGap(doc, { host: after, direction: "after", label: "what happened next" }),
+  );
 
   const card = el(
     "article",
@@ -747,118 +841,253 @@ function renderCard(result, index) {
       dataset: { index: String(index), error: doc.is_error ? "1" : null },
       on: { click: () => setSelected(index, false) },
     },
-    el("div", { class: "ss-card-head" }, ...badges(doc)),
+    contextLine(doc, collapsed ? collapsed + 1 : null),
+    conv,
     el(
       "div",
-      { class: "ss-card-body" },
-      metaLine(doc),
-      snippetBlock(result, meta, doc),
-      el(
-        "div",
-        { class: "ss-meta" },
-        expandBtn,
-        collapseBtn,
-        el("button", {
-          class: "ss-more",
-          type: "button",
-          text: "open session",
-          on: { click: () => openDrawer(doc) },
-        }),
-        rawButton(doc, rawHost),
-      ),
-      rawHost,
-      threadHost,
+      { class: "ss-card-actions" },
+      // The gap between what the card shows and what the turn matched. Only ever set on a
+      // grouped search, where this card is standing in for the rest.
+      collapsed > 0 && turn.scopeable
+        ? el("button", {
+            class: "ss-more",
+            type: "button",
+            title: "Every matching document in this turn, one per row",
+            text: `${fmtCount(collapsed)} more ${collapsed === 1 ? "match" : "matches"} in this turn`,
+            on: { click: () => scopeToTurn(doc, { flat: true }) },
+          })
+        : null,
+      turn.scopeable && !collapsed
+        ? el("button", {
+            class: "ss-more",
+            type: "button",
+            title: "Every document under this one turn",
+            text: "only this turn",
+            on: { click: () => scopeToTurn(doc, { flat: false }) },
+          })
+        : null,
+      el("button", {
+        class: "ss-more",
+        type: "button",
+        text: "open session",
+        on: { click: () => openDrawer(doc) },
+      }),
     ),
   );
-  card.__expand = expand;
+  // `j`/`k` open the gap between the request and the hit, which is the one that has a count
+  // and is the reason the card is shaped this way.
+  card.__expand = () => {
+    const gap = card.querySelector(".ss-gap[data-direction='before']") || card.querySelector(".ss-gap");
+    if (gap) gap.click();
+  };
   return card;
 }
 
-function badges(doc) {
-  const out = [];
-  if (doc.role) {
-    out.push(el("span", { class: "ss-badge ss-badge-role", dataset: { role: doc.role }, text: doc.role }));
-  }
-  if (doc.tool_name) {
-    const tool = toolMeta(doc);
-    out.push(
-      el(
-        "span",
-        {
-          class: "ss-badge ss-badge-tool",
-          dataset: { accent: tool.accent },
-          title: doc.tool_name,
-        },
-        iconFor(tool.icon),
-        el("span", { text: clampText(tool.label, 22) }),
-      ),
-    );
-  }
-  if (doc.is_error) out.push(el("span", { class: "ss-badge is-error", text: "error" }));
-  if (doc.is_sidechain) out.push(el("span", { class: "ss-badge", text: "sidechain" }));
-  if (doc.agent_type) out.push(el("span", { class: "ss-badge", text: clampText(doc.agent_type, 18) }));
-  return out;
+/**
+ * Narrow to one turn.
+ *
+ * Both halves of the key or neither: `turn_seq` is a per-file ordinal, so a path-less one is
+ * not a narrower search but a wider one, and the server refuses it rather than answering it.
+ * `flat` turns grouping off with it — a grouped view of one turn is one card, which is the
+ * card the reader is already looking at.
+ */
+function scopeToTurn(doc, { flat }) {
+  state.filters.turn_of = doc.source_path || "";
+  state.filters.turn_seq = String(doc.turn_seq);
+  if (flat) state.group = "none";
+  syncControls();
+  search({ push: true });
 }
 
-function metaLine(doc) {
+/**
+ * What the hit says about the turn it happened under.
+ *
+ * `turn_seq` is on every document and the turn's opening prompt is resolved once per page by
+ * the server, so all of this is answerable from the search response — a card costs no extra
+ * request to say what was being asked when the thing it found happened.
+ */
+function turnOf(doc, meta) {
+  const turnSeq = Number(doc.turn_seq);
+  const at = Number(doc.seq);
+  const opener = (meta && meta.turnOpener) || null;
+  if (!Number.isFinite(turnSeq) || !Number.isFinite(at)) {
+    return { opener: null, hiddenBefore: 0, scopeable: false, opening: false };
+  }
+  return {
+    opener,
+    // The hit *is* the turn's opening prompt — there is nothing above it to draw. A file that
+    // begins mid-conversation gets a synthetic turn with no opener at all, and then
+    // `turnOpener` is null and this is false: both are "nothing to put above the hit".
+    opening: turnSeq === at,
+    hiddenBefore: Math.max(0, at - turnSeq - 1),
+    scopeable: Boolean(doc.source_path) && Number.isFinite(turnSeq),
+  };
+}
+
+/**
+ * The human turn a hit happened under.
+ *
+ * The whole document, not a copy of its opening: the server resolves the opener for every turn
+ * on the page in one query, so what arrives here is a real turn with its own timestamp and its
+ * own raw line — and nothing has to warn the reader that they are looking at the first two
+ * hundred characters of an instruction.
+ */
+function openerTurn(turn) {
+  if (turn.opening || !turn.opener) return null;
+  const node = renderTurn(turn.opener, { bodyMax: CARD_BODY_MAX });
+  node.classList.add("ss-turn-request");
+  const who = node.querySelector(".ss-who");
+  if (who) who.textContent = "You asked";
+  return node;
+}
+
+/**
+ * A run of turns nobody has asked for yet, as one line saying how many.
+ *
+ * The gap above a hit has an exact count, because `turn_seq` says where the turn began.
+ * The one below does not — nothing on the hit says how far the request runs — so it loads a
+ * window and stops at the boundary it finds, which is either the next request or the end of
+ * the transcript. Saying which is the point: "nothing follows" and "the next request starts
+ * here" are different facts about the session and a reader is entitled to both.
+ */
+function turnGap(doc, { host, direction, count = null, label }) {
+  const at = direction === "before";
+  let loaded = 0;
+
+  const button = el("button", {
+    class: "ss-gap",
+    type: "button",
+    dataset: { direction },
+    "aria-expanded": "false",
+    on: { click: () => load() },
+  });
+  const caption = el("span", { class: "ss-gap-label", text: label });
+  button.append(el("span", { class: "ss-gap-rule", "aria-hidden": "true" }), caption);
+
+  async function load() {
+    if (!Number.isFinite(Number(doc.seq)) || !doc.session_id) {
+      caption.textContent = "this hit carries no session and seq to read around";
+      button.disabled = true;
+      return;
+    }
+    // Before: exactly the run between the request and the hit, which is known. After: a
+    // window, widened by another one on each press until a boundary answers the question.
+    const want = at ? count : loaded + WINDOW_STEP;
+    button.disabled = true;
+    caption.textContent = "loading…";
+    try {
+      const data = await fetchAround(doc, at ? want : 0, at ? 0 : want, false);
+      const all = Array.isArray(data.docs) ? data.docs : [];
+      let turns = all.filter((d) =>
+        at ? Number(d.seq) < Number(doc.seq) : Number(d.seq) > Number(doc.seq),
+      );
+      // Below the hit, the run belongs to this request only until the next one begins.
+      let boundary = null;
+      if (!at) {
+        const next = turns.findIndex((d) => Number(d.turn_seq) !== Number(doc.turn_seq));
+        if (next !== -1) {
+          boundary = turns[next];
+          turns = turns.slice(0, next);
+        }
+      }
+      host.replaceChildren(...turns.map((turn) => renderTurn(turn)));
+      loaded = turns.length;
+      button.setAttribute("aria-expanded", "true");
+
+      if (at) {
+        button.remove();
+        return;
+      }
+      if (boundary) {
+        caption.textContent = "the next request starts here";
+        button.disabled = true;
+      } else if (turns.length < want) {
+        caption.textContent = turns.length
+          ? "the end of this transcript"
+          : "nothing follows this in the transcript";
+        button.disabled = true;
+      } else {
+        caption.textContent = "further";
+        button.disabled = false;
+      }
+    } catch (err) {
+      if (err === SUPERSEDED) return;
+      caption.textContent = failureText(err);
+      button.disabled = false;
+    }
+  }
+
+  return button;
+}
+
+/**
+ * The excerpt the server cut, and which body it came from.
+ *
+ * `_meta.snippetField` is four different claims about what happened — what the turn said, a
+ * snippet it quoted, what a command printed, what the model was thinking privately — and each
+ * one is shown in the place that says so, never as if the model had written it.
+ */
+function excerptOf(result, meta) {
+  const field = meta.snippetField || "text";
+  const entry = result[field];
+  const html = entry && typeof entry.snippet === "string" ? entry.snippet : null;
+  return html === null ? null : { field, html };
+}
+
+/** The server's excerpt as a block. `data-marked` keeps `highlight.js` off it: the `<em>`s in
+ *  it are the spans the index actually matched, and a second opinion can only disagree. */
+function excerptNode(excerpt) {
+  const label =
+    excerpt.field === "tool_output"
+      ? "matched in what the tool printed"
+      : excerpt.field === "thinking"
+        ? "matched in the model's thinking"
+        : excerpt.field === "code"
+          ? "matched in code"
+          : null;
+  return el(
+    "div",
+    { class: "ss-excerpt", dataset: { marked: "", field: excerpt.field } },
+    label ? el("span", { class: "ss-excerpt-label", text: label }) : null,
+    el("p", { class: "ss-snippet", html: excerpt.html }),
+  );
+}
+
+/** Where and when, above a hit. Quiet on purpose: it is the filing, not the conversation. */
+function contextLine(doc, matched = null) {
   const parts = [];
   if (doc.project) {
     parts.push(
       el(
         "span",
         { class: "ss-path", title: doc.project },
-        el("span", { class: "ss-path-dir", text: dirname(doc.project) }),
+        el("span", { class: "ss-path-dir", text: dirname(String(doc.project).replace(/^\/home\/[^/]+/, "~")) }),
         el("span", { class: "ss-path-base", text: basename(doc.project) }),
       ),
     );
   }
   if (doc.git_branch) parts.push(el("span", { text: doc.git_branch }));
-  if (doc.model) parts.push(el("span", { text: clampText(doc.model, 28) }));
   if (Number.isFinite(doc.timestamp_ms)) {
     parts.push(el("span", { title: fmtTime(doc.timestamp_ms), text: relTime(doc.timestamp_ms) }));
   }
-  parts.push(el("span", { title: doc.doc_id || "", text: sessionKey(doc) }));
-  return el("div", { class: "ss-meta" }, ...parts);
+  parts.push(el("span", { class: "ss-count", title: doc.doc_id || "", text: sessionKey(doc) }));
+  if (doc.is_sidechain) parts.push(el("span", { class: "ss-badge", text: "sidechain" }));
+  if (doc.agent_type) parts.push(el("span", { class: "ss-badge", text: clampText(doc.agent_type, 18) }));
+  if (doc.is_meta) parts.push(el("span", { class: "ss-badge", text: "meta" }));
+  if (matched !== null) {
+    parts.push(
+      el("span", {
+        class: "ss-hits ss-ctx-hits",
+        text: matched === 1 ? "1 match" : `${fmtCount(matched)} matches`,
+      }),
+    );
+  }
+  return el("div", { class: "ss-card-ctx" }, ...parts);
 }
 
-/**
- * The excerpt, labelled with the body it was cut from.
- *
- * `_meta.snippetField` says whether the words matched in the turn's text, in what a tool
- * printed, or in what the model was thinking. Those are three different claims about what
- * happened, and a card that showed thinking as if it were assistant text — or a command's
- * output as if the model had said it — would be misattributing a quote.
- */
-function snippetBlock(result, meta, doc) {
-  const field = meta.snippetField || "text";
-  const entry = result[field];
-  const html = entry && typeof entry.snippet === "string" ? entry.snippet : null;
-
-  const label =
-    field === "tool_output"
-      ? { text: "matched in what the tool printed", accent: "warn" }
-      : field === "thinking"
-        ? { text: "matched in the model's thinking", accent: "accent" }
-        : null;
-
-  const nodes = [];
-  if (label) {
-    nodes.push(el("span", { class: "ss-badge ss-badge-tool", dataset: { accent: label.accent }, text: label.text }));
-  }
-  if (html !== null) {
-    // The one place `html` is used. `dto::highlight_html` escapes the text and then wraps the
-    // matched spans in `<em>`; anything else on this page goes through `text`.
-    nodes.push(el("p", { class: "ss-snippet", html }));
-  } else {
-    // A hit with no snippet is normal for a filter-only browse, where there are no query terms
-    // to mark. Showing the head of the body is better than showing an empty card.
-    // `body` is the body as a reader saw it; `text` and `code` are the indexed halves of it,
-    // split for retrieval and not reassemblable into it (the split drops link destinations and
-    // loses where a fence sat). So the reader always gets `body`.
-    const body = doc.kind === "tool_call" ? doc.tool_output || doc.body : doc.body;
-    nodes.push(el("p", { class: "ss-snippet", text: clampText(body || "(no indexed text)", 400) }));
-  }
-  return frag(...nodes);
+/** A record that is part of the transcript rather than part of the conversation. */
+function noteLike(doc) {
+  return doc.role === "system" || doc.role === "attachment";
 }
 
 function sessionKey(doc) {
@@ -885,59 +1114,254 @@ function fetchAround(doc, before, after, includeRaw) {
   return api(`/api/sessions/${encodeURIComponent(doc.session_id || "")}/around?${p.toString()}`);
 }
 
-/** One turn, as a nested thread entry or as a card in the drawer. */
-function renderTurn(doc, { focused = false, card = false } = {}) {
-  const node = el(card ? "article" : "div", {
-    class: [card ? "ss-card" : "ss-thread-turn", focused ? "ss-focus" : null],
-    dataset: { docId: doc.doc_id || "", error: doc.is_error ? "1" : null },
-  });
-  const head = el("div", { class: card ? "ss-card-head" : "ss-meta" }, ...badges(doc));
-  const body = el("div", { class: "ss-card-body" }, metaLine(doc), ...turnContent(doc));
-  node.append(head, body);
-  return node;
-}
+/**
+ * One turn of the conversation.
+ *
+ * Three shapes, because three things happened: a person typed, the model answered, or a tool
+ * ran. A tool call collapses to its one line — `Bash  cargo test --locked` — and opens on
+ * demand, which is the only way a session of six hundred turns stays a thing you can scroll.
+ */
+function renderTurn(doc, { focused = false, excerpt = null, bodyMax = TURN_BODY_MAX } = {}) {
+  const role = typeof doc.role === "string" ? doc.role : "";
+  const isTool = doc.kind === "tool_call";
+  const speaker = SPEAKERS[role] || SPEAKERS.system;
 
-function turnContent(doc) {
-  const out = [];
-  let rendered = false;
-  if (doc.kind === "tool_call") {
-    out.push(renderToolCall(doc));
-    const result = renderToolResult(doc);
-    if (result) out.push(result);
-    rendered = true;
-  } else if (doc.body && doc.body.trim()) {
-    out.push(el("div", {}, renderMarkdown(doc.body)));
-    rendered = true;
+  const main = el("div", { class: "ss-turn-main" });
+  if (!isTool) main.append(turnHead(doc, speaker));
+
+  let drew = false;
+  if (isTool) {
+    main.append(renderActivity(doc, { excerpt, open: focused && excerpt === null }));
+    drew = true;
+  } else {
+    const body = messageBody(doc, excerpt, bodyMax);
+    if (body) {
+      main.append(body);
+      drew = true;
+    }
   }
 
-  if (doc.thinking && doc.thinking.trim()) {
-    rendered = true;
-    // Behind a disclosure and never open: thinking is the model's scratch work, it is long, and
-    // presenting it inline alongside the turn invites reading it as something that was said.
-    out.push(
-      el(
-        "details",
-        {},
-        el("summary", { text: `thinking (${fmtCount(doc.thinking.length)} characters)` }),
-        el("div", {}, renderMarkdown(doc.thinking)),
-      ),
-    );
+  const thinking = thinkingBlock(doc, excerpt, bodyMax);
+  if (thinking) {
+    main.append(thinking);
+    drew = true;
   }
 
-  const host = el("div");
-  out.push(el("div", { class: "ss-meta" }, rawButton(doc, host)), host);
-
-  if (!rendered) {
+  if (!drew) {
     // A record this build indexed but has no view for. Saying so points at the affordance that
     // always works, rather than leaving a turn that looks empty because it contained nothing.
-    out.unshift(
+    main.append(
       el("p", {
         class: "ss-hint",
         text: "no text here that this view knows how to render — the raw JSONL line is the record itself",
       }),
     );
   }
-  return out;
+
+  // The raw line lives in the gutter under the avatar rather than in a row of its own: a
+  // control on every one of four hundred turns costs a row of empty space on every one of
+  // them, and empty space between a turn and the next is exactly what a conversation is not.
+  const rawHost = el("div");
+  main.append(rawHost);
+
+  return el(
+    "div",
+    {
+      class: ["ss-turn", focused ? "ss-focus" : null],
+      dataset: {
+        role: role || "system",
+        kind: isTool ? "tool_call" : "message",
+        docId: doc.doc_id || "",
+        error: doc.is_error ? "1" : null,
+      },
+    },
+    el(
+      "div",
+      { class: "ss-turn-rail" },
+      avatarNode(doc, speaker, isTool),
+      el("div", { class: "ss-turn-tools" }, rawButton(doc, rawHost, { icon: true })),
+    ),
+    main,
+  );
+}
+
+function avatarNode(doc, speaker, isTool) {
+  if (isTool) {
+    const meta = toolMeta(doc);
+    return el("span", { class: "ss-avatar ss-avatar-tool", dataset: { accent: meta.accent } }, iconFor(meta.icon));
+  }
+  return el("span", { class: "ss-avatar", dataset: { role: doc.role || "system" } }, iconFor(speaker.icon));
+}
+
+function turnHead(doc, speaker) {
+  const parts = [el("span", { class: "ss-who", text: speaker.who })];
+  if (doc.role === "assistant" && doc.model) {
+    parts.push(el("span", { class: "ss-turn-model", title: doc.model, text: clampText(doc.model, 24) }));
+  }
+  if (Number.isFinite(doc.timestamp_ms)) {
+    parts.push(el("span", { class: "ss-when", title: fmtTime(doc.timestamp_ms), text: fmtClock(doc.timestamp_ms) }));
+  }
+  return el("div", { class: "ss-turn-head" }, ...parts);
+}
+
+/**
+ * What was said.
+ *
+ * `body` is the body as a reader saw it; `text` and `code` are the indexed halves of it, split
+ * for retrieval and not reassemblable into it (the split drops link destinations and loses
+ * where a fence sat). So the reader always gets `body` — unless it is longer than this view
+ * asked for, in which case the server's excerpt is shown instead and says that it is one.
+ */
+function messageBody(doc, excerpt, max) {
+  const body = typeof doc.body === "string" ? doc.body : "";
+  const own = excerpt && excerpt.field !== "thinking" ? excerpt : null;
+  const wrap = (node) => el("div", { class: doc.role === "user" ? "ss-bubble" : "ss-prose" }, node);
+  if (!body.trim()) return own ? wrap(excerptNode(own)) : null;
+  return wrap(longText(body, own, max));
+}
+
+/**
+ * Text that may be longer than this view wants to draw.
+ *
+ * Under the cap it is rendered whole and marked here, and the server's excerpt is not shown at
+ * all — it is a window onto text that is already entirely on screen, and printing both says
+ * the same thing twice. Over the cap the excerpt wins, because it is centred on the match and
+ * the first `max` characters of a turn whose match is nine thousand characters in are not.
+ */
+function longText(text, excerpt, max) {
+  if (text.length <= max) return highlight(el("div", { class: "ss-md" }, renderMarkdown(text)));
+
+  const host = el("div", { class: "ss-md" });
+  const showAll = el("button", {
+    class: "ss-more",
+    type: "button",
+    text: `show all ${fmtCount(text.length)} characters`,
+    on: {
+      click: () => {
+        host.replaceChildren(highlight(el("div", {}, renderMarkdown(text))));
+        showAll.remove();
+      },
+    },
+  });
+  host.append(excerpt ? excerptNode(excerpt) : highlight(el("div", {}, renderMarkdown(clampText(text, max)))));
+  return frag(host, showAll);
+}
+
+/**
+ * The model's scratch work, behind a disclosure.
+ *
+ * Never open unless the match is in it: thinking is long, it is not something that was said,
+ * and presenting it inline beside the turn invites reading it as if it were.
+ */
+function thinkingBlock(doc, excerpt, max) {
+  const text = typeof doc.thinking === "string" ? doc.thinking : "";
+  const matched = excerpt && excerpt.field === "thinking" ? excerpt : null;
+  if (!text.trim()) return matched ? el("div", { class: "ss-think-body" }, excerptNode(matched)) : null;
+
+  const host = el("div", { class: "ss-think-body" });
+  let built = false;
+  const build = () => {
+    if (built) return;
+    built = true;
+    host.append(longText(text, matched, max));
+  };
+
+  const hits = countIn(text);
+  const details = el(
+    "details",
+    { class: "ss-think", on: { toggle: () => details.open && build() } },
+    el(
+      "summary",
+      {},
+      iconFor("brain"),
+      el("span", { text: `thought for ${fmtCount(text.length)} characters` }),
+      hits ? el("span", { class: "ss-hits", text: hitLabel(hits) }) : null,
+    ),
+    host,
+  );
+  if (matched) {
+    // The words were found in here, so opening it is the answer to "found where?".
+    build();
+    details.open = true;
+  }
+  return details;
+}
+
+/**
+ * A tool call as one line, opening onto the call and its result.
+ *
+ * Built lazily: a `MultiEdit` is a stack of diffs and the drawer draws four hundred turns, so
+ * a row that is never opened must cost a row. The match count is not lazy — it is counted from
+ * the text rather than from the DOM, precisely so a collapsed row can say what is inside it.
+ */
+function renderActivity(doc, { excerpt = null, open = false } = {}) {
+  const meta = toolMeta(doc);
+  const summary = toolSummary(doc);
+  const hits = countIn(doc.body) + countIn(doc.tool_output);
+
+  const bodyHost = el("div", { class: "ss-act-body", hidden: true });
+  let built = false;
+  const build = () => {
+    if (built) return;
+    built = true;
+    bodyHost.append(renderToolCall(doc));
+    const result = renderToolResult(doc);
+    if (result) bodyHost.append(result);
+    highlight(bodyHost);
+  };
+
+  const chevron = iconFor("chevron");
+  chevron.classList.add("ss-act-chevron");
+
+  // The row's own argument is marked like everything else. `markMatches` skips buttons when it
+  // walks a subtree — chrome is not transcript — so the span is handed to it directly.
+  const arg = summary ? el("span", { class: "ss-act-arg", title: summary, text: summary }) : null;
+  const argMarks = arg ? markMatches(arg, markPlan) : 0;
+
+  const head = el(
+    "button",
+    {
+      class: "ss-act",
+      type: "button",
+      "aria-expanded": "false",
+      dataset: { accent: meta.accent, error: doc.is_error ? "1" : null },
+      on: { click: () => setOpen(bodyHost.hidden) },
+    },
+    el("span", { class: "ss-act-tool", text: clampText(meta.label, 24) }),
+    arg,
+    doc.is_error ? el("span", { class: "ss-act-flag", text: "error" }) : null,
+    hits ? el("span", { class: "ss-hits", text: hitLabel(hits) }) : null,
+    chevron,
+  );
+
+  // An excerpt cut from the call itself repeats the row above it word for word — the body of
+  // a tool call *is* its name and its parameters — so it is only worth the space when the row
+  // is not already showing the match. Output and thinking are never on the row, so they are.
+  const shows = excerpt && (excerpt.field === "tool_output" || excerpt.field === "thinking" || argMarks === 0);
+  const preview = shows ? excerptNode(excerpt) : null;
+
+  const setOpen = (on) => {
+    if (on) build();
+    bodyHost.hidden = !on;
+    // The excerpt is the stand-in for the body; showing both says the same thing twice, and
+    // the one that is actually in the transcript should win once it is on screen.
+    if (preview) preview.hidden = on;
+    head.setAttribute("aria-expanded", on ? "true" : "false");
+  };
+
+  const node = el("div", { class: "ss-act-wrap" }, head, preview, bodyHost);
+  if (open) setOpen(true);
+  return node;
+}
+
+/** How many marks `text` would get. Counted from the text, so a collapsed row can say it. */
+function countIn(text) {
+  if (typeof text !== "string" || !text || isEmptyPlan(markPlan)) return 0;
+  return matchRanges(text.slice(0, SCAN_MAX), markPlan).length;
+}
+
+function hitLabel(n) {
+  return n === 1 ? "1 match" : `${fmtCount(n)} matches`;
 }
 
 /**
@@ -948,18 +1372,28 @@ function turnContent(doc) {
  * always right, so it is one press away from every turn rather than a thing you go to the
  * terminal for.
  */
-function rawButton(doc, host) {
+function rawButton(doc, host, { icon = false } = {}) {
   let shown = false;
+  const label = (open) => (open ? "hide raw" : "raw JSON");
+  const setLabel = (open) => {
+    // The icon form has no room for a caption, so the state it would have carried moves to
+    // the tooltip and to `aria-pressed`, which is what a screen reader reads either way.
+    if (icon) button.setAttribute("aria-pressed", open ? "true" : "false");
+    else button.textContent = label(open);
+  };
   const button = el("button", {
-    class: "ss-more",
+    class: icon ? "ss-btn ss-btn-icon ss-raw" : "ss-more",
     type: "button",
-    text: "raw JSON",
+    title: "The raw JSONL line for this turn",
+    "aria-label": "Show the raw JSONL line",
+    "aria-pressed": icon ? "false" : null,
+    text: icon ? null : "raw JSON",
     on: {
       click: async () => {
         if (shown) {
           host.replaceChildren();
           shown = false;
-          button.textContent = "raw JSON";
+          setLabel(false);
           return;
         }
         if (!Number.isFinite(Number(doc.seq)) || !doc.session_id) {
@@ -974,7 +1408,7 @@ function rawButton(doc, host) {
           const match = (data.docs || []).find((d) => d.doc_id === doc.doc_id) || (data.docs || [])[0];
           host.replaceChildren(rawBlock(match));
           shown = true;
-          button.textContent = "hide raw";
+          setLabel(true);
         } catch (err) {
           if (err !== SUPERSEDED) host.replaceChildren(el("p", { class: "ss-err", text: failureText(err) }));
         } finally {
@@ -983,6 +1417,7 @@ function rawButton(doc, host) {
       },
     },
   });
+  if (icon) button.appendChild(iconFor("braces"));
   return button;
 }
 
@@ -1021,7 +1456,12 @@ async function openDrawer(doc) {
   try {
     const data = await api(`/api/sessions/${encodeURIComponent(doc.session_id || "")}?${p.toString()}`);
     const docs = Array.isArray(data.docs) ? data.docs : [];
-    const nodes = docs.map((turn) => renderTurn(turn, { card: true, focused: turn.doc_id === doc.doc_id }));
+    const conv = el(
+      "div",
+      { class: "ss-conv" },
+      ...docs.map((turn) => renderTurn(turn, { focused: turn.doc_id === doc.doc_id })),
+    );
+    const nodes = [conv];
     if (data.truncated) {
       nodes.push(
         el("p", {
@@ -1031,6 +1471,7 @@ async function openDrawer(doc) {
       );
     }
     drawerBodyEl.replaceChildren(...nodes);
+    drawerNavEl.replaceChildren(matchNav(drawerBodyEl));
     // The matched turn is the reason the drawer was opened; a session view that lands at turn
     // one leaves the reader to find it again by hand in four hundred turns.
     const focus = drawerBodyEl.querySelector(".ss-focus");
@@ -1061,6 +1502,43 @@ function bindSidechainLinks(host) {
 bindSidechainLinks(resultsEl);
 bindSidechainLinks(drawerBodyEl);
 
+/**
+ * Step through the marks in a session.
+ *
+ * The count is taken at each press rather than cached, because it moves: a collapsed tool row
+ * says how many matches are inside it, and opening one puts those marks into this pool. A
+ * number frozen at render time would disagree with the row right next to it.
+ */
+function matchNav(host) {
+  if (isEmptyPlan(markPlan)) return frag();
+
+  let at = -1;
+  const label = el("span", { class: "ss-count" });
+
+  const marks = () => Array.from(host.querySelectorAll("mark.ss-hit"));
+
+  const step = (dir) => {
+    const all = marks();
+    if (!all.length) {
+      label.textContent = "no marks on screen";
+      return;
+    }
+    at = (at + dir + all.length) % all.length;
+    for (const mark of all) mark.classList.remove("ss-hit-on");
+    all[at].classList.add("ss-hit-on");
+    all[at].scrollIntoView({ block: "center" });
+    label.textContent = `${at + 1} / ${all.length}`;
+  };
+
+  const button = (text, dir, title) =>
+    el("button", { class: "ss-btn ss-btn-icon", type: "button", title, "aria-label": title, text, on: { click: () => step(dir) } });
+
+  const count = countMarks(host);
+  label.textContent = count ? hitLabel(count) : "no marks on screen";
+  host.__step = step;
+  return frag(label, button("\u2191", -1, "Previous match"), button("\u2193", 1, "Next match"));
+}
+
 function showDrawer() {
   drawerEl.hidden = false;
   if (typeof drawerEl.showModal === "function" && !drawerEl.open) drawerEl.showModal();
@@ -1070,6 +1548,7 @@ function closeDrawer() {
   if (drawerEl.open) drawerEl.close();
   drawerEl.hidden = true;
   drawerBodyEl.replaceChildren();
+  drawerNavEl.replaceChildren();
 }
 
 // `<dialog>` closes itself on Escape and on the backdrop, and the markup ships `hidden` as well
@@ -1316,6 +1795,17 @@ function buildFilterPanel() {
   });
   rows.push(checkbox("search thinking", thinking));
 
+  const allRecords = el("input", {
+    type: "checkbox",
+    on: {
+      change: () => {
+        state.filters.all_records = allRecords.checked;
+        search({ push: true });
+      },
+    },
+  });
+  rows.push(checkbox("attachments and system", allRecords));
+
   const panel = el(
     "section",
     { class: "ss-facet" },
@@ -1324,7 +1814,7 @@ function buildFilterPanel() {
   );
   facetsEl.parentNode.insertBefore(panel, facetsEl);
 
-  return { toolInput, since, until, errors, sidechain, thinking };
+  return { toolInput, since, until, errors, sidechain, thinking, allRecords };
 }
 
 function dateField(key, label) {
@@ -1375,11 +1865,13 @@ const controls = buildFilterPanel();
 function syncControls() {
   qEl.value = state.q;
   sortEl.value = state.sort;
+  groupEl.value = state.group;
   controls.since.value = state.filters.since;
   controls.until.value = state.filters.until;
   controls.errors.checked = state.filters.errors_only;
   controls.sidechain.value = state.filters.sidechain;
   controls.thinking.checked = state.includeThinking;
+  controls.allRecords.checked = state.filters.all_records;
 }
 
 // ─── Stats and reindex ────────────────────────────────────────────────────────────────────
@@ -1473,8 +1965,16 @@ document.addEventListener("keydown", (ev) => {
   }
 
   if (ev.metaKey || ev.ctrlKey || ev.altKey) return;
-  // The drawer is modal: every other shortcut here acts on the result list behind it.
-  if (drawerEl.open || !drawerEl.hidden) return;
+
+  // The drawer is modal, and inside it the only thing to move between is the marks: `n` and
+  // `N` are the same pair the two steppers in its header press.
+  if (drawerEl.open || !drawerEl.hidden) {
+    if ((ev.key === "n" || ev.key === "N") && !isTyping(ev.target) && typeof drawerBodyEl.__step === "function") {
+      ev.preventDefault();
+      drawerBodyEl.__step(ev.key === "n" ? 1 : -1);
+    }
+    return;
+  }
 
   if (ev.key === "/" && !isTyping(ev.target)) {
     ev.preventDefault();
@@ -1540,6 +2040,11 @@ qEl.addEventListener("keydown", (ev) => {
 
 sortEl.addEventListener("change", () => {
   state.sort = SORTS.includes(sortEl.value) ? sortEl.value : "relevance";
+  search({ push: true });
+});
+
+groupEl.addEventListener("change", () => {
+  state.group = GROUPS.includes(groupEl.value) ? groupEl.value : "turn";
   search({ push: true });
 });
 

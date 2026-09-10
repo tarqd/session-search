@@ -30,6 +30,7 @@ web/index.html     the shell — ids below are the contract with app.js
 web/styles.css     design tokens and every class listed under "CSS contract"
 web/dom.js         shared DOM primitives (no imports of its own)
 web/markdown.js    a deliberately small, escape-first markdown subset
+web/highlight.js   query-term marking, a port of the index's own tokenizer
 web/tools.js       one renderer per known tool, registry + fallbacks
 web/app.js         state, the API client, facets, results, expansion, routing
 ```
@@ -89,6 +90,7 @@ Request body (every key optional):
   "facets": { "tool_name": { "type": "value", "size": 15 } },
   "sortList": [{ "field": "timestamp", "direction": "desc" }],
   "includeThinking": false,            // native extras, camelCase like the rest
+  "groupByTurn": false,                // one result per TURN instead of per document
   "snippetChars": 240
 }
 ```
@@ -116,6 +118,8 @@ Filter field names in the Search UI form map onto `Filters` like this. Anything 
 | `git_branch` / `branch`    | `branch`               | one value only                           |
 | `timestamp`                | `since` / `until`      | range value `{from, to}`                 |
 | `thinking_tokens`          | `min_thinking`         | range value `{from}`                     |
+| `all_records`              | `all_records`          | `[true]` widens to the whole index; `[false]` is the default |
+| `turn_of` + `turn_seq`     | same                   | one turn; both halves or a `400`         |
 | `is_error`                 | `errors_only`          | `[true]`                                 |
 | `is_sidechain`             | `sidechains_only` / `no_sidechains` | `[true]` / `[false]`        |
 
@@ -195,13 +199,51 @@ prints is in `_meta.doc` only by way of the plain body text. Which spans those a
 that read a markdown file has some — is otherwise indistinguishable from the highlighter's,
 and emphasis on a word the caller did not search for is a wrong answer given confidently.
 
+### Grouping, and the two totals
+
+`groupByTurn: true` makes a result a **turn** rather than a document: `search::search` keeps the
+best-scoring member of each turn and `_meta.collapsed` says how many it stood in for.
+
+This envelope withheld grouping for a long time, for a reason specific to Search UI — grouping
+makes `limit`/`offset` count turns while `SearchResponse::total` keeps counting documents, and
+every page control in the response divides one by the other. A facade that paged in turns and
+reported a document total would be wrong in the one place a user can see it.
+
+It carries grouping now because that failure is avoidable rather than inherent:
+
+| field | ungrouped | grouped |
+| ----- | --------- | ------- |
+| `totalResults`, `totalPages` | documents | **turns** — the unit being paged |
+| `info.totalDocuments` | documents | documents |
+| `info.grouped` | `false` | `true` |
+| `_meta.collapsed` | `0` | others of that turn that matched |
+
+The turn total costs `search::count_turns`, one extra pass keyed on `(source_path, turn_seq)`,
+paid only when grouping is on. `turn_seq` is a per-file ordinal and two transcripts can share a
+`session_id` (§9), so the path is half the key — and term ordinals are per segment, so the
+distinct count resolves them before merging or two files' turn #0 count as one.
+
+### What a search covers, and `_meta.turnOpener`
+
+Results exclude the transcript's apparatus — `attachment` records, `system` records and meta
+turns — unless `all_records` asks for them, and `info.hidden` says how many that refused. It is
+a scope on the results, never on the index: everything stays findable by asking.
+
+`_meta.turnOpener` is the human prompt each hit happened under, as a whole `ApiDoc`.
+`Doc::turn_prompt` is indexed into `context_text` and never *stored*, so a hit does not carry
+it; `context::turn_openers` resolves every turn on the page in one query — the opener is the
+document where `seq == turn_seq` — because twenty cards each fetching their own would be twenty
+round trips for one page. `null` when the hit is itself that prompt, and when the turn is the
+synthetic one a file beginning mid-conversation gets.
+
 ### `GET /api/search` — the same envelope, for `curl`
 
 Repeatable keys are repeated, not comma-joined (`?tool=Bash&tool=Read`).
 
 ```
 q, page, size, offset, sort, facets (comma-separated), facet_top, snippet_chars,
-include_thinking, project, tool, tool_input, tool_output, lang, program, min_thinking, branch,
+include_thinking, group_by_turn, all_records, turn_of, turn_seq, project, tool, tool_input,
+tool_output, lang, program, min_thinking, branch,
 model, role, kind, session, agent_type, since, until, errors_only, no_sidechains, sidechains_only
 ```
 
@@ -319,6 +361,35 @@ blockquotes, bullet and numbered lists, horizontal rules. Anything it does not u
 stays literal text. It is small on purpose: this renders text a model wrote, and a
 markdown bug that turns into an injection is the worst possible outcome here.
 
+### `web/highlight.js`
+
+```js
+export function parseQuery(query)        // -> {words, phrases}; empty when nothing to mark
+export function isEmptyPlan(plan)        // -> boolean
+export function tokenize(text)           // -> [{start, end, terms:Set}]
+export function matchRanges(text, plan)  // -> [[start, end]] merged, in order
+export function markMatches(root, plan)  // wraps matches in <mark class="ss-hit">; -> count
+export function countMarks(root)         // -> how many marks are under `root`
+```
+
+The server marks one excerpt per hit (`highlight_html`). This marks the same words everywhere
+else the UI draws transcript text — a widened turn window, a whole session in the drawer, the
+argument on a collapsed tool row.
+
+"Does this word match" is not a substring question here: `tokenizer.rs` indexes
+`open_or_create` as `openorcreate` + `open` + `or` + `create` at one position, so a search for
+`openOrCreate` finds the snake_case spelling. The splitting rules are a **port** of that
+analyzer — `parts_of`, `is_boundary`, `is_blob`, the separator-free whole form — and a document
+token matches a query word when it carries every term that word produces. A highlighter that
+disagreed with the index would say "not here" about a document the index returned *because* the
+word was here.
+
+It knowingly under-marks rather than guessing: the prose analyzer's English stemmer is
+approximated by a short list of regular endings, and a field-scoped clause marks its value
+anywhere in the turn. Negated clauses are never marked — a matching document cannot contain
+them. Blocks holding a server snippet carry `data-marked`, and `markMatches` skips them: those
+`<em>`s are the spans the index actually matched.
+
 ### `web/tools.js`
 
 ```js
@@ -344,9 +415,9 @@ object: generic table, no console noise beyond one `console.debug`.
 
 ### `web/index.html` ids (the contract with `app.js`)
 
-`#q` (search input), `#sort`, `#refresh`, `#stats`, `#facets`, `#chips`, `#results`,
-`#summary`, `#pager`, `#drawer`, `#drawer-body`, `#drawer-title`, `#drawer-close`,
-`#empty`, `#error`, `#theme`.
+`#q` (search input), `#sort`, `#group`, `#refresh`, `#stats`, `#facets`, `#chips`,
+`#results`, `#summary`, `#pager`, `#drawer`, `#drawer-body`, `#drawer-title`, `#drawer-nav`,
+`#drawer-close`, `#empty`, `#error`, `#theme`.
 
 ### CSS contract
 
@@ -356,11 +427,53 @@ Tokens on `:root`, redefined under `[data-theme="dark"]` and
 --ok --warn --err --add --del --mark --radius --mono --sans`.
 
 Classes the renderers emit, which `styles.css` must style:
-`.ss-card .ss-card-head .ss-card-body .ss-meta .ss-badge .ss-badge-role .ss-badge-tool
-.ss-chip .ss-chip-x .ss-path .ss-path-dir .ss-path-base .ss-snippet .ss-code .ss-term
-.ss-term-cmd .ss-out .ss-kv .ss-kv-k .ss-kv-v .ss-json .ss-diff .ss-diff-add .ss-diff-del
-.ss-todo .ss-todo-done .ss-todo-active .ss-more .ss-thread .ss-thread-turn .ss-focus
-.ss-facet .ss-facet-head .ss-facet-row .ss-count .ss-hint .ss-err .ss-spinner .ss-empty`
+
+* the conversation — `.ss-conv .ss-turn .ss-turn-rail .ss-turn-main .ss-turn-head
+  .ss-turn-tools .ss-avatar .ss-avatar-tool .ss-who .ss-when .ss-turn-model .ss-focus`
+* the turn around a hit — `.ss-request .ss-turn-request .ss-gap .ss-gap-rule .ss-gap-label`
+* what was said — `.ss-bubble .ss-prose .ss-md .ss-think .ss-think-body`
+* an activity row — `.ss-act .ss-act-wrap .ss-act-tool .ss-act-arg .ss-act-flag
+  .ss-act-chevron .ss-act-body`
+* the search on top of it — `.ss-excerpt .ss-excerpt-label .ss-snippet .ss-hits .ss-ctx-hits
+  .ss-hit .ss-hit-on`
+* the card and the chrome — `.ss-card .ss-card-ctx .ss-card-body .ss-card-actions .ss-meta
+  .ss-badge .ss-badge-tool .ss-chip .ss-chip-x .ss-path .ss-path-dir .ss-path-base .ss-more
+  .ss-raw .ss-facet .ss-facet-head .ss-facet-row .ss-count .ss-hint .ss-err .ss-spinner
+  .ss-empty .ss-drawer-nav`
+* tool content — `.ss-code .ss-term .ss-term-cmd .ss-out .ss-kv .ss-kv-k .ss-kv-v .ss-json
+  .ss-diff .ss-diff-add .ss-diff-del .ss-todo .ss-todo-done .ss-todo-active`
+
+Chrome is the sans stack and transcript *content* is the mono stack, with one deliberate
+exception: `.ss-md`, the rendered body of a message. A paragraph a person typed and a paragraph
+a model wrote are prose, and prose set in a monospace column is the single thing that makes a
+transcript view read as a log file rather than as a conversation. Everything where column
+alignment carries meaning — code, commands, paths, diffs, terminal output, the server's excerpt
+— stays mono.
+
+## The conversation view
+
+A transcript is a conversation, so the UI draws one. Every turn — in a card, in a widened
+window, in the drawer — is an avatar in a fixed left column and its content in the rest, and
+inside a run of turns that column carries a rail.
+
+| the record | how it is drawn |
+| ---------- | --------------- |
+| `role: user` | a tinted bubble, shrink-wrapped to its own measure |
+| `role: assistant` | prose, no chrome |
+| `role: system` / `attachment` | quieter and smaller — the transcript's apparatus |
+| `kind: tool_call` | one collapsed activity row: the tool, `toolSummary`, a match count |
+| `thinking` | a disclosure, never open unless the match is in it |
+
+A card leads with `_meta.turnOpener` — the human prompt the hit happened under — then a gap
+saying how many turns it hides (`seq - turn_seq - 1`, exact, both ends already in hand), then
+the hit, then a gap for what came next. The gap below has no count to give: nothing on the hit
+says how far the turn runs, so it widens on each press until it reaches a boundary and says
+which one — the next turn, or the end of the transcript.
+
+The **show** control switches the unit. Grouped, the card also carries `_meta.collapsed` as
+"N more matches in this turn", one press to see them all; `turn_of` + `turn_seq` is what that
+sets, and the chip clears both halves together.
+
 
 Dark and light both first-class; no external fonts, no CDN, no build step. The page must
 work at 400px wide.

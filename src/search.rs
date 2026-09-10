@@ -17,7 +17,7 @@
 //! parse falls back to `parse_query_lenient`, and the errors that fallback discards are logged
 //! rather than swallowed — a typo'd field name must not look like an empty corpus.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::ops::{Bound, Range};
 use std::time::Instant;
 
@@ -25,7 +25,7 @@ use anyhow::{Context, anyhow, bail};
 use serde_json::{Value, json};
 use tantivy::aggregation::AggregationCollector;
 use tantivy::aggregation::agg_req::Aggregations;
-use tantivy::collector::{Count, TopDocs};
+use tantivy::collector::{Collector, Count, SegmentCollector, TopDocs};
 use tantivy::query::{
     AllQuery, BooleanQuery, BoostQuery, ExistsQuery, Occur, Query, QueryParser, RangeQuery,
     RegexQuery, TermQuery,
@@ -113,6 +113,31 @@ pub struct Filters {
     pub since: Option<String>,
     #[arg(long, value_name = "WHEN")]
     pub until: Option<String>,
+    /// Search the whole index, including the records nobody typed and the model did not
+    /// write: attachments (system reminders, environment blocks, pasted file contents),
+    /// `system` records, and meta turns such as compaction summaries.
+    ///
+    /// Excluded by default because of what they do to a result list rather than what they
+    /// cost to store: measured on this repo's own history they are a fifth of all documents
+    /// and a twentieth of the text, and they are dense with the vocabulary every search uses
+    /// — paths, tool names, the word "session" — so a plain query returns page after page of
+    /// the same boilerplate reminder. They stay indexed, and this brings them back.
+    ///
+    /// An explicit `--role` overrides the default on its own: asking for `--role attachment`
+    /// and getting nothing would be a filter that silently contradicts itself.
+    #[arg(long = "all-records")]
+    pub all_records: bool,
+    /// One turn, by the file it is in and its `turn_seq`: everything that happened under one
+    /// human prompt, and nothing else.
+    ///
+    /// Both halves or neither. `turn_seq` is a per-file ordinal and two transcripts can share
+    /// a `session_id` (§9), so an ordinal on its own would silently match that position in
+    /// every file — the same reason [`crate::context::turn`] takes a path where [`around`]
+    /// takes an `Option`.
+    #[arg(long = "turn-of", value_name = "SOURCE_PATH", requires = "turn_seq")]
+    pub turn_of: Option<String>,
+    #[arg(long = "turn-seq", value_name = "N", requires = "turn_of")]
+    pub turn_seq: Option<u64>,
     #[arg(long)]
     pub errors_only: bool,
     #[arg(long, conflicts_with = "sidechains_only")]
@@ -336,6 +361,16 @@ pub struct SearchResponse {
     /// and `total` is still a document count.
     #[serde(default)]
     pub grouped: bool,
+    /// Documents this query matched and the default scope refused: attachments, `system`
+    /// records and meta turns. Zero when `--all-records` or an explicit `--role` is in force,
+    /// because nothing was refused.
+    ///
+    /// Counted rather than inferred. A result list quietly a fifth shorter than the corpus can
+    /// support is the kind of omission a reader discovers by not finding something, and
+    /// "hidden: 0" and "hidden: 340" are the difference between a search that found nothing
+    /// and a search that was not allowed to look.
+    #[serde(default)]
+    pub hidden: usize,
 }
 
 // ---------------------------------------------------------------------------
@@ -350,7 +385,18 @@ pub fn search(
     let started = Instant::now();
     let schema = index.schema();
     let searcher = index.reader()?.searcher();
-    let query = build_query(index, f, req)?;
+    let scope = scope_of(&req.filters);
+    let query = build_scoped_query(index, f, req, scope)?;
+
+    // One extra `Count` over the complement, and only when there is a complement to count.
+    // The alternative — subtracting from a second, unscoped total — would have to run the same
+    // query twice anyway and would report a difference rather than a set.
+    let hidden = if scope == Scope::Conversation {
+        let refused = build_scoped_query(index, f, req, Scope::Apparatus)?;
+        searcher.search(&refused, &Count)?
+    } else {
+        0
+    };
 
     // `TopDocs` preallocates a heap of `limit + offset` entries **per segment**, so unclamped
     // user-supplied numbers abort the process — or overflow the addition — before a single
@@ -614,7 +660,117 @@ pub fn search(
         facets,
         elapsed_ms: started.elapsed().as_millis(),
         grouped: req.group_by_turn,
+        hidden,
     })
+}
+
+/// How many distinct turns the query matched.
+///
+/// Main deliberately did not compute this — "a second pass over all of it for a number nobody
+/// pages by". Something pages by it now: the HTTP envelope reports turns as `totalResults`
+/// when grouping is on, and every page control in a Search UI response divides that by
+/// `resultsPerPage`. A page count derived from a document total while paging in turns is wrong
+/// in the one place a user can see it, so the number has to be real.
+///
+/// Paid only when grouping is on, and only once per response.
+pub fn count_turns(
+    index: &tantivy::Index,
+    f: &Fields,
+    req: &SearchRequest,
+) -> anyhow::Result<usize> {
+    let searcher = index.reader()?.searcher();
+    let query = build_query(index, f, req)?;
+    let turns = searcher.search(&query, &DistinctTurns)?;
+    Ok(turns.len())
+}
+
+/// The group key is `(source_path, turn_seq)`, exactly as [`crate::context::turn_query`] reads
+/// it: `turn_seq` is a per-file ordinal, and two transcripts can share a `session_id` (§9), so
+/// the path is half the key.
+type TurnKey = (String, u64);
+
+struct DistinctTurns;
+
+struct DistinctTurnsSegment {
+    /// `None` when the segment holds no values for the field, which no index this build writes
+    /// can produce. Every document then falls into one key rather than the query failing: a
+    /// stale segment is a reason to reindex, not a reason to error.
+    paths: Option<tantivy::columnar::StrColumn>,
+    turns: tantivy::columnar::Column<u64>,
+    /// Keyed by *term ordinal*, which is per-segment and only meaningful until `harvest`.
+    /// Resolving each document's path as it is collected would do a dictionary lookup per
+    /// matching document instead of one per distinct file.
+    seen: HashSet<(u64, u64)>,
+}
+
+impl Collector for DistinctTurns {
+    type Fruit = HashSet<TurnKey>;
+    type Child = DistinctTurnsSegment;
+
+    fn for_segment(
+        &self,
+        _segment_ord: u32,
+        reader: &tantivy::SegmentReader,
+    ) -> tantivy::Result<DistinctTurnsSegment> {
+        Ok(DistinctTurnsSegment {
+            paths: reader.fast_fields().str("source_path")?,
+            turns: reader.fast_fields().u64("turn_seq")?,
+            seen: HashSet::new(),
+        })
+    }
+
+    /// Counting, not ranking.
+    fn requires_scoring(&self) -> bool {
+        false
+    }
+
+    fn merge_fruits(&self, fruits: Vec<Self::Fruit>) -> tantivy::Result<Self::Fruit> {
+        let mut merged = HashSet::new();
+        for fruit in fruits {
+            merged.extend(fruit);
+        }
+        Ok(merged)
+    }
+}
+
+/// Sentinel for a document with no `source_path` value. Real ordinals never collide with it,
+/// and it keeps such documents in one key rather than silently out of the count.
+const MISSING_PATH_ORD: u64 = u64::MAX;
+
+impl SegmentCollector for DistinctTurnsSegment {
+    type Fruit = HashSet<TurnKey>;
+
+    fn collect(&mut self, doc: tantivy::DocId, _score: Score) {
+        let path = self
+            .paths
+            .as_ref()
+            .and_then(|column| column.term_ords(doc).next())
+            .unwrap_or(MISSING_PATH_ORD);
+        self.seen.insert((path, self.turns.first(doc).unwrap_or(0)));
+    }
+
+    /// Ordinals are per-segment, so they are resolved here — before `merge_fruits` ever sees
+    /// them. Merging on raw ordinals would count one turn twice, or two as one, on any index
+    /// with more than one segment.
+    fn harvest(self) -> Self::Fruit {
+        let mut out = HashSet::with_capacity(self.seen.len());
+        let mut buf = Vec::new();
+        for (path_ord, turn_seq) in self.seen {
+            let path = match (&self.paths, path_ord) {
+                (_, MISSING_PATH_ORD) => String::new(),
+                (Some(column), ord) => {
+                    buf.clear();
+                    match column.ord_to_bytes(ord, &mut buf) {
+                        Ok(true) => String::from_utf8_lossy(&buf).into_owned(),
+                        _ => String::new(),
+                    }
+                }
+                (None, _) => String::new(),
+            };
+            out.insert((path, turn_seq));
+        }
+        out
+    }
 }
 
 /// How many *other* documents of this document's turn matched `query`.
@@ -801,6 +957,15 @@ fn build_query(
     f: &Fields,
     req: &SearchRequest,
 ) -> anyhow::Result<Box<dyn Query>> {
+    build_scoped_query(index, f, req, scope_of(&req.filters))
+}
+
+fn build_scoped_query(
+    index: &tantivy::Index,
+    f: &Fields,
+    req: &SearchRequest,
+    scope: Scope,
+) -> anyhow::Result<Box<dyn Query>> {
     let mut clauses: Vec<(Occur, Box<dyn Query>)> = Vec::new();
 
     if let Some(text) = non_empty(req.query.as_deref()) {
@@ -931,6 +1096,37 @@ fn build_query(
         }
     }
 
+    // Everything in the transcript that is not the conversation, out of the way unless it was
+    // asked for. `MustNot` rather than a positive `role` clause so a document with no `role`
+    // at all — which the index has never produced, but the field is `Option<String>` — cannot
+    // be dropped by a filter nobody set.
+    match scope {
+        Scope::All => {}
+        Scope::Conversation => {
+            for excluded in NON_CONVERSATIONAL_ROLES {
+                clauses.push((Occur::MustNot, term_query(f.role, excluded)));
+            }
+            clauses.push((Occur::MustNot, flag_query(f.is_meta, 1)));
+        }
+        Scope::Apparatus => {
+            let mut any: Vec<(Occur, Box<dyn Query>)> = NON_CONVERSATIONAL_ROLES
+                .iter()
+                .map(|role| (Occur::Should, term_query(f.role, role)))
+                .collect();
+            any.push((Occur::Should, flag_query(f.is_meta, 1)));
+            clauses.push((Occur::Must, Box::new(BooleanQuery::new(any))));
+        }
+    }
+
+    // `clap` enforces the pair on the command line; over HTTP `dto` refuses a half of it, so
+    // by here either both are set or neither is.
+    if let (Some(path), Some(turn_seq)) = (non_empty(flt.turn_of.as_deref()), flt.turn_seq) {
+        clauses.push((
+            Occur::Must,
+            Box::new(crate::context::turn_query(f, path, turn_seq)),
+        ));
+    }
+
     if flt.errors_only {
         clauses.push((Occur::Must, flag_query(f.is_error, 1)));
     }
@@ -953,11 +1149,47 @@ fn build_query(
         clauses.push((Occur::Must, range));
     }
 
+    // A boolean query made only of `MustNot` matches nothing in Tantivy — there is no positive
+    // set for the negatives to subtract from. The default scope is exactly that shape on a
+    // filter-only browse with no query, so it needs a universe to exclude out of; without this
+    // line "everything except the apparatus" silently becomes "nothing".
+    if !clauses.is_empty() && clauses.iter().all(|(occur, _)| *occur == Occur::MustNot) {
+        clauses.push((Occur::Must, Box::new(AllQuery)));
+    }
+
     Ok(match clauses.len() {
         0 => Box::new(AllQuery),
         1 => clauses.pop().expect("checked len").1,
         _ => Box::new(BooleanQuery::new(clauses)),
     })
+}
+
+/// Roles that are apparatus rather than conversation. `attachment` is the harness injecting
+/// context — system reminders, environment blocks, the contents of a pasted file — and
+/// `system` is the harness reporting on itself. Neither was typed and neither was generated.
+pub const NON_CONVERSATIONAL_ROLES: &[&str] = &["attachment", "system"];
+
+/// Which half of the index a query is asking about.
+///
+/// The same clauses build both: [`Scope::Conversation`] pushes the apparatus away with
+/// `MustNot`, and [`Scope::Apparatus`] requires exactly what the other one refused, so "how
+/// many did that hide" is a `Count` over the complement rather than a second opinion assembled
+/// somewhere else and free to disagree.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Scope {
+    Conversation,
+    Apparatus,
+    All,
+}
+
+/// The scope a request implies. An explicit `--role` wins outright: asking for
+/// `--role attachment` and being handed nothing would be a filter contradicting itself.
+pub(crate) fn scope_of(flt: &Filters) -> Scope {
+    if flt.all_records || non_empty(flt.role.as_deref()).is_some() {
+        Scope::All
+    } else {
+        Scope::Conversation
+    }
 }
 
 fn non_empty(s: Option<&str>) -> Option<&str> {
@@ -2543,16 +2775,29 @@ pub(crate) mod testkit {
 
     /// A RAM index built straight from hand-made [`Doc`]s — no dependency on the indexer.
     pub fn index_docs(docs: &[Doc]) -> (Index, Fields) {
+        index_in_segments(&[docs])
+    }
+
+    /// The same, with each slice committed separately so the index really has that many
+    /// segments.
+    ///
+    /// Anything that reads a *fast field* per document has to merge across segments, and the
+    /// merge is where the mistakes live: term ordinals are per-segment, so a collector that
+    /// keys on them and forgets to resolve before merging silently files two different values
+    /// under one key. A single-segment index cannot fail that way, so it cannot test it.
+    pub fn index_in_segments(batches: &[&[Doc]]) -> (Index, Fields) {
         let (schema, fields) = build_schema();
         let index = crate::tokenizer::create_in_ram(schema.clone());
         let mut writer = index.writer_with_num_threads(1, 15_000_000).unwrap();
-        for doc in docs {
-            let json = doc_to_json(doc, None, true).to_string();
-            writer
-                .add_document(TantivyDocument::parse_json(&schema, &json).unwrap())
-                .unwrap();
+        for batch in batches {
+            for doc in *batch {
+                let json = doc_to_json(doc, None, true).to_string();
+                writer
+                    .add_document(TantivyDocument::parse_json(&schema, &json).unwrap())
+                    .unwrap();
+            }
+            writer.commit().unwrap();
         }
-        writer.commit().unwrap();
         (index, fields)
     }
 
@@ -2653,6 +2898,128 @@ mod tests {
         SearchRequest {
             query: (!query.is_empty()).then(|| query.to_string()),
             ..SearchRequest::default()
+        }
+    }
+
+    /// A result list a fifth shorter than the corpus can support is the kind of omission a
+    /// reader only discovers by failing to find something, so the default scope has to be both
+    /// narrow *and* loud about being narrow.
+    #[test]
+    fn the_default_scope_is_the_conversation_and_says_what_it_refused() {
+        let mut docs = Vec::new();
+        for (seq, role, meta) in [
+            (0u64, "user", false),
+            (1, "assistant", false),
+            (2, "attachment", false),
+            (3, "system", false),
+            (4, "user", true),
+        ] {
+            let mut d = blank_doc(seq);
+            d.role = role.into();
+            d.is_meta = meta;
+            d.text = vec!["the standing request".into()];
+            docs.push(d);
+        }
+        let (index, f) = index_docs(&docs);
+
+        let r = search(&index, &f, &req("standing")).unwrap();
+        assert_eq!(r.total, 2, "user and assistant only: {:?}", texts(&r));
+        assert_eq!(r.hidden, 3, "attachment, system, and the meta turn");
+
+        let r = search(&index, &f, &req_all("standing")).unwrap();
+        assert_eq!(r.total, 5);
+        assert_eq!(r.hidden, 0, "nothing was refused, so nothing is reported");
+
+        // An explicit `--role attachment` that returned nothing would be a filter
+        // contradicting itself, so the scope steps aside for it.
+        let by_role = SearchRequest {
+            filters: Filters {
+                role: Some("attachment".into()),
+                ..Filters::default()
+            },
+            ..req("standing")
+        };
+        let r = search(&index, &f, &by_role).unwrap();
+        assert_eq!(r.total, 1, "{:?}", texts(&r));
+        assert_eq!(r.hidden, 0);
+    }
+
+    /// The scope narrows the *result set*, never the index. Everything it hides stays
+    /// findable, which is the whole reason it is a search default rather than an index-time
+    /// decision — "which session had that env var in its reminder" has to stay answerable.
+    #[test]
+    fn what_the_scope_hides_is_still_indexed() {
+        let mut hidden = blank_doc(0);
+        hidden.role = "attachment".into();
+        hidden.text = vec!["CLAUDE_CONFIG_DIR=/srv/claude".into()];
+        let (index, f) = index_docs(&[hidden]);
+
+        assert_eq!(
+            search(&index, &f, &req("CLAUDE_CONFIG_DIR")).unwrap().total,
+            0
+        );
+        assert_eq!(
+            search(&index, &f, &req_all("CLAUDE_CONFIG_DIR"))
+                .unwrap()
+                .total,
+            1
+        );
+    }
+
+    /// A filter-only browse builds a query of nothing but `MustNot`, which matches nothing in
+    /// Tantivy — there is no positive set for the negatives to subtract from. The scope needs
+    /// a universe to exclude out of, or "everything except the apparatus" becomes "nothing".
+    #[test]
+    fn the_default_scope_on_a_filter_only_browse_still_returns_the_conversation() {
+        let mut docs = vec![blank_doc(0)];
+        docs[0].text = vec!["something".into()];
+        let mut noise = blank_doc(1);
+        noise.role = "attachment".into();
+        docs.push(noise);
+        let (index, f) = index_docs(&docs);
+
+        let r = search(&index, &f, &req("")).unwrap();
+        assert_eq!(r.total, 1, "not zero: {:?}", texts(&r));
+        assert_eq!(r.hidden, 1);
+    }
+
+    /// The number the HTTP pager divides by when grouping is on. Term ordinals are
+    /// per-segment, so the distinct count has to resolve them before merging — otherwise two
+    /// files' turn #0 count as one, or one file's counts twice.
+    #[test]
+    fn counting_turns_is_exact_across_the_segment_boundary() {
+        let turn = |seq: u64, turn_seq: u64, path: &str| {
+            let mut d = blank_doc(seq);
+            d.turn_seq = turn_seq;
+            d.source_path = path.into();
+            d.text = vec!["memmap".into()];
+            d
+        };
+        // Two files, and one turn of each straddles the commit.
+        let first = vec![turn(0, 0, "/a.jsonl"), turn(1, 0, "/b.jsonl")];
+        let second = vec![turn(2, 0, "/b.jsonl"), turn(3, 5, "/a.jsonl")];
+        let (index, f) = index_in_segments(&[&first, &second]);
+
+        assert_eq!(
+            count_turns(&index, &f, &req("memmap")).unwrap(),
+            3,
+            "a#0, b#0, a#5 — the two files' turn 0 are different turns"
+        );
+        assert_eq!(search(&index, &f, &req("memmap")).unwrap().total, 4);
+    }
+
+    /// The same request over the whole index rather than the conversation.
+    ///
+    /// For the tests that are about something else — the analyzer, the schema round trip — and
+    /// that use an `attachment` or `system` document because those are documents like any
+    /// other to the thing under test. Scoping is tested where scoping lives.
+    fn req_all(query: &str) -> SearchRequest {
+        SearchRequest {
+            filters: Filters {
+                all_records: true,
+                ..Filters::default()
+            },
+            ..req(query)
         }
     }
 
@@ -3523,7 +3890,7 @@ mod tests {
             ("create", "attachment"),
             ("parse", "system"),
         ] {
-            let hits = search(&index, &f, &req(query)).unwrap().hits;
+            let hits = search(&index, &f, &req_all(query)).unwrap().hits;
             assert!(
                 hits.iter().any(|h| h.doc.role == role),
                 "{query:?} did not reach the {role} document"
@@ -3954,6 +4321,9 @@ mod tests {
         let (index, f) = index_docs(&docs);
 
         let mut r0 = SearchRequest::default();
+        // The round trip, not the scope: `docs[3]` is deliberately meta, which the default
+        // scope refuses and this test is not about.
+        r0.filters.all_records = true;
         r0.filters.errors_only = true;
         let r = search(&index, &f, &r0).unwrap();
         assert_eq!(r.total, 1);
@@ -4366,10 +4736,19 @@ mod tests {
         assert!(r.total > 0);
         assert!(r.hits.iter().any(|h| h.snippet.contains("**")));
 
-        // The project comes from the record `cwd`, and matches by prefix.
+        // The project comes from the record `cwd`, and matches by prefix. On a real slice the
+        // default scope is doing visible work, so the two halves are asserted together: what
+        // came back plus what was refused is the whole file, and neither number is guessed.
         let mut r0 = SearchRequest::default();
         r0.filters.project = Some("/home/user".into());
-        assert_eq!(search(&index, &f, &r0).unwrap().total, out.docs.len());
+        let scoped = search(&index, &f, &r0).unwrap();
+        assert!(scoped.hidden > 0, "this fixture carries apparatus records");
+        assert_eq!(scoped.total + scoped.hidden, out.docs.len());
+
+        r0.filters.all_records = true;
+        let whole = search(&index, &f, &r0).unwrap();
+        assert_eq!(whole.total, out.docs.len());
+        assert_eq!(whole.hidden, 0, "nothing refused, nothing reported");
 
         // Facets over a declared field and over a parameter key that is not in the schema.
         let tools = facets(&index, &f, "tool_name", &SearchRequest::default()).unwrap();
