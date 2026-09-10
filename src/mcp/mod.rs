@@ -63,9 +63,9 @@ use rmcp::{ErrorData, ServerHandler, ServiceExt, tool, tool_handler, tool_router
 use crate::schema::Fields;
 use crate::sessions::FilterError;
 use types::{
-    AggregateRequest, AggregateResponse, Corpus, GetOutputRequest, GetOutputResponse,
+    AggregateRequest, AggregateResponse, Corpus, Enveloped, GetOutputRequest, GetOutputResponse,
     GetTurnRequest, GetTurnResponse, SearchSessionsRequest, SearchSessionsResponse,
-    SearchTurnsRequest, SearchTurnsResponse,
+    SearchTurnsRequest, SearchTurnsResponse, unknown_key_warnings,
 };
 
 /// How often the server may re-index while it runs, when the caller does not say. Five minutes:
@@ -215,7 +215,8 @@ impl Server {
         &self,
         Parameters(req): Parameters<SearchTurnsRequest>,
     ) -> Result<Json<SearchTurnsResponse>, ErrorData> {
-        self.blocking(move |state| tools::turns::run(state, req))
+        let unknown = unknown_key_warnings::<SearchTurnsRequest>(&req.unknown);
+        self.answering(unknown, move |state| tools::turns::run(state, req))
             .await
     }
 
@@ -245,7 +246,8 @@ impl Server {
         &self,
         Parameters(req): Parameters<GetTurnRequest>,
     ) -> Result<Json<GetTurnResponse>, ErrorData> {
-        self.blocking(move |state| tools::drill::run_turn(state, req))
+        let unknown = unknown_key_warnings::<GetTurnRequest>(&req.unknown);
+        self.answering(unknown, move |state| tools::drill::run_turn(state, req))
             .await
     }
 
@@ -274,7 +276,8 @@ impl Server {
         &self,
         Parameters(req): Parameters<GetOutputRequest>,
     ) -> Result<Json<GetOutputResponse>, ErrorData> {
-        self.blocking(move |state| tools::drill::run_output(state, req))
+        let unknown = unknown_key_warnings::<GetOutputRequest>(&req.unknown);
+        self.answering(unknown, move |state| tools::drill::run_output(state, req))
             .await
     }
 
@@ -310,7 +313,8 @@ impl Server {
         &self,
         Parameters(req): Parameters<SearchSessionsRequest>,
     ) -> Result<Json<SearchSessionsResponse>, ErrorData> {
-        self.blocking(move |state| tools::sessions::run(state, req))
+        let unknown = unknown_key_warnings::<SearchSessionsRequest>(&req.unknown);
+        self.answering(unknown, move |state| tools::sessions::run(state, req))
             .await
     }
 
@@ -345,12 +349,30 @@ impl Server {
         &self,
         Parameters(req): Parameters<AggregateRequest>,
     ) -> Result<Json<AggregateResponse>, ErrorData> {
-        self.blocking(move |state| tools::aggregate::run(state, req))
+        let unknown = unknown_key_warnings::<AggregateRequest>(&req.unknown);
+        self.answering(unknown, move |state| tools::aggregate::run(state, req))
             .await
     }
 }
 
 impl Server {
+    /// [`Server::blocking`], with the request's unrecognised arguments reported in the answer.
+    ///
+    /// This is where the unknown-argument warning has to be raised, because it is the only place
+    /// that still holds the request as the client wrote it: the tool bodies receive a typed
+    /// struct with those keys already set aside, and by then `tool_name` is indistinguishable
+    /// from a filter nobody sent. Prepended rather than appended — a warning about the request
+    /// changes how every other line of the answer should be read.
+    async fn answering<T, F>(&self, unknown: Vec<String>, body: F) -> Result<Json<T>, ErrorData>
+    where
+        F: FnOnce(&State) -> anyhow::Result<T> + Send + 'static,
+        T: Enveloped + Send + 'static,
+    {
+        let mut answer = self.blocking(body).await?;
+        answer.0.envelope_mut().warnings.splice(0..0, unknown);
+        Ok(answer)
+    }
+
     /// Run one tool body off the async runtime, refreshing the index first if it is due.
     ///
     /// Every tool body is blocking, CPU-bound tantivy work, and a refresh is blocking I/O; both
@@ -646,6 +668,50 @@ mod tests {
         ] {
             assert!(text.contains(tool), "instructions never mention {tool}");
         }
+    }
+
+    /// The one silent failure a description cannot cover. `tool_name` is a plausible spelling of
+    /// `tool` — `aggregate`'s own field vocabulary uses it — and before this the call was
+    /// answered over the whole corpus with `applied_filters: []` and nothing to say the filter
+    /// had not been applied. The warning is raised here rather than in the tool body because
+    /// this is the last place that still holds the request as the client wrote it.
+    #[tokio::test]
+    async fn a_misspelled_argument_reaches_the_caller_as_a_warning() {
+        let tmp = tempfile::tempdir().expect("a temp dir");
+        let server = super::Server::with_options(
+            tmp.path(),
+            &super::ServeOptions {
+                refresh_secs: 0,
+                no_refresh: true,
+            },
+        )
+        .expect("an empty index still opens");
+
+        // As a client sends it: two arguments this tool does not define, one of them a filter
+        // name from a sibling tool.
+        let req: super::SearchTurnsRequest = serde_json::from_str(
+            r#"{"query":"indexer","tool_name":["Bash"],"sinceX":"7d","limit":2}"#,
+        )
+        .expect("an unknown key must not fail the call");
+
+        let answer = server
+            .search_turns(rmcp::handler::server::wrapper::Parameters(req))
+            .await
+            .expect("a tool that can answer");
+        let warnings = &answer.0.envelope.warnings;
+        assert!(
+            warnings.iter().any(|w| w.contains("tool_name")),
+            "an ignored filter argument was never mentioned: {warnings:?}"
+        );
+        assert!(
+            warnings.iter().any(|w| w.contains("sinceX")),
+            "{warnings:?}"
+        );
+        // And it is the first thing in the envelope: it changes how everything under it reads.
+        assert!(
+            warnings[0].starts_with("ignored unknown argument"),
+            "{warnings:?}"
+        );
     }
 
     #[test]

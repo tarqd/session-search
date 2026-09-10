@@ -170,8 +170,17 @@ impl From<anyhow::Error> for ApiError {
     /// The index or the disk was wrong, not the caller. `{err:#}` keeps the whole context
     /// chain: "opening the index at /… : permission denied" is actionable, "permission denied"
     /// on its own is not.
+    ///
+    /// The one exception is a [`sessions::FilterError`], which the query builder raises for a
+    /// filter it could not read. That is the caller's mistake and has to be a 400 for the same
+    /// reason a malformed date is one, pinned by `a_malformed_date_is_a_400_wherever_it_arrives`:
+    /// a caller typing a filter hits every prefix of it on the way, and a 500 claims the index or
+    /// the disk broke. `dto` pre-validates the shapes it can see, so this catches the rest.
     fn from(err: anyhow::Error) -> ApiError {
-        ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, format!("{err:#}"))
+        match err.downcast::<sessions::FilterError>() {
+            Ok(filter) => ApiError::bad_request(format!("{}: {:#}", filter.field, filter.source)),
+            Err(err) => ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, format!("{err:#}")),
+        }
     }
 }
 
@@ -1268,6 +1277,38 @@ mod tests {
 
         let (status, body) = server.get("/api/search?since=7d");
         assert_eq!(status, StatusCode::OK, "{body}");
+    }
+
+    /// The same argument as the date above, for the filters the query builder parses rather than
+    /// `dto`. These reach `ApiError` as a `FilterError` from inside `search::search`, and without
+    /// the downcast that classifies them they are a `500` telling the caller the index broke when
+    /// what happened is that they typed `--tool-input command` without an `=`.
+    #[test]
+    fn a_malformed_tool_filter_is_a_400_and_names_the_wire_parameter() {
+        let server = server();
+        // Only the `tool_input` spellings: an empty `tool_output=` is dropped by the query-string
+        // decoder before the builder ever sees it, so over HTTP it is an absent filter rather
+        // than an unreadable one. That asymmetry with the CLI is issue #13, not this change.
+        for uri in [
+            "/api/search?tool_input=command",
+            "/api/search?tool_input=k%3D",
+            "/api/facets/tool_name?tool_input=command",
+        ] {
+            let (status, body) = server.get(uri);
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{uri}: {body}");
+            let message = error_message(&body);
+            assert!(
+                !message.contains("--"),
+                "over HTTP there is no flag: {uri}: {message}"
+            );
+        }
+
+        let (status, body) = server.get("/api/search?tool_input=command%3Dcargo");
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "a readable filter still answers: {body}"
+        );
     }
 
     #[test]

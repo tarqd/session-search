@@ -21,6 +21,10 @@
 //!   an answer and stops the caller looking. The list and the reasoning stay shared: a second
 //!   sentence for MCP would have arrived with a second copy of the ten filters beside it.
 //!
+//!   Those same ten are cleared before the envelope is built — see [`applied_filters`]. The
+//!   envelope echoes and ranks what was *applied*, and a filter that could never have been
+//!   applied is not a cause a caller can act on.
+//!
 //! # Ordering and counts
 //!
 //! Most recent `last_ts_ms` first, ties broken by session id and then agent id, exactly as
@@ -33,7 +37,10 @@ use crate::mcp::State;
 use crate::mcp::envelope::{self, Context};
 use crate::mcp::types::{SearchSessionsRequest, SearchSessionsResponse, SessionRow};
 use crate::parse::SessionInfo;
-use crate::sessions::{SearchSurface, SessionMatcher, unanswerable_filter_notes};
+use crate::search::Filters;
+use crate::sessions::{
+    SearchSurface, SessionMatcher, unanswerable_filter_notes, unanswerable_filters,
+};
 
 /// Filter, sort and page the session list.
 ///
@@ -84,12 +91,17 @@ pub fn run(state: &State, req: SearchSessionsRequest) -> anyhow::Result<SearchSe
     matched.truncate(req.limit);
 
     let sessions: Vec<SessionRow> = matched.into_iter().map(row).collect();
+    // 4. The filters the envelope is allowed to reason about: the ones this listing actually
+    //    applied. Everything the warnings above call ignored is cleared first, for the reason in
+    //    `applied`'s own doc comment — an envelope over the raw request blames filters that
+    //    narrowed nothing.
+    let applied = applied_filters(&req.filters);
     let ctx = Context {
         tool: "search_sessions",
         // This tool takes no free-text query: `sessions.json` has nothing to search. A zero here
         // is always a filter's doing, so the envelope's query-shaped advice never applies.
         query: None,
-        filters: &req.filters,
+        filters: &applied,
         time_range,
         extra: Vec::new(),
         corpus: &state.corpus,
@@ -100,6 +112,46 @@ pub fn run(state: &State, req: SearchSessionsRequest) -> anyhow::Result<SearchSe
         total,
         envelope: envelope::build(&ctx, total, warnings),
     })
+}
+
+/// The request's filters with the unanswerable ones cleared — what the listing actually applied.
+///
+/// [`envelope::build`] echoes these and ranks them, and both readings are of *applied* filters:
+/// the echo is a report of what narrowed the answer, and `narrowest` names the likeliest cause of
+/// a zero. Handing it the whole request lets it blame a filter this same response has already
+/// called ignored, which is the one thing a caller cannot act on. It happened: `search_sessions
+/// {session: "zzzzzz", tool_input: ["command=cargo"], model: "claude-opus-5"}` came back with
+/// `warnings: ["`tool_input` was ignored…", "`model` was ignored…"]` beside
+/// `narrowest_filter: "tool_input"` and a retry that dropped the ignored `tool_input`, kept the
+/// ignored `model`, and left `session` — the filter that actually caused the zero — in place.
+/// Following that retry returns zero again, and the caller has learned nothing.
+///
+/// The list of what to clear is [`unanswerable_filters`], the same list the warnings are built
+/// from, so the two cannot disagree about which filters this listing can answer. A name that
+/// arrives here with no arm to clear it is that drift, and
+/// `no_filter_the_listing_ignored_can_be_blamed_for_the_zero_it_did_not_cause` is where it fails.
+fn applied_filters(f: &Filters) -> Filters {
+    let mut applied = f.clone();
+    for name in unanswerable_filters(f) {
+        match name {
+            "tool" => applied.tool.clear(),
+            "tool_input" => applied.tool_input.clear(),
+            "tool_output" => applied.tool_output.clear(),
+            "lang" => applied.lang.clear(),
+            "min_thinking" => applied.min_thinking = None,
+            "program" => applied.program.clear(),
+            "model" => applied.model = None,
+            "role" => applied.role = None,
+            "kind" => applied.kind = None,
+            "errors_only" => applied.errors_only = false,
+            other => debug_assert!(
+                false,
+                "`{other}` is reported as ignored but is not cleared here: the envelope would \
+                 blame a filter this listing never applied"
+            ),
+        }
+    }
+    applied
 }
 
 /// One `sessions.json` row on the wire.
@@ -208,7 +260,11 @@ mod tests {
     fn request(limit: usize, mutate: impl FnOnce(&mut Filters)) -> SearchSessionsRequest {
         let mut filters = Filters::default();
         mutate(&mut filters);
-        SearchSessionsRequest { filters, limit }
+        SearchSessionsRequest {
+            filters,
+            limit,
+            ..SearchSessionsRequest::default()
+        }
     }
 
     fn ids(res: &SearchSessionsResponse) -> Vec<(&str, Option<&str>)> {
@@ -304,6 +360,122 @@ mod tests {
             );
         }
         assert!(unfiltered.envelope.warnings.is_empty());
+    }
+
+    #[test]
+    fn no_filter_the_listing_ignored_can_be_blamed_for_the_zero_it_did_not_cause() {
+        // One envelope used to hold both halves of a contradiction: warnings saying `tool_input`
+        // and `model` were ignored, and `narrowest_filter: "tool_input"` with "it is the
+        // likeliest cause" — of a zero it could not have caused, since it narrowed nothing. The
+        // retry that came with it dropped the ignored `tool_input`, kept the ignored `model`, and
+        // kept `session`, the filter that actually caused the zero. Sending it returns zero
+        // again.
+        let (_tmp, state) = state_over(&[session("aaa", 1_700_000_000_000)]);
+        let res = run(
+            &state,
+            request(50, |f| {
+                f.session = Some("zzzzzz".into());
+                f.tool_input = vec!["command=cargo".into()];
+                f.model = Some("claude-opus-5".into());
+            }),
+        )
+        .expect("a zero is a successful answer");
+        assert_eq!(res.total, 0);
+        assert_eq!(
+            res.envelope.warnings.len(),
+            2,
+            "{:?}",
+            res.envelope.warnings
+        );
+
+        let echoed: Vec<&str> = res
+            .envelope
+            .applied_filters
+            .iter()
+            .map(|a| a.name.as_str())
+            .collect();
+        assert_eq!(
+            echoed,
+            ["session"],
+            "only filters the listing applied are `applied_filters`"
+        );
+
+        let no_results = res.envelope.no_results.expect("a zero is never bare");
+        assert_eq!(
+            no_results.narrowest_filter.as_deref(),
+            Some("session"),
+            "the blame has to land on the one filter that actually cut the listing"
+        );
+        assert!(
+            !no_results.message.contains("tool_input"),
+            "{}",
+            no_results.message
+        );
+        // The retry is the call to send next, so it must not carry a filter that was ignored —
+        // and it must not carry the one being blamed either.
+        assert_eq!(
+            no_results.retry,
+            serde_json::json!({}),
+            "dropping the only applied filter leaves a listing of everything, which is sendable"
+        );
+    }
+
+    #[test]
+    fn every_filter_this_listing_cannot_apply_is_cleared_before_the_envelope_sees_it() {
+        // The drift guard for `applied_filters`: the ten names come from
+        // `sessions::unanswerable_filters`, and a filter added to that list without an arm to
+        // clear it would go back to being blamed for zeroes it did not cause. Everything a
+        // `Filters` can carry is set here, so the two lists are compared in full.
+        let (_tmp, state) = state_over(&[session("aaa", 1_700_000_000_000)]);
+        let req = request(50, |f| {
+            f.project = Some("/home/user/session-search".into());
+            f.tool = vec!["Bash".into()];
+            f.tool_input = vec!["command=cargo".into()];
+            f.tool_output = vec!["No such file".into()];
+            f.lang = vec!["rust".into()];
+            f.min_thinking = Some(500);
+            f.program = vec!["cargo".into()];
+            f.branch = Some("main".into());
+            f.model = Some("claude-opus-5".into());
+            f.role = Some("assistant".into());
+            f.kind = Some("tool_call".into());
+            f.session = Some("aaa".into());
+            f.agent_type = Some("Explore".into());
+            f.since = Some("2020-01-01".into());
+            f.until = Some("2030-01-01".into());
+            f.errors_only = true;
+            f.no_sidechains = true;
+        });
+        let ignored = crate::sessions::unanswerable_filters(&req.filters);
+        assert_eq!(ignored.len(), 10, "{ignored:?}");
+        let res = run(&state, req).expect("unanswerable filters are not errors");
+
+        for name in ignored {
+            assert!(
+                !res.envelope.applied_filters.iter().any(|a| a.name == name),
+                "`{name}` was reported as ignored and echoed as applied: {:?}",
+                res.envelope.applied_filters
+            );
+        }
+        // And the answerable ones are all still there: clearing must not cost a filter that works.
+        let echoed: Vec<&str> = res
+            .envelope
+            .applied_filters
+            .iter()
+            .map(|a| a.name.as_str())
+            .collect();
+        assert_eq!(
+            echoed,
+            [
+                "project",
+                "branch",
+                "session",
+                "agent_type",
+                "since",
+                "until",
+                "no_sidechains"
+            ]
+        );
     }
 
     #[test]

@@ -61,16 +61,16 @@ impl SessionMatcher {
         // One `now` for both ends and every row, for the reason in the type's doc comment.
         let now = chrono::Utc::now();
         let at = |raw: &Option<String>, field: &'static str, edge: Edge| {
-            raw.as_deref()
+            set(raw)
                 .map(|s| when_ms(s, now, edge))
                 .transpose()
                 .map_err(|source| FilterError { field, source })
         };
         Ok(SessionMatcher {
-            project: f.project.as_deref().map(search::expand_tilde),
-            branch: f.branch.clone(),
-            session: f.session.clone(),
-            agent_type: f.agent_type.clone(),
+            project: set(&f.project).map(search::expand_tilde),
+            branch: set(&f.branch).map(str::to_string),
+            session: set(&f.session).map(str::to_string),
+            agent_type: set(&f.agent_type).map(str::to_string),
             since_ms: at(&f.since, "since", Edge::Lower)?,
             until_ms: at(&f.until, "until", Edge::Upper)?,
             no_sidechains: f.no_sidechains,
@@ -130,6 +130,23 @@ impl SessionMatcher {
         }
         true
     }
+}
+
+/// A filter that arrived as `Some("")` — or as whitespace — is the same as absent.
+///
+/// Clients that fill every optional field with an empty string are common, and every other
+/// reader of [`Filters`] already defends against the habit: `search::non_empty` on the index
+/// side, `envelope::opt` in the filter echo and the ranking, `envelope::resolve_time_range` on
+/// the dates, `mcp::tools::drill::given` on the addresses. This matcher did not, and the
+/// disagreement was visible from outside: `search_sessions {since: ""}` failed with
+/// `-32602 parsing since: cannot read ""`, while `search_turns {query: "indexer", since: ""}`
+/// answered normally — the same value, an error on one tool and ignored on the other.
+///
+/// The string filters need it as much as the dates, and for a quieter reason: an empty `branch`
+/// or `agent_type` matches no row at all, while `envelope::opt` drops it from the echo, so the
+/// zero comes back with no filter named and nothing to retry without.
+fn set(v: &Option<String>) -> Option<&str> {
+    v.as_deref().map(str::trim).filter(|s| !s.is_empty())
 }
 
 /// The filters that arrived and that a session listing cannot answer, in [`Filters`] declaration
@@ -366,6 +383,41 @@ mod tests {
         }))
         .expect("both dates parse");
         assert!(matcher.matches(&late));
+    }
+
+    #[test]
+    fn a_filter_sent_as_an_empty_string_is_absent_rather_than_unmatchable() {
+        // Clients that fill every optional field with `""` are common, and the two front ends
+        // used to disagree about what that means: `search_sessions {since: ""}` came back
+        // `-32602 parsing since: cannot read ""`, while `search_turns {query: "indexer",
+        // since: ""}` succeeded — `envelope::resolve_time_range` filters whitespace-only values
+        // and this constructor did not.
+        let blank = filters_with(|f| {
+            f.since = Some("  ".into());
+            f.until = Some(String::new());
+            f.project = Some(String::new());
+            f.branch = Some(String::new());
+            f.session = Some(String::new());
+            f.agent_type = Some("  ".into());
+        });
+        let matcher = SessionMatcher::new(&blank)
+            .expect("an empty string is a field nobody filled in, not an unreadable date");
+
+        // And absent means absent: an empty `branch` must not exclude every row that has one,
+        // which is a zero with no filter in the echo to explain it.
+        let row = SessionInfo {
+            session_id: "s1".into(),
+            project: Some("/home/user/session-search".into()),
+            git_branch: Some("main".into()),
+            first_ts_ms: Some(1_788_980_839_000),
+            last_ts_ms: Some(1_788_980_899_000),
+            ..SessionInfo::default()
+        };
+        assert!(matcher.matches(&row));
+        // The same fields with real values still filter, so nothing was traded away for this.
+        let real = SessionMatcher::new(&filters_with(|f| f.branch = Some("other".into())))
+            .expect("a branch name parses");
+        assert!(!real.matches(&row));
     }
 
     #[test]

@@ -37,6 +37,7 @@ use tantivy::{DateTime, Score, Searcher, TantivyDocument};
 
 use crate::parse::{Doc, DocKind};
 use crate::schema::Fields;
+use crate::sessions::FilterError;
 
 /// Wraps the matched span inside a snippet. Plain text on purpose: the snippet travels through
 /// JSON output and MCP responses as well as the terminal, so HTML would be wrong everywhere.
@@ -1421,17 +1422,37 @@ pub(crate) fn expand_tilde(path: &str) -> String {
     }
 }
 
-/// `--tool-input command=cargo` -> a query over the JSON subpath `tool_input.command`.
+/// A filter value this builder could not read, typed rather than left as a bare `anyhow`.
 ///
-/// Routed through `QueryParser` on purpose: it emits both the tokenized text terms *and* the
-/// typed fast-value term, so `path=/tmp/x.rs`, `command="cargo build"` and `timeout=600000`
-/// all match the way they were indexed.
+/// [`FilterError`] is the crate's one "the caller sent something unusable" type, and being that
+/// type is what the answer depends on: `mcp::from_anyhow` downcasts it into an `invalid_params`
+/// and renders everything it cannot classify as an `internal_error`. Those two say opposite
+/// things — an `internal_error` tells a model the tool broke and to stop, an `invalid_params`
+/// tells it to send a different value — and only the second is true of a misspelled filter. A
+/// second error type would be a second arm at that boundary for somebody to forget, and the
+/// symptom is silent: the sentence still arrives, labelled as the server's fault.
+///
+/// `field` is the plain name (`tool_input`), never `--tool-input`. This builder is shared by a
+/// CLI that spells it with dashes, an HTTP API that spells it `tool_input=` and an MCP server
+/// where no flag exists at all, so baking one spelling in here puts a flag that cannot be typed
+/// into two of the three answers. Each front end re-spells `field` in its own dialect, exactly
+/// as `cli::session_matcher` re-spells [`FilterError`]'s `since`.
+fn filter_error(field: &'static str, message: String) -> anyhow::Error {
+    anyhow::Error::new(FilterError {
+        field,
+        source: anyhow::Error::msg(message),
+    })
+}
+
 /// `--tool-output TEXT` as a phrase query over what the tool returned. Quoted, so an operator
 /// or a stray colon in the text is matched literally rather than reinterpreted as grammar.
 fn tool_output_query(index: &tantivy::Index, phrase: &str) -> anyhow::Result<Box<dyn Query>> {
     let phrase = phrase.trim();
     if phrase.is_empty() {
-        bail!("--tool-output expects a non-empty value");
+        return Err(filter_error(
+            "tool_output",
+            "expects a non-empty value".into(),
+        ));
     }
     let escaped = phrase.replace('\\', r"\\").replace('"', r#"\""#);
     let qp = QueryParser::for_index(index, Vec::new());
@@ -1439,21 +1460,31 @@ fn tool_output_query(index: &tantivy::Index, phrase: &str) -> anyhow::Result<Box
         .with_context(|| format!("building a tool-output filter from {phrase:?}"))
 }
 
+/// `--tool-input command=cargo` -> a query over the JSON subpath `tool_input.command`.
+///
+/// Routed through `QueryParser` on purpose: it emits both the tokenized text terms *and* the
+/// typed fast-value term, so `path=/tmp/x.rs`, `command="cargo build"` and `timeout=600000`
+/// all match the way they were indexed.
 fn tool_input_query(index: &tantivy::Index, spec: &str) -> anyhow::Result<Box<dyn Query>> {
+    let unreadable = |message: String| filter_error("tool_input", message);
     let (key, value) = spec
         .split_once('=')
-        .ok_or_else(|| anyhow!("--tool-input expects KEY=VALUE, got {spec:?}"))?;
+        .ok_or_else(|| unreadable(format!("expects KEY=VALUE, got {spec:?}")))?;
     let key = key.trim();
     if key.is_empty() {
-        bail!("--tool-input expects a non-empty key, got {spec:?}");
+        return Err(unreadable(format!("expects a non-empty key, got {spec:?}")));
     }
     if key.contains([' ', '"', ':']) {
-        bail!("--tool-input key {key:?} contains a character the query grammar reserves");
+        return Err(unreadable(format!(
+            "key {key:?} contains a character the query grammar reserves"
+        )));
     }
     if value.trim().is_empty() {
         // `tool_input.k:""` parses cleanly and matches nothing, which is indistinguishable
         // from "this value does not occur". Say what actually went wrong instead.
-        bail!("--tool-input expects a non-empty value, got {spec:?}");
+        return Err(unreadable(format!(
+            "expects a non-empty value, got {spec:?}"
+        )));
     }
     let escaped = value.replace('\\', r"\\").replace('"', r#"\""#);
     let expr = format!("tool_input.{key}:\"{escaped}\"");
@@ -2515,13 +2546,20 @@ fn coordinate_query(
 /// search ends up seeded from a document the caller never named. The order is by the `seq` fast
 /// field, then by `doc_id`, so the two candidates an error names are the same two on every run.
 ///
-/// The single exception is §9's duplicate. When every candidate is the same `seq` of the same
-/// session and agent, they are one logical record that was indexed from two files — the
-/// `resetSessionFile()`/`relocated` case, where one transcript lives under two project keys and
+/// The single exception is §9's duplicate: one transcript indexed under two project keys — the
+/// `resetSessionFile()`/`relocated` case — so the *same record* is read out of two files and
 /// carries identical record uuids in both. There is no question to ask there: the documents say
 /// the same thing, and the only difference is which file they were read from. So the first by
 /// `doc_id` is taken. Anything else — two different `seq`s, two different transcripts — is a
 /// real ambiguity and stays an error.
+///
+/// The `uuid` is what makes the exception an exception, and it is not decoration. `seq` is a
+/// per-file ordinal and §9 lets two *different* transcripts share a session id, so `seq` +
+/// session + agent is satisfied by turn 0 of one conversation and turn 0 of another. Matching on
+/// those three alone declared that pair one record and returned whichever file sorted first — a
+/// document from a transcript the caller never named, with no error and no warning, which reads
+/// exactly like a correct answer. An absent uuid is no evidence either way, so it is not
+/// accepted as agreement.
 fn one_of(
     searcher: &Searcher,
     f: &Fields,
@@ -2531,7 +2569,11 @@ fn one_of(
     let mut docs = docs_by_seq(searcher, f, query, RESOLVE_CANDIDATE_LIMIT)?;
     docs.sort_by(|a, b| a.seq.cmp(&b.seq).then_with(|| a.doc_id.cmp(&b.doc_id)));
     let same_record = |a: &Doc, b: &Doc| {
-        a.seq == b.seq && a.session_id == b.session_id && a.agent_id == b.agent_id
+        a.seq == b.seq
+            && a.session_id == b.session_id
+            && a.agent_id == b.agent_id
+            && a.uuid.is_some()
+            && a.uuid == b.uuid
     };
     match docs.as_slice() {
         [] => Ok(None),
@@ -3427,6 +3469,54 @@ mod tests {
         r0.filters.tool_input = vec!["command".into()];
         let err = search(&index, &f, &r0).unwrap_err().to_string();
         assert!(err.contains("KEY=VALUE"), "{err}");
+    }
+
+    /// A `tool_input` / `tool_output` value this builder cannot read is the caller's mistake,
+    /// and it has to arrive *typed* — the sentence alone is not the fix.
+    ///
+    /// [`crate::mcp::from_anyhow`] downcasts [`FilterError`] into an `invalid_params` and turns
+    /// everything else into an `internal_error`. Without the type these read to a model as "the
+    /// tool broke", when the remedy is to send a different value; the wording would still look
+    /// right in the terminal, so nothing but the downcast catches it. The field name is pinned
+    /// alongside because the same builder answers an HTTP API and an MCP server, neither of
+    /// which has a `--tool-input` for a caller to correct.
+    #[test]
+    fn an_unreadable_tool_filter_is_a_typed_caller_mistake_naming_the_plain_field() {
+        let (index, f) = index_docs(&corpus());
+        let input = |spec: &str| Filters {
+            tool_input: vec![spec.into()],
+            ..Filters::default()
+        };
+        let output = |phrase: &str| Filters {
+            tool_output: vec![phrase.into()],
+            ..Filters::default()
+        };
+
+        for (filters, field, needle) in [
+            (input("command"), "tool_input", "KEY=VALUE"),
+            (input("=cargo"), "tool_input", "non-empty key"),
+            (
+                input("a b=cargo"),
+                "tool_input",
+                "the query grammar reserves",
+            ),
+            (input("command="), "tool_input", "non-empty value"),
+            (output(""), "tool_output", "non-empty value"),
+        ] {
+            let request = SearchRequest {
+                filters,
+                ..SearchRequest::default()
+            };
+            let err = search(&index, &f, &request).unwrap_err();
+            let rendered = format!("{err:#}");
+            let typed = err
+                .downcast_ref::<FilterError>()
+                .unwrap_or_else(|| panic!("{rendered} must classify as a caller mistake"));
+            assert_eq!(typed.field, field, "{rendered}");
+            assert!(rendered.contains(needle), "{rendered}");
+            // The plain field, never a flag: two of the three front ends have no `--` to offer.
+            assert!(!rendered.contains("--"), "{rendered}");
+        }
     }
 
     #[test]
@@ -5082,6 +5172,81 @@ mod tests {
 
         // The exact-before-prefix rule: one of them spelled in full is not ambiguous.
         assert_eq!(resolve_doc(&index, &f, "dup-alpha").unwrap().seq, 4);
+    }
+
+    /// Two documents at the same `SESSION:SEQ` that are not the same record stay an ambiguity.
+    ///
+    /// §9's `resetSessionFile()` lets two *different* transcripts carry one session id, and
+    /// `seq` restarts at 0 in every file — so `s1:0` names turn 0 of one conversation and turn 0
+    /// of another, and they agree on session, agent and `seq`. Without the `uuid` half of
+    /// [`one_of`]'s same-record test this passes silently and wrongly: the pair is declared one
+    /// logical record, whichever file sorts first by `doc_id` is returned, and the caller is
+    /// handed a document out of a transcript it never named with no error and no warning. That
+    /// is the hazard `get_turn` warns a model about for a bare turn number, arriving through the
+    /// resolver instead.
+    #[test]
+    fn two_transcripts_sharing_a_session_id_stay_an_ambiguous_reference() {
+        let docs: Vec<Doc> = [
+            ("aaaaaaaa", "/tmp/a/s1.jsonl", "record-in-a"),
+            ("bbbbbbbb", "/tmp/b/s1.jsonl", "record-in-b"),
+        ]
+        .into_iter()
+        .map(|(tag, path, uuid)| Doc {
+            doc_id: format!("s1:-:{tag}:0"),
+            source_path: path.into(),
+            // Different records: two files that merely share a session id are two conversations.
+            uuid: Some(uuid.into()),
+            body: format!("{tag} turn 0"),
+            ..blank_doc(0)
+        })
+        .collect();
+        let (index, f) = index_docs(&docs);
+
+        let err = format!("{:#}", resolve_doc(&index, &f, "s1:0").unwrap_err());
+        assert!(err.contains("ambiguous document reference"), "{err}");
+        assert!(
+            err.contains("s1:-:aaaaaaaa:0") && err.contains("s1:-:bbbbbbbb:0"),
+            "both candidates are named so the caller can pick one: {err}"
+        );
+
+        // The documents themselves were never ambiguous — only the coordinate was.
+        assert_eq!(
+            resolve_doc(&index, &f, "record-in-b").unwrap().doc_id,
+            "s1:-:bbbbbbbb:0"
+        );
+    }
+
+    /// §9's `relocated` duplicate is the one ambiguity with a single answer, and it survives the
+    /// test above: one transcript indexed under two project keys is the *same record* read from
+    /// two files, so the two candidates carry identical record uuids.
+    ///
+    /// The pair matters. Tightening [`one_of`] until this case errors too would refuse a
+    /// reference the caller has no other spelling for — `cli::source_path_for` returns `None` in
+    /// exactly this case, so there is no `--session`-plus-file form to fall back to, and
+    /// `--similar-to <uuid>` on a relocated transcript would stop working entirely.
+    #[test]
+    fn one_record_read_from_two_files_is_still_one_record() {
+        let docs: Vec<Doc> = [
+            ("aaaaaaaa", "/tmp/a/s1.jsonl"),
+            ("bbbbbbbb", "/tmp/b/s1.jsonl"),
+        ]
+        .into_iter()
+        .map(|(tag, path)| Doc {
+            doc_id: format!("s1:-:{tag}:0"),
+            source_path: path.into(),
+            // The same record uuid in both files — that is what makes it one transcript.
+            uuid: Some("relocated-record".into()),
+            ..blank_doc(0)
+        })
+        .collect();
+        let (index, f) = index_docs(&docs);
+
+        assert_eq!(resolve_doc(&index, &f, "s1:0").unwrap().seq, 0);
+        assert_eq!(
+            resolve_doc(&index, &f, "relocated-record").unwrap().doc_id,
+            "s1:-:aaaaaaaa:0",
+            "the first by `doc_id`, so two runs name the same file"
+        );
     }
 
     /// An unknown reference is an error naming the grammar, not an empty result set. The two

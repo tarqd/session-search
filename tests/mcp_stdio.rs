@@ -127,9 +127,19 @@ fn every_tool_is_listed_with_a_schema_a_model_can_read() {
         // An input schema whose root is not an object panics rmcp's router at startup rather
         // than at build time, so the shape is worth asserting even though it compiled.
         assert_eq!(input["type"], "object", "{name} input schema");
-        // Nothing required: `{"query":"SIGBUS"}` must be a valid call, which is what
-        // `#[serde(default)]` on `Filters` and on each request struct buys.
-        assert!(input.get("required").is_none(), "{name} demands arguments");
+        // Nothing required but `aggregate.field`: `{"query":"SIGBUS"}` must be a valid
+        // `search_turns` call, which is what `#[serde(default)]` on `Filters` and on each
+        // request struct buys. `field` is the exception because there is no field worth
+        // counting by default — a schema that let the call through would only buy the caller a
+        // refusal naming a field nobody wrote.
+        match name {
+            "aggregate" => assert_eq!(
+                input["required"],
+                serde_json::json!(["field"]),
+                "aggregate must declare the one argument it cannot answer without"
+            ),
+            _ => assert!(input.get("required").is_none(), "{name} demands arguments"),
+        }
         // The descriptions are the deliverable — issue #28, "the schemas are the actual work".
         // A property without one is a filter a model will guess at.
         for (property, schema) in input["properties"].as_object().expect("properties") {

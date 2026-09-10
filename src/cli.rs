@@ -467,7 +467,7 @@ fn dispatch(
                 similar_to: similar,
                 group_by_turn,
             };
-            let response = search::search(&index, &fields, &request)?;
+            let response = search::search(&index, &fields, &request).map_err(cli_dialect)?;
             opts.context = match window {
                 ContextWindow::Docs(n) => n,
                 ContextWindow::Turn | ContextWindow::Skeleton => 0,
@@ -497,7 +497,7 @@ fn dispatch(
                 snippet_chars: SNIPPET_CHARS,
                 ..SearchRequest::default()
             };
-            let result = search::facets(&index, &fields, &field, &request)?;
+            let result = search::facets(&index, &fields, &field, &request).map_err(cli_dialect)?;
             format::facet_list(out, &result, &opts)
         }
 
@@ -998,7 +998,29 @@ pub(crate) fn index_stats(index_dir: &Path) -> Result<IndexStats> {
 /// surface where `--since` is a flag nobody can type. Here the flag *is* what was typed, so it
 /// goes back on at the boundary — this is the whole of the CLI's dialect.
 fn session_matcher(f: &Filters) -> Result<SessionMatcher> {
-    SessionMatcher::new(f).map_err(|err| anyhow!("parsing --{}: {:#}", err.field, err.source))
+    SessionMatcher::new(f).map_err(|err| cli_flag(err.field, &err.source))
+}
+
+/// A [`sessions::FilterError`] re-spelled as the flag the user actually typed.
+///
+/// The shared core names the plain field (`tool_input`), because the same builder answers an HTTP
+/// API and an MCP server, and neither of those callers can type a flag — putting `--tool-input`
+/// in a JSON-RPC error tells a model to send something it has no way to send. Here the flag *is*
+/// what was typed, so it goes back on, at the boundary that owns the dialect.
+fn cli_flag(field: &str, source: &anyhow::Error) -> anyhow::Error {
+    anyhow!("parsing --{}: {:#}", field.replace('_', "-"), source)
+}
+
+/// The same re-spelling, for an error that arrived as an opaque `anyhow` from the query builder.
+///
+/// `search::build_query` reports an unreadable `--tool-input` / `--tool-output` as a
+/// [`sessions::FilterError`] for the reason above. Everything else it can fail with is a genuine
+/// internal fault and passes through untouched.
+fn cli_dialect(err: anyhow::Error) -> anyhow::Error {
+    match err.downcast::<sessions::FilterError>() {
+        Ok(filter) => cli_flag(filter.field, &filter.source),
+        Err(err) => err,
+    }
 }
 
 /// The filters `sessions` was handed that a session listing cannot answer, on stderr.
@@ -1596,6 +1618,40 @@ mod tests {
             Err(err) => err,
         };
         assert!(format!("{err:#}").contains("--since"), "{err:#}");
+    }
+
+    /// The shared query builder names the plain field, because an HTTP or MCP caller cannot type
+    /// a flag. Without this, that correctness for the other two front ends arrives here as a
+    /// message telling someone at a shell prompt to fix a `tool_input` they never typed.
+    #[test]
+    fn an_unreadable_tool_filter_is_reported_as_the_flag_that_was_typed() {
+        let (index, fields) = search::testkit::index_docs(&search::testkit::corpus());
+        for (filters, flag) in [
+            (
+                Filters {
+                    tool_input: vec!["command".into()],
+                    ..Filters::default()
+                },
+                "--tool-input",
+            ),
+            (
+                Filters {
+                    tool_output: vec![String::new()],
+                    ..Filters::default()
+                },
+                "--tool-output",
+            ),
+        ] {
+            let request = search::SearchRequest {
+                filters,
+                ..Default::default()
+            };
+            let err = search::search(&index, &fields, &request)
+                .map_err(cli_dialect)
+                .expect_err("an unreadable filter must fail the command");
+            let message = format!("{err:#}");
+            assert!(message.contains(flag), "{message}");
+        }
     }
 
     #[test]

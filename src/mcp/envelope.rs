@@ -37,6 +37,29 @@
 //!   them does not widen the question, it answers a different one. A hit from another repository
 //!   or another month is not a better answer than zero; it is a wrong answer that reads as a
 //!   right one.
+//!
+//! # What the retry does with the diagnosis
+//!
+//! The ranking names a filter; the retry is the object a client sends without reading the prose,
+//! so the two must not disagree. Three rules keep them together:
+//!
+//! * **a contradiction drops the exclusion, never the intent.** `agent_type` lives only on
+//!   sidechain documents and `no_sidechains` deletes every one of them, so the pair is provably
+//!   empty. The retry drops the flag and keeps `agent_type`: the caller's question is in the
+//!   value, and a retry that kept the exclusion would answer a question nobody asked and return
+//!   zero a second time;
+//! * **an exact-match value the caller mis-spelled is corrected, not deleted.** `program`,
+//!   `tool`, `branch`, `lang` and `model` are exact terms over a vocabulary, so `Cargo` and
+//!   `cargo build` are silent zeroes where `cargo` matches. Deleting the filter answers a
+//!   different, much wider question — every document mentioning the query — while correcting it
+//!   answers the one that was asked. The correction is derived from the value the caller sent
+//!   (case-folded, cut at the first word, or spelled against the capitalised tool vocabulary),
+//!   so **the ranking still never probes the index**: it stays a total function of the request.
+//!   A correction that is itself wrong costs one extra call and no more — the second pass finds
+//!   nothing left to repair and drops the filter;
+//! * **a retry never hands back a term the message just warned about.** A query term beginning
+//!   with `-` is a negation, and the rephrase retry quotes the whole query rather than offering
+//!   the negated term as the one to keep.
 
 use serde_json::{Value, json};
 
@@ -222,10 +245,20 @@ pub struct Ranked {
     pub why: String,
     /// Drop it, or correct it.
     pub action: RetryAction,
-    /// The closed vocabulary, when the action is [`RetryAction::Fix`].
+    /// The closed vocabulary, when the action is [`RetryAction::Fix`] over one. Empty when the
+    /// fix is a spelling repair over an open vocabulary, where there is no set to list.
     pub legal: &'static [&'static str],
     /// The value the retry substitutes, when the action is [`RetryAction::Fix`].
-    pub fix_to: Option<String>,
+    ///
+    /// A `Value` rather than a `String` because three of the repairable filters are repeatable
+    /// and arrive as arrays; a retry that corrected `program: ["Cargo"]` to the string `cargo`
+    /// would not be sendable in the shape the field takes.
+    pub fix_to: Option<Value>,
+    /// The other filter of a contradictory pair — the one whose intent [`Ranked::filter`]
+    /// destroys, and which the retry therefore keeps. Set only where the pair is provably empty
+    /// together, and it is what makes the message say *these two cannot both hold* rather than
+    /// *this one is narrow*.
+    pub contradicts: Option<&'static str>,
 }
 
 /// The narrowest filter the request actually set, per the drop order above. `None` when no
@@ -249,7 +282,8 @@ pub fn narrowest(f: &Filters) -> Option<Ranked> {
             ),
             action: RetryAction::Fix,
             legal: KIND_VALUES,
-            fix_to: Some(nearest(v, KIND_VALUES).to_string()),
+            fix_to: Some(json!(nearest(v, KIND_VALUES))),
+            contradicts: None,
         });
     }
     if let Some(v) = opt(&f.role)
@@ -265,24 +299,69 @@ pub fn narrowest(f: &Filters) -> Option<Ranked> {
             ),
             action: RetryAction::Fix,
             legal: ROLE_VALUES,
-            fix_to: Some(nearest(v, ROLE_VALUES).to_string()),
+            fix_to: Some(json!(nearest(v, ROLE_VALUES))),
+            contradicts: None,
         });
     }
 
-    // 2..14. Narrowness, most to least selective.
-    let drop = |filter: &'static str, value: Value, why: &str| {
+    // 2. A contradictory pair, which is provable in the same way an illegal `kind` is: the two
+    //    filters select disjoint halves of the corpus, so their intersection is empty however
+    //    the rest of the request is spelled. What goes is the broad exclusion flag, never the
+    //    filter carrying the value — see the module docs.
+    if f.no_sidechains && f.sidechains_only {
+        return Some(Ranked {
+            filter: "no_sidechains",
+            value: json!(true),
+            why: "`sidechains_only` keeps subagent transcripts and `no_sidechains` removes them; \
+                  set together they select nothing at all. `sidechains_only` is the one that \
+                  asks for something, so it is the flag that stays"
+                .to_string(),
+            action: RetryAction::Drop,
+            legal: &[],
+            fix_to: None,
+            contradicts: Some("sidechains_only"),
+        });
+    }
+    if let Some(v) = opt(&f.agent_type)
+        && f.no_sidechains
+    {
+        return Some(Ranked {
+            filter: "no_sidechains",
+            value: json!(true),
+            why: format!(
+                "`agent_type` is an exact term that only sidechain documents carry, so \
+                 `agent_type={v}` silently implies subagent transcripts and `no_sidechains` \
+                 excludes every one of them — the pair matches nothing whatever else is set. \
+                 The intent is in `agent_type`; the flag is what goes"
+            ),
+            action: RetryAction::Drop,
+            legal: &[],
+            fix_to: None,
+            contradicts: Some("agent_type"),
+        });
+    }
+
+    // 3..15. Narrowness, most to least selective. `rank` corrects the value where the value
+    //        itself says how, and drops the filter where it does not.
+    let rank = |filter: &'static str, value: Value, why: &str| {
+        let fix_to = repaired(filter, &value);
         Some(Ranked {
             filter,
             value,
             why: why.to_string(),
-            action: RetryAction::Drop,
+            action: if fix_to.is_some() {
+                RetryAction::Fix
+            } else {
+                RetryAction::Drop
+            },
             legal: &[],
-            fix_to: None,
+            fix_to,
+            contradicts: None,
         })
     };
 
     if !f.tool_input.is_empty() {
-        return drop(
+        return rank(
             "tool_input",
             json!(f.tool_input),
             "`tool_input` is an exact match on one named parameter of one tool, and it has two \
@@ -292,7 +371,7 @@ pub fn narrowest(f: &Filters) -> Option<Ranked> {
         );
     }
     if !f.tool_output.is_empty() {
-        return drop(
+        return rank(
             "tool_output",
             json!(f.tool_output),
             "`tool_output` is a phrase query: the words must appear adjacent and in order, and \
@@ -301,7 +380,7 @@ pub fn narrowest(f: &Filters) -> Option<Ranked> {
         );
     }
     if !f.program.is_empty() {
-        return drop(
+        return rank(
             "program",
             json!(f.program),
             "`program` is an exact, case-sensitive match on the program name as it was typed, so \
@@ -310,7 +389,7 @@ pub fn narrowest(f: &Filters) -> Option<Ranked> {
         );
     }
     if let Some(n) = f.min_thinking {
-        return drop(
+        return rank(
             "min_thinking",
             json!(n),
             "`min_thinking` is nominally a range and in practice a presence filter: the count is \
@@ -319,7 +398,7 @@ pub fn narrowest(f: &Filters) -> Option<Ranked> {
         );
     }
     if !f.lang.is_empty() {
-        return drop(
+        return rank(
             "lang",
             json!(f.lang),
             "`lang` matches the info string of a markdown code fence, so it excludes every tool \
@@ -327,7 +406,7 @@ pub fn narrowest(f: &Filters) -> Option<Ranked> {
         );
     }
     if let Some(v) = opt(&f.agent_type) {
-        return drop(
+        return rank(
             "agent_type",
             json!(v),
             "`agent_type` is an exact term that only sidechain documents carry, so it silently \
@@ -335,7 +414,7 @@ pub fn narrowest(f: &Filters) -> Option<Ranked> {
         );
     }
     if let Some(v) = opt(&f.model) {
-        return drop(
+        return rank(
             "model",
             json!(v),
             "`model` is an exact term on the full recorded id, so a family name such as `opus` \
@@ -343,7 +422,7 @@ pub fn narrowest(f: &Filters) -> Option<Ranked> {
         );
     }
     if let Some(v) = opt(&f.branch) {
-        return drop(
+        return rank(
             "branch",
             json!(v),
             "`branch` is an exact term on the whole recorded name, never a prefix: `claude/` does \
@@ -351,7 +430,7 @@ pub fn narrowest(f: &Filters) -> Option<Ranked> {
         );
     }
     if !f.tool.is_empty() {
-        return drop(
+        return rank(
             "tool",
             json!(f.tool),
             "`tool` is exact and case-sensitive against the capitalised vocabulary the transcript \
@@ -359,7 +438,7 @@ pub fn narrowest(f: &Filters) -> Option<Ranked> {
         );
     }
     if let Some(v) = opt(&f.session) {
-        return drop(
+        return rank(
             "session",
             json!(v),
             "`session` is a prefix match, but it scopes the answer to one conversation, so \
@@ -367,14 +446,14 @@ pub fn narrowest(f: &Filters) -> Option<Ranked> {
         );
     }
     if f.sidechains_only {
-        return drop(
+        return rank(
             "sidechains_only",
             json!(true),
             "`sidechains_only` keeps only subagent transcripts, which are a minority of files",
         );
     }
     if f.errors_only {
-        return drop(
+        return rank(
             "errors_only",
             json!(true),
             "`errors_only` keeps only calls the transcript itself flagged as failed, which are a \
@@ -382,7 +461,7 @@ pub fn narrowest(f: &Filters) -> Option<Ranked> {
         );
     }
     if f.no_sidechains {
-        return drop(
+        return rank(
             "no_sidechains",
             json!(true),
             "`no_sidechains` removes a minority of documents, so it rarely explains a zero on its \
@@ -392,7 +471,7 @@ pub fn narrowest(f: &Filters) -> Option<Ranked> {
 
     // 15. `kind`, then `role`, with legal values — the widest term filters.
     if let Some(v) = opt(&f.kind) {
-        return drop(
+        return rank(
             "kind",
             json!(v),
             "`kind` splits the corpus roughly in half, so it is wide when right — but it is the \
@@ -401,7 +480,7 @@ pub fn narrowest(f: &Filters) -> Option<Ranked> {
         );
     }
     if let Some(v) = opt(&f.role) {
-        return drop(
+        return rank(
             "role",
             json!(v),
             "`role` is a legal value here, so it cannot be provably wrong — but a tool call's \
@@ -414,7 +493,7 @@ pub fn narrowest(f: &Filters) -> Option<Ranked> {
     //     excludes everything before it, which on a transcript corpus is nearly all of it,
     //     while an upper bound usually sits at or near `now` and excludes nothing.
     if let Some(v) = opt(&f.since) {
-        return drop(
+        return rank(
             "since",
             json!(v),
             "only the time window and the project scope are left. Dropping `since` widens the \
@@ -423,7 +502,7 @@ pub fn narrowest(f: &Filters) -> Option<Ranked> {
         );
     }
     if let Some(v) = opt(&f.until) {
-        return drop(
+        return rank(
             "until",
             json!(v),
             "only the time window and the project scope are left. Dropping `until` widens the \
@@ -434,7 +513,7 @@ pub fn narrowest(f: &Filters) -> Option<Ranked> {
 
     // 17. `project`, always last.
     if let Some(v) = opt(&f.project) {
-        return drop(
+        return rank(
             "project",
             json!(v),
             "this is the last filter. Dropping it does not widen this question, it answers a \
@@ -442,6 +521,91 @@ pub fn narrowest(f: &Filters) -> Option<Ranked> {
         );
     }
     None
+}
+
+/// Tool names as the transcript capitalises them, for repairing a lower-cased `tool`.
+///
+/// A spelling aid, **not** a legal set: the vocabulary is open — an MCP server contributes tool
+/// names nobody here can know — so a value that matches nothing in this list is left alone and
+/// the filter is dropped rather than "corrected" to something invented. `aggregate` on
+/// `tool_name` is still the way to learn what a corpus actually holds.
+const TOOL_SPELLINGS: &[&str] = &[
+    "Bash",
+    "BashOutput",
+    "Edit",
+    "ExitPlanMode",
+    "Glob",
+    "Grep",
+    "KillShell",
+    "NotebookEdit",
+    "Read",
+    "SlashCommand",
+    "Task",
+    "TodoWrite",
+    "WebFetch",
+    "WebSearch",
+    "Write",
+];
+
+/// The corrected value for an exact-match filter, or `None` when the value says nothing about
+/// how it is wrong.
+///
+/// Index-free by construction: every candidate is derived from the value the caller sent, so
+/// this stays a pure function of the request and the promise above — that the ranking never
+/// takes a second pass over the corpus — still holds. Three repairs, all of them observed:
+/// a value carrying more than the term (`cargo build`, cut at the first word), a case-wrong
+/// value over a lower-case vocabulary (`Cargo`), and a lower-cased tool name (`bash`), which
+/// goes the other way and is repaired against [`TOOL_SPELLINGS`] rather than by guessing at
+/// capitalisation.
+///
+/// A repair that is itself wrong is bounded: the retry carries the corrected value, finds
+/// nothing, and the next ranking has nothing left to repair — so it drops the filter, exactly
+/// as it would have on the first pass.
+fn repaired(filter: &str, value: &Value) -> Option<Value> {
+    match value {
+        Value::String(one) => repaired_term(filter, one).map(Value::String),
+        Value::Array(items) => {
+            let fixed: Vec<Value> = items
+                .iter()
+                .map(|item| match item {
+                    Value::String(one) => repaired_term(filter, one)
+                        .map(Value::String)
+                        .unwrap_or_else(|| item.clone()),
+                    other => other.clone(),
+                })
+                .collect();
+            (fixed != *items).then_some(Value::Array(fixed))
+        }
+        _ => None,
+    }
+}
+
+fn repaired_term(filter: &str, value: &str) -> Option<String> {
+    let head = value.split_whitespace().next().unwrap_or_default();
+    if head.is_empty() {
+        return None;
+    }
+    let proposal = match filter {
+        "tool" => tool_spelling(head)?.to_string(),
+        // `lang` is lower-cased on both sides before it is matched, so case is never the fault
+        // here and proposing a case change would be a retry that cannot behave differently.
+        "lang" => head.to_string(),
+        "program" | "branch" | "model" => head.to_lowercase(),
+        _ => return None,
+    };
+    (proposal != value).then_some(proposal)
+}
+
+/// The capitalisation the transcript uses for a tool the caller spelled some other way.
+fn tool_spelling(value: &str) -> Option<&'static str> {
+    let squash = |s: &str| {
+        s.chars()
+            .filter(|c| c.is_alphanumeric())
+            .flat_map(char::to_lowercase)
+            .collect::<String>()
+    };
+    let want = squash(value);
+    TOOL_SPELLINGS.iter().copied().find(|t| squash(t) == want)
 }
 
 /// The legal value closest to what the caller wrote, for the `fix` retry.
@@ -510,8 +674,17 @@ fn no_results(ctx: &Context<'_>, applied: &[AppliedFilter]) -> NoResults {
         time_sentence(&ctx.time_range)
     );
     let body = match ranked.action {
+        // A contradiction is named as a pair, because "the narrowest of these" would be a lie
+        // about a flag that is wide on its own and only fatal beside the filter it cancels.
+        _ if ranked.contradicts.is_some() => format!(
+            "{}.\n\nRetry without {}, keeping {}: {}",
+            ranked.why,
+            ranked.filter,
+            ranked.contradicts.unwrap_or_default(),
+            compact(&retry)
+        ),
         RetryAction::Fix => {
-            let fix = ranked.fix_to.clone().unwrap_or_default();
+            let fix = ranked.fix_to.as_ref().map(render_value).unwrap_or_default();
             format!(
                 "{}.\n\nRetry with {}={fix}: {}",
                 ranked.why,
@@ -582,8 +755,8 @@ fn no_filters_at_all(ctx: &Context<'_>) -> NoResults {
         };
     };
     let terms: Vec<&str> = query.split_whitespace().collect();
-    let rarest = rarest_term(&terms);
-    let retry = retry_with_query(ctx, rarest);
+    let (rephrased, how) = rephrase(query, &terms);
+    let retry = retry_with_query(ctx, &rephrased);
     let message = format!(
         "0 results for {query} across {} documents in {} indexed sessions, no filters applied.\n\
          The query itself matched nothing. Three things that commonly cause this:\n\
@@ -593,7 +766,7 @@ fn no_filters_at_all(ctx: &Context<'_>) -> NoResults {
          contain\n\x20   `release`; quote anything with a flag in it: \"cargo build --release\".\n\
          \x20 - This index covers only Claude Code session transcripts on this machine. If the \
          work happened\n\x20   elsewhere, it is not here, and no query will find it.\n\
-         Retry with the single most distinctive term: {}",
+         {how}: {}",
         ctx.corpus.docs,
         ctx.corpus.sessions,
         compact(&retry),
@@ -608,6 +781,44 @@ fn no_filters_at_all(ctx: &Context<'_>) -> NoResults {
         legal_values: Vec::new(),
         retry,
     }
+}
+
+/// The query a rephrase retry should carry, and the sentence that introduces it.
+///
+/// The message three lines above this one explains that a leading `-` negates a term and tells
+/// the caller to quote the query. Handing back the negated term as "the single most distinctive
+/// term" contradicts that in the one field a client acts on without reading: the prose is skimmed
+/// and the retry is sent. So a query carrying a flag retries as the whole query, quoted — the
+/// repair the message already recommends — and only a query that cannot be quoted again without
+/// nesting its own quotes falls back to a term, with the negation stripped so the retry cannot
+/// ask for the absence of the thing it is looking for.
+fn rephrase(query: &str, terms: &[&str]) -> (String, &'static str) {
+    let negated = |t: &&str| t.starts_with('-') && t.len() > 1;
+    if terms.iter().any(negated) {
+        if !query.contains('"') {
+            return (
+                format!("\"{query}\""),
+                "Retry with the whole query quoted, so the flag is text and not a negation",
+            );
+        }
+        let positive: Vec<&str> = terms.iter().copied().filter(|t| !negated(t)).collect();
+        let pick = rarest_term(if positive.is_empty() {
+            terms
+        } else {
+            &positive
+        });
+        return (
+            // Edge punctuation goes with it: half of a `"quoted phrase"` is not a term, and a
+            // stray quote would make the retry a syntax error rather than a narrower query.
+            pick.trim_matches(|c: char| !c.is_alphanumeric())
+                .to_string(),
+            "Retry with the most distinctive term that is not negated",
+        );
+    }
+    (
+        rarest_term(terms).to_string(),
+        "Retry with the single most distinctive term",
+    )
 }
 
 /// The most distinctive term of a query, as a proxy for the rarest.
@@ -634,7 +845,7 @@ pub fn retry_body(ctx: &Context<'_>, ranked: Option<&Ranked>) -> Value {
         .map(|r| r.filter);
     let fix = ranked
         .filter(|r| r.action == RetryAction::Fix)
-        .and_then(|r| r.fix_to.as_deref().map(|to| (r.filter, to)));
+        .and_then(|r| r.fix_to.as_ref().map(|to| (r.filter, to)));
     let mut map = serde_json::Map::new();
     if let Some(q) = ctx.query.map(str::trim).filter(|q| !q.is_empty()) {
         map.insert("query".into(), json!(q));
@@ -644,7 +855,7 @@ pub fn retry_body(ctx: &Context<'_>, ranked: Option<&Ranked>) -> Value {
             continue;
         }
         let value = match fix {
-            Some((name, to)) if name == applied.name => json!(to),
+            Some((name, to)) if name == applied.name => to.clone(),
             _ => applied.value,
         };
         map.insert(applied.name, value);
@@ -745,7 +956,7 @@ mod tests {
         let ranked = narrowest(&f).expect("a filter is set");
         assert_eq!(ranked.filter, "kind");
         assert_eq!(ranked.action, RetryAction::Fix);
-        assert_eq!(ranked.fix_to.as_deref(), Some("tool_call"));
+        assert_eq!(ranked.fix_to, Some(json!("tool_call")));
 
         let corpus = corpus();
         let c = ctx(Some("cargo"), &f, &corpus);
@@ -784,9 +995,12 @@ mod tests {
     }
 
     #[test]
-    fn the_case_wrong_program_is_the_narrowest_of_a_real_request() {
+    fn the_case_wrong_program_is_corrected_by_the_retry_rather_than_deleted_from_it() {
         // The worked example from the issue: a program name reproduced from memory with the
         // wrong case, inside a project scope and a time window that must both survive the retry.
+        // Dropping `program` answers a much wider question — every document that merely mentions
+        // the query — and reads as an answer to the one that was asked; `program: ["cargo"]`
+        // answers the question itself.
         let f = filters(|f| {
             f.project = Some("/home/user/code/other-tool".into());
             f.program = vec!["Cargo".into()];
@@ -805,18 +1019,107 @@ mod tests {
             "{}",
             none.message
         );
+        assert_eq!(none.narrowest_filter.as_deref(), Some("program"));
+        assert_eq!(none.action, RetryAction::Fix);
         assert!(
+            none.message.contains("Retry with program=cargo"),
+            "{}",
             none.message
-                .contains("The narrowest of these is program=Cargo")
         );
+        // Open vocabulary: there is a correction to send and no set to enumerate, so the two
+        // are not the same field.
+        assert!(none.legal_values.is_empty());
         assert_eq!(
             none.retry,
             json!({
                 "query": "build failure",
                 "project": "/home/user/code/other-tool",
+                "program": ["cargo"],
                 "since": "7d",
             })
         );
+    }
+
+    #[test]
+    fn a_program_carrying_its_arguments_is_cut_back_to_the_program() {
+        // The second measured case. `cargo build` is a command line, not a program name, and
+        // `bash_cmd.program` stores the head of it; dropping the filter answers "everything
+        // mentioning release", which is a different question with sixteen times the results.
+        let f = filters(|f| f.program = vec!["cargo build".into()]);
+        let ranked = narrowest(&f).expect("a filter is set");
+        assert_eq!(ranked.action, RetryAction::Fix);
+        assert_eq!(ranked.fix_to, Some(json!(["cargo"])));
+
+        // And a value with nothing to repair is still dropped: a correction is only offered
+        // where the value itself says how it is wrong.
+        let f = filters(|f| f.program = vec!["cargo".into()]);
+        assert_eq!(narrowest(&f).expect("set").action, RetryAction::Drop);
+    }
+
+    #[test]
+    fn a_lower_cased_tool_is_respelled_and_a_tool_nobody_knows_is_left_alone() {
+        // `tool` runs the other way from `program`: the transcript writes `Bash`, so the repair
+        // is a capitalisation and it can only come from a list. The list is a spelling aid, not
+        // a legal set — the vocabulary is open, so an unrecognised name must be dropped rather
+        // than "corrected" into something this module invented.
+        let f = filters(|f| f.tool = vec!["bash".into(), "Read".into()]);
+        let ranked = narrowest(&f).expect("a filter is set");
+        assert_eq!(ranked.action, RetryAction::Fix);
+        assert_eq!(ranked.fix_to, Some(json!(["Bash", "Read"])));
+
+        let f = filters(|f| f.tool = vec!["mcp__thing__do".into()]);
+        let ranked = narrowest(&f).expect("a filter is set");
+        assert_eq!(ranked.action, RetryAction::Drop);
+        assert_eq!(ranked.fix_to, None);
+    }
+
+    #[test]
+    fn a_contradiction_drops_the_flag_and_keeps_the_filter_that_carries_the_intent() {
+        // `agent_type` lives only on sidechain documents and `no_sidechains` deletes every one
+        // of them, so the pair matches nothing. Dropping `agent_type` — the value the caller
+        // actually asked for — returns zero again and costs a second retry to reach a query
+        // with neither filter; dropping the flag answers the question in one call.
+        let f = filters(|f| {
+            f.agent_type = Some("Explore".into());
+            f.no_sidechains = true;
+        });
+        let ranked = narrowest(&f).expect("a filter is set");
+        assert_eq!(ranked.filter, "no_sidechains");
+        assert_eq!(ranked.contradicts, Some("agent_type"));
+
+        let corpus = corpus();
+        let c = ctx(Some("limit"), &f, &corpus);
+        let none = build(&c, 0, Vec::new())
+            .no_results
+            .expect("zero carries a suggestion");
+        assert_eq!(none.narrowest_filter.as_deref(), Some("no_sidechains"));
+        // The message names both halves, because a flag that is wide on its own is only fatal
+        // beside the filter it cancels.
+        assert!(
+            none.message.contains("agent_type=Explore"),
+            "{}",
+            none.message
+        );
+        assert!(
+            none.message
+                .contains("Retry without no_sidechains, keeping agent_type"),
+            "{}",
+            none.message
+        );
+        assert_eq!(
+            none.retry,
+            json!({ "query": "limit", "agent_type": "Explore" })
+        );
+
+        // The other contradictory pair, where neither half carries a value: the exclusion goes
+        // and the positive selection stays.
+        let f = filters(|f| {
+            f.no_sidechains = true;
+            f.sidechains_only = true;
+        });
+        let ranked = narrowest(&f).expect("a filter is set");
+        assert_eq!(ranked.filter, "no_sidechains");
+        assert_eq!(ranked.contradicts, Some("sidechains_only"));
     }
 
     #[test]
@@ -912,7 +1215,16 @@ mod tests {
         for (_, f) in &cases {
             merge(&mut all, f);
         }
-        // `kind`/`role` are legal here, so the phrase filter wins rather than the provable case.
+        // Every filter at once contains both contradictory pairs, and a pair that provably
+        // matches nothing outranks a filter that is merely narrow: no width of `tool_input`
+        // can rescue a request that also asks for sidechains and excludes them.
+        let ranked = narrowest(&all).expect("set");
+        assert_eq!(ranked.filter, "no_sidechains");
+        assert_eq!(ranked.contradicts, Some("sidechains_only"));
+
+        // With the flags settled, the phrase filter wins — `kind`/`role` are legal here, so the
+        // statically provable case does not fire either.
+        all.no_sidechains = false;
         assert_eq!(narrowest(&all).expect("set").filter, "tool_input");
     }
 
@@ -959,6 +1271,42 @@ mod tests {
     }
 
     #[test]
+    fn a_query_carrying_a_flag_retries_the_quoted_query_never_the_negated_term() {
+        // The message explains that a leading `-` negates a term and says to quote the query.
+        // The retry is the field a client sends without reading the prose, so handing back
+        // `--release` — the term the message just warned about — is worse than no retry at all:
+        // it matches every document that does not say "release" and warns about nothing.
+        let f = Filters::default();
+        let corpus = corpus();
+        let c = ctx(Some("cargo build --release"), &f, &corpus);
+        let none = build(&c, 0, Vec::new())
+            .no_results
+            .expect("zero carries a suggestion");
+        assert_eq!(
+            none.retry,
+            json!({ "query": "\"cargo build --release\"" }),
+            "{}",
+            none.message
+        );
+        assert!(
+            none.message.contains(
+                "Retry with the whole query quoted, so the flag is text and not a \
+                           negation"
+            ),
+            "{}",
+            none.message
+        );
+
+        // A query that already carries quotes cannot be quoted again without nesting them, so
+        // it falls back to a term — and the term is never the negated one.
+        let c = ctx(Some("\"cargo build\" --release"), &f, &corpus);
+        let none = build(&c, 0, Vec::new())
+            .no_results
+            .expect("zero carries a suggestion");
+        assert_eq!(none.retry, json!({ "query": "build" }), "{}", none.message);
+    }
+
+    #[test]
     fn an_empty_index_says_so_rather_than_blaming_a_query_nobody_sent() {
         let f = Filters::default();
         let corpus = Corpus::default();
@@ -991,7 +1339,7 @@ mod tests {
     fn the_retry_carries_tool_specific_arguments_through() {
         // `aggregate` without `field` is not a request. A retry that dropped it would be
         // unsendable, which is the same as no retry at all.
-        let f = filters(|f| f.program = vec!["Cargo".into()]);
+        let f = filters(|f| f.program = vec!["cargo".into()]);
         let corpus = corpus();
         let mut c = ctx(None, &f, &corpus);
         c.tool = "aggregate";

@@ -7,6 +7,7 @@
 //!   JSON subpath under a non-JSON field is already a clear error rather than an empty result —
 //!   pass that error through as-is. Set `facet_top` from `top`, and set `limit` to `top.max(1)`
 //!   the way `cli.rs` does: the collector needs a non-zero limit even though no hits are read.
+//!   `top` itself must be at least 1 by the time it gets there — see [`buckets_asked_for`].
 //! * [`crate::search::FacetResult`] travels to the caller **whole**. Issue #28 is explicit:
 //!   *"Must return `matching_docs`, `docs_with_value`, `other_docs` and `distinct`, not a bare
 //!   bucket list: a model handed only buckets will sum them and report a wrong total with total
@@ -49,7 +50,23 @@ pub fn run(state: &State, req: AggregateRequest) -> anyhow::Result<AggregateResp
 
     // Second, and still before the searcher opens: an unknown field costs nothing to catch here
     // and is expensive to catch late, where the only report available is an opaque one.
+    //
+    // The empty spelling gets its own sentence ahead of that. The schema declares `field`
+    // required, so a validating client cannot reach here — but a client that sends
+    // `{"field": ""}` explicitly satisfies the schema and would otherwise be told
+    // `unknown field ""`, which reads as a claim about a field rather than as "you left it out".
+    if req.field.trim().is_empty() {
+        return Err(crate::mcp::caller_error(
+            "`field` is required — name the field whose values you want counted, such as \
+             `tool_name`, `project` or `session_id`, or a JSON path such as \
+             `tool_input.file_path`",
+        ));
+    }
     facetable(&state.index.schema(), &req.field)?;
+
+    // Third: how many buckets were asked for, which for `top: 0` is a question with no honest
+    // answer. See `buckets_asked_for`.
+    let top = buckets_asked_for(req.top)?;
 
     let request = SearchRequest {
         query: req.query.clone(),
@@ -58,12 +75,16 @@ pub fn run(state: &State, req: AggregateRequest) -> anyhow::Result<AggregateResp
         // top-hits collector still has to be built, and a zero limit builds a collector that
         // refuses to collect. `cli.rs` passes `top.max(1)` for the same reason; the two callers
         // agreeing is what keeps `--top 0` from meaning different things on the two surfaces.
-        limit: req.top.max(1),
+        limit: top,
         offset: 0,
         // The single field goes to `facets` as an argument, not in here: `SearchRequest::facets`
         // is what `search()` reads, and `facets()` ignores it.
         facets: Vec::new(),
-        facet_top: req.top,
+        // The same number the limit above is built from, and it has to be: `search::facets`
+        // feeds `facet_top` to the collector, which floors it at 1, *and* to the take that
+        // builds the buckets. Two different numbers there means documents collected into a
+        // bucket that is never reported and never counted in `other_docs` either.
+        facet_top: top,
         // Nothing renders a snippet on this path, and asking for one would cost a stored-field
         // fetch and a highlighter pass per hit for text no caller will ever see.
         snippet_chars: 0,
@@ -104,6 +125,44 @@ pub fn run(state: &State, req: AggregateRequest) -> anyhow::Result<AggregateResp
         elapsed_ms: u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
         envelope,
     })
+}
+
+/// How many buckets the request asked for, or the refusal for a request that asked for none.
+///
+/// `top: 0` is rejected rather than clamped, and the reason is that it cannot be answered
+/// honestly here. [`crate::search::facets`] passes one number to two places: the aggregation
+/// collector, which floors it at 1, and the take that builds the bucket list. `other_docs` is the
+/// collector's `sum_other_doc_count` — everything *outside* the buckets it collected — so with a
+/// take of 0 the top bucket's documents were collected, dropped from `values`, and excluded from
+/// `other_docs` as well. `aggregate {field: "role", top: 0}` returned
+/// `{values: [], other_docs: 4, docs_with_value: 9}`: five documents in no bucket and in no
+/// remainder, against a `top` whose own description promises that "whatever falls outside them is
+/// counted in `other_docs`, so a small `top` is honest rather than lossy".
+///
+/// Clamping 0 to 1 would restore that arithmetic, and it is the other reasonable fix. It is not
+/// the one taken because it answers a different question than the one asked, silently: the caller
+/// sees one bucket where it asked for none, with nothing in the response to say a floor was
+/// applied. Nor is `top: 0` the counts-only request it looks like — `matching_docs`,
+/// `docs_with_value` and `distinct` all come back with `top: 1` unchanged, since only the bucket
+/// list is truncated by `top`. So there is no question it is the right spelling of, and the
+/// refusal names the one that is.
+///
+/// This is not [`crate::mcp::types::SearchTurnsRequest`]'s `limit: 0`, which `search_turns`
+/// answers with a warning: there the count is a complete answer produced by the same pass, and
+/// nothing is silently lost by returning no hits.
+fn buckets_asked_for(top: usize) -> Result<usize, crate::mcp::CallerError> {
+    if top == 0 {
+        return Err(crate::mcp::CallerError(
+            "`top` is 0, so no bucket could be returned and the documents in the top bucket \
+             would be counted in neither `values` nor `other_docs` — a total that silently loses \
+             them. Send `top: 1` or more. If the buckets are not what you want, note that \
+             `matching_docs`, `docs_with_value` and `distinct` are unaffected by `top`: `top: 1` \
+             answers 'how many documents carry a value for this field' exactly as `top: 0` would \
+             have."
+                .to_string(),
+        ));
+    }
+    Ok(top)
 }
 
 /// What the counts are true about but do not say.
@@ -306,6 +365,56 @@ mod tests {
         let summed: u64 = out.facet.values.iter().map(|v| v.count).sum();
         assert!(summed < out.facet.matching_docs, "{summed}");
         assert!(out.envelope.no_results.is_none());
+    }
+
+    #[test]
+    fn asking_for_zero_buckets_is_refused_rather_than_answered_with_a_lossy_total() {
+        let fx = fixture();
+        // `top: 0` used to reach `search::facets` as one number read two ways: the collector
+        // floored it at 1 and collected a top bucket, the bucket list took 0 of it, and
+        // `other_docs` — `sum_other_doc_count`, everything outside what the collector collected —
+        // excluded it too. `aggregate {field: "role", top: 0}` came back
+        // `{values: [], other_docs: 4, docs_with_value: 9}`: five documents in no bucket and in
+        // no remainder, under a `top` whose description promises the opposite.
+        let err = run(&fx.state, request("role", |r| r.top = 0)).unwrap_err();
+        let message = format!("{err:#}");
+        assert!(
+            err.downcast_ref::<crate::mcp::CallerError>().is_some(),
+            "asking for no buckets is a malformed question, not a broken server: {message}"
+        );
+        assert!(message.contains("other_docs"), "{message}");
+        assert!(message.contains("top: 1"), "{message}");
+
+        // And the answer `top: 0` looked like it was asking for is `top: 1`, which loses nothing:
+        // one bucket, and every document either in it or in `other_docs`.
+        let out = run(&fx.state, request("role", |r| r.top = 1)).unwrap();
+        assert_eq!(out.facet.values.len(), 1, "{:?}", out.facet.values);
+        let bucketed: u64 = out.facet.values.iter().map(|v| v.count).sum();
+        assert_eq!(
+            bucketed + out.facet.other_docs,
+            out.facet.docs_with_value,
+            "every document carrying a value is in a bucket or in the remainder: {:?}",
+            out.facet
+        );
+    }
+
+    #[test]
+    fn the_bucket_list_and_the_remainder_are_cut_by_the_same_number() {
+        let fx = fixture();
+        // The invariant the `top: 0` defect broke, stated over every `top` a caller can send:
+        // `search::facets` hands one number to the collector and to the bucket take, so the two
+        // must be the same number or documents fall out of both `values` and `other_docs`.
+        // `role` is single-valued, which is what makes the sum a document count.
+        for top in 1..=5 {
+            let out = run(&fx.state, request("role", |r| r.top = top)).unwrap();
+            let bucketed: u64 = out.facet.values.iter().map(|v| v.count).sum();
+            assert_eq!(
+                bucketed + out.facet.other_docs,
+                out.facet.docs_with_value,
+                "top={top} lost documents from every count: {:?}",
+                out.facet
+            );
+        }
     }
 
     #[test]

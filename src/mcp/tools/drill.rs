@@ -19,6 +19,9 @@
 //!   neighbouring documents: walk `turn_seq` outwards and call `turn_window` per turn. Turns are
 //!   not densely numbered — `turn_seq` is the `seq` of the record that opened the turn — so
 //!   "the previous turn" is a lookup, not `turn_seq - 1`. [`neighbour_turn`] is that lookup.
+//! * Resolve the anchor's own window **before** walking, and refuse the whole call when it holds
+//!   nothing: see [`no_such_turn`]. Neighbours exist relative to a turn, so an anchor that opens
+//!   no turn has no neighbours to return — only turns that would be read as the one addressed.
 //! * Render each document with [`crate::format::doc_json`], which is the pinned document shape
 //!   and already withholds `raw`. Then cut `tool_output` to `max_doc_bytes`, mark it, and count
 //!   how many documents were cut into `docs_with_truncated_output`. `get_turn` truncates where
@@ -73,9 +76,10 @@ use crate::{context, format, search};
 /// names four things, a `grep` that is not a regular expression.
 ///
 /// It exists because these two tools are the only ones whose *arguments* can be wrong in a way
-/// the index cannot answer. Everything else — including "that turn holds no documents" — is a
-/// normal result with an [`crate::mcp::types::Envelope`] explaining itself, per the contract in
-/// [`crate::mcp::tools`].
+/// the index cannot answer, and an address that names no document is one of those: see
+/// [`no_such_turn`]. What stays a normal result with an [`crate::mcp::types::Envelope`], per the
+/// contract in [`crate::mcp::tools`], is everything the address did answer — a turn cut short by
+/// `max_docs`, a tool call that ran and printed nothing, a `grep` that matched no line.
 ///
 /// Carried as `anyhow` so the bodies here read like the rest of the crate, and classified once at
 /// the boundary by [`crate::mcp::from_anyhow`], exactly as [`crate::sessions::FilterError`] is.
@@ -115,7 +119,24 @@ pub fn run_turn(state: &State, req: GetTurnRequest) -> anyhow::Result<GetTurnRes
 
     let anchor = address(state, &req)?;
 
-    // 3. The neighbours, outwards from the anchor, one lookup each.
+    // 3. The anchor's own window, before a single neighbour is looked up. The order is the whole
+    //    of the check: the walk below steps outwards from `anchor.turn_seq` whether or not a turn
+    //    opens there, so an anchor that names nothing used to be dropped by the emptiness guard
+    //    while its neighbours survived — `get_turn {turn_seq: 9999, before: 1}` answered with the
+    //    last real turn of the file, beside a `turn_seq: 9999` echo and no warning, and a caller
+    //    read that turn as the turn it had addressed.
+    let anchor_window = context::turn_window(
+        &state.index,
+        &state.fields,
+        &anchor.source_path,
+        anchor.turn_seq,
+        req.max_docs,
+    )?;
+    if anchor_window.total == 0 {
+        return Err(no_such_turn(&anchor));
+    }
+
+    // 4. The neighbours, outwards from an anchor now known to exist, one lookup each.
     let mut wanted = Vec::with_capacity(req.before + req.after + 1);
     let mut cursor = anchor.turn_seq;
     for _ in 0..req.before {
@@ -143,6 +164,12 @@ pub fn run_turn(state: &State, req: GetTurnRequest) -> anyhow::Result<GetTurnRes
 
     let mut turns = Vec::with_capacity(wanted.len());
     for turn_seq in wanted {
+        if turn_seq == anchor.turn_seq {
+            // Already fetched, and fetching it twice is how the anchor's emptiness gets decided
+            // twice with two answers.
+            turns.push(render_turn(&anchor.source_path, &anchor_window, &plan));
+            continue;
+        }
         let window = context::turn_window(
             &state.index,
             &state.fields,
@@ -150,10 +177,12 @@ pub fn run_turn(state: &State, req: GetTurnRequest) -> anyhow::Result<GetTurnRes
             turn_seq,
             req.max_docs,
         )?;
-        // A turn with no documents at all is a turn that does not exist — an address the caller
-        // made up, or a stale one from an index that has since been rebuilt. Dropping it here is
-        // what makes `turns` empty and hands the explanation to the envelope, rather than
-        // returning a hollow entry that reads as a real but silent turn.
+        // A neighbour with no documents at all: its `turn_seq` came off a document in this file
+        // microseconds ago, so an empty window here can only mean the index was rebuilt
+        // underneath the walk. Dropping it returns fewer neighbours than asked for, which is
+        // already what the edge of a file returns, rather than a hollow entry that reads as a
+        // real but silent turn. The anchor never reaches this line — its own emptiness is a
+        // refusal above, because it is the turn the caller actually addressed.
         if window.total == 0 {
             continue;
         }
@@ -220,6 +249,29 @@ fn address(state: &State, req: &GetTurnRequest) -> anyhow::Result<TurnRef> {
              tool_use_id, or SESSION:SEQ / SESSION:AGENT:SEQ, any by unambiguous prefix",
         )),
     }
+}
+
+/// The refusal for an address that resolves to no documents at all.
+///
+/// A `(source_path, turn_seq)` pair the caller assembled itself, or one from an index that has
+/// since been rebuilt. It is a [`crate::mcp::CallerError`] for the same reason `get_output`
+/// refuses a reference that names nothing, and because the two other shapes are both untrue.
+/// Returning an empty `turns` with a zero-hit envelope describes a search that matched nothing,
+/// and this tool ran no search: the envelope then blames — or, with no filter to blame, calls the
+/// index empty in the same sentence that counts its documents. Returning the neighbours alone is
+/// worse still: it answers about turns the caller never named, under a `turn_seq` echo saying it
+/// asked about this one.
+fn no_such_turn(anchor: &TurnRef) -> anyhow::Error {
+    bad(format!(
+        "no turn opens at turn_seq={} in {}, so there is nothing to return — and any \
+         `before`/`after` neighbours are withheld with it, since turns surrounding a turn that \
+         does not exist are not an answer to what was asked. `turn_seq` is the `seq` of the \
+         record that opened the turn, never a count of turns, so a number that falls inside a \
+         turn, or past the end of the file, opens nothing. The pair can also be stale: an index \
+         rebuilt since it was handed out may renumber or drop it. Take a fresh pair from \
+         `search_turns`, or address the document itself with `doc_id`",
+        anchor.turn_seq, anchor.source_path
+    ))
 }
 
 /// Which way [`neighbour_turn`] steps.
@@ -433,6 +485,8 @@ pub fn run_output(state: &State, req: GetOutputRequest) -> anyhow::Result<GetOut
         matched_lines: report.matched_lines,
         returned_lines: report.returned_lines,
         dropped_lines: report.dropped_lines,
+        returned_bytes: report.returned_bytes,
+        dropped_bytes: report.dropped_bytes,
         truncated: report.truncated,
         cut_mid_line: report.cut_mid_line,
         // True for both empty states as well: nothing was withheld. `state` is what says whether
@@ -457,14 +511,44 @@ fn classify(output: Option<&str>) -> OutputState {
     }
 }
 
+/// Which parameter carried the reference `get_output` is resolving.
+///
+/// Kept because the two are not interchangeable when the reference resolves to nothing: they
+/// accept different things, so they need different sentences. The resolution itself is shared —
+/// see [`resolve_call`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Param {
+    DocId,
+    ToolUseId,
+}
+
+/// A `tool_use_id` that matched no document, said in terms of the parameter that carried it.
+///
+/// [`crate::search::resolve_doc`] answers every miss with its own grammar — *"a reference is
+/// SESSION:SEQ, SESSION:AGENT:SEQ, a record uuid, or a doc_id"* — which is the right sentence for
+/// `doc_id` and the wrong one for `tool_use_id`: it lists four forms and not one of them is the
+/// parameter the caller used, so a model reads it as "your id was the wrong shape" and reaches
+/// for a shape it does not have. A `tool_use_id` cannot be constructed at all — it is the host's
+/// own id for the call — so the only actionable sentence names where a real one comes from.
+fn no_such_tool_use_id(spec: &str) -> String {
+    format!(
+        "no tool call in this index has tool_use_id {spec:?}. A `tool_use_id` is the id the host \
+         gave the call, spelled exactly as the transcript wrote it — `toolu_…` in Claude Code \
+         transcripts — and it is not a shape you can build out of a session id or a seq: the one \
+         place to read one is the `tool_use_id` field of a tool_call document returned by \
+         `get_turn`. Take it from there, or address that document by its `doc_id` instead"
+    )
+}
+
 /// The tool call the request points at.
 ///
 /// `tool_use_id` is not a second resolution path: [`crate::search::resolve_doc`] already searches
 /// that field, so both arguments feed the same resolver and cannot disagree about what a
 /// reference means.
 fn resolve_call(state: &State, req: &GetOutputRequest) -> anyhow::Result<Doc> {
-    let spec = match (given(&req.doc_id), given(&req.tool_use_id)) {
-        (Some(spec), None) | (None, Some(spec)) => spec,
+    let (spec, param) = match (given(&req.doc_id), given(&req.tool_use_id)) {
+        (Some(spec), None) => (spec, Param::DocId),
+        (None, Some(spec)) => (spec, Param::ToolUseId),
         (Some(_), Some(_)) => {
             return Err(bad(
                 "give either doc_id or tool_use_id, not both: they can name different calls, and \
@@ -478,8 +562,24 @@ fn resolve_call(state: &State, req: &GetOutputRequest) -> anyhow::Result<Doc> {
             ));
         }
     };
-    let doc = search::resolve_doc(&state.index, &state.fields, spec)
-        .map_err(|err| bad(format!("{err:#}")))?;
+    let doc = match param {
+        // The resolver's own grammar — SESSION:SEQ, SESSION:AGENT:SEQ, a record uuid, a doc_id —
+        // is exactly the set `doc_id` accepts, so its message is already the right one.
+        Param::DocId => search::resolve_doc(&state.index, &state.fields, spec)
+            .map_err(|err| bad(format!("{err:#}")))?,
+        // `tool_use_id` accepts one form and none of the four, so "not found" needs a sentence of
+        // its own — but "ambiguous" does not. `resolve_doc_in` is the same resolution with the
+        // two outcomes separated: `Ok(None)` for nothing found, `Err` for a prefix that names
+        // several documents, which is still best reported in the resolver's words.
+        Param::ToolUseId => search::resolve_doc_in(
+            &state.index,
+            &state.fields,
+            spec,
+            search::DocScope::Anywhere,
+        )
+        .map_err(|err| bad(format!("{err:#}")))?
+        .ok_or_else(|| bad(no_such_tool_use_id(spec)))?,
+    };
     if doc.kind != DocKind::ToolCall {
         // Not an empty output: there is no call here at all. Naming what it did resolve to is the
         // difference between a caller that fixes its reference and one that concludes the tool
@@ -781,23 +881,91 @@ mod tests {
     }
 
     #[test]
-    fn a_turn_addressed_but_not_found_is_an_empty_answer_with_an_envelope() {
+    fn a_turn_seq_that_opens_no_turn_is_refused_instead_of_reported_as_an_empty_index() {
         let h = harness();
-        let response = run_turn(
+        // A number in the middle of turn 5, which no turn opens on. This used to come back as a
+        // success with `turns: []`, and the envelope — `get_turn` sets no filters, so there is
+        // nothing to blame — explained the zero as "this index is empty or holds nothing this
+        // tool can return. Run `session-search index` to build it", in the same sentence that
+        // counted the documents it holds, with a retry identical to the call that just failed.
+        let err = run_turn(
             &h.state,
             GetTurnRequest {
                 source_path: Some(h.turns_path.clone()),
-                // A number in the middle of turn 5, which no turn opens on.
                 turn_seq: Some(SPARSE_TURNS[1] + 1),
                 ..GetTurnRequest::default()
             },
         )
-        .unwrap();
-        assert!(response.turns.is_empty());
+        .unwrap_err();
+        let message = format!("{err:#}");
         assert!(
-            response.envelope.no_results.is_some(),
-            "a zero must never travel alone"
+            err.downcast_ref::<crate::mcp::CallerError>().is_some(),
+            "an address that names nothing is the caller's mistake, not an empty search: \
+             {message}"
         );
+        assert!(
+            message.contains(&format!("turn_seq={}", SPARSE_TURNS[1] + 1)),
+            "{message}"
+        );
+        assert!(message.contains(&h.turns_path), "{message}");
+        // The two things a caller can act on: why a number can name nothing, and that the pair
+        // may simply be out of date.
+        assert!(message.contains("opened the turn"), "{message}");
+        assert!(message.contains("stale"), "{message}");
+        assert!(message.contains("search_turns"), "{message}");
+        // And never the query-shaped zero, which is about a search this tool did not run.
+        assert!(!message.contains("index is empty"), "{message}");
+    }
+
+    #[test]
+    fn neighbours_are_never_returned_under_a_turn_seq_that_names_nothing() {
+        let h = harness();
+        // The walk starts from the anchor whether or not a turn opens there, so before the
+        // anchor was checked first this returned exactly one turn — the last real turn of the
+        // file — beside `turn_seq: 9999`, `no_results: null` and `warnings: []`. Nothing in the
+        // response said the turn that was asked for does not exist, and a caller reads the turn
+        // it was handed as the turn it addressed.
+        for (before, after) in [(1, 0), (0, 1), (2, 2)] {
+            let err = run_turn(
+                &h.state,
+                GetTurnRequest {
+                    source_path: Some(h.turns_path.clone()),
+                    turn_seq: Some(9999),
+                    before,
+                    after,
+                    ..GetTurnRequest::default()
+                },
+            )
+            .unwrap_err();
+            let message = format!("{err:#}");
+            assert!(
+                err.downcast_ref::<crate::mcp::CallerError>().is_some(),
+                "{message}"
+            );
+            assert!(
+                message.contains("neighbours are withheld"),
+                "the refusal has to say the neighbours were not returned either: {message}"
+            );
+        }
+        // The same walk from a real anchor still returns neighbours, including at the file's
+        // edges: refusing a missing anchor must not cost the feature it guards.
+        let from_the_last_turn = run_turn(
+            &h.state,
+            GetTurnRequest {
+                source_path: Some(h.turns_path.clone()),
+                turn_seq: Some(SPARSE_TURNS[2]),
+                before: 1,
+                after: 1,
+                ..GetTurnRequest::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            turn_seqs(&from_the_last_turn),
+            vec![SPARSE_TURNS[1], SPARSE_TURNS[2]],
+            "there is no turn after the last one, and that is an answer"
+        );
+        assert!(from_the_last_turn.envelope.no_results.is_none());
     }
 
     #[test]
@@ -1023,6 +1191,63 @@ mod tests {
         );
         assert!(message.contains("not a tool call"), "{message}");
         assert!(message.contains("role=\"user\""), "{message}");
+    }
+
+    #[test]
+    fn a_tool_use_id_that_matches_nothing_says_so_and_says_where_a_real_one_comes_from() {
+        let h = harness();
+        // The resolver's grammar lists SESSION:SEQ, SESSION:AGENT:SEQ, a record uuid and a
+        // doc_id — four forms, none of them the parameter the caller used. Read against a
+        // `tool_use_id`, it says the id was the wrong shape and points at shapes the caller
+        // cannot build, so the next call is another guess.
+        let err = run_output(
+            &h.state,
+            GetOutputRequest {
+                tool_use_id: Some("toolu_nothing_here".into()),
+                ..GetOutputRequest::default()
+            },
+        )
+        .unwrap_err();
+        let message = format!("{err:#}");
+        assert!(
+            err.downcast_ref::<crate::mcp::CallerError>().is_some(),
+            "{message}"
+        );
+        assert!(message.contains("tool_use_id"), "{message}");
+        assert!(message.contains("toolu_nothing_here"), "{message}");
+        // Where a real one comes from, and what one looks like.
+        assert!(message.contains("get_turn"), "{message}");
+        assert!(message.contains("toolu_"), "{message}");
+        assert!(
+            !message.contains("SESSION:SEQ"),
+            "the grammar of a doc_id is not what a caller holding a tool_use_id needs: {message}"
+        );
+
+        // A `doc_id` that matches nothing still gets the resolver's grammar, which for that
+        // parameter is the right sentence.
+        let by_doc_id = run_output(
+            &h.state,
+            GetOutputRequest {
+                doc_id: Some("no-such-reference-anywhere".into()),
+                ..GetOutputRequest::default()
+            },
+        )
+        .unwrap_err();
+        assert!(
+            format!("{by_doc_id:#}").contains("SESSION:SEQ"),
+            "{by_doc_id:#}"
+        );
+
+        // And a real `tool_use_id` still resolves through the same path.
+        let found = run_output(
+            &h.state,
+            GetOutputRequest {
+                tool_use_id: Some("toolu_long".into()),
+                ..GetOutputRequest::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(found.tool_use_id.as_deref(), Some("toolu_long"));
     }
 
     #[test]

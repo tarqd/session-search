@@ -172,8 +172,10 @@ pub struct Slice {
 
 /// What was there, what came back, and what was dropped on the way.
 ///
-/// Every count except [`Self::returned_lines`] describes the **original** output, so that a caller
-/// can size a follow-up request without fetching anything again.
+/// Every count is denominated in the **original** output — its lines, its bytes — even the ones
+/// that measure what came back, so that a caller can size a follow-up request without fetching
+/// anything again. Nothing here measures [`Slice::text`] itself, which is longer than the output
+/// it carries by this module's own markers.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SliceReport {
     /// Bytes of the original output, before any slicing.
@@ -191,6 +193,18 @@ pub struct SliceReport {
     pub returned_lines: usize,
     /// `total_lines - returned_lines`.
     pub dropped_lines: usize,
+    /// Bytes **of the original** present in [`Slice::text`], counting each returned line's
+    /// terminating `\n` exactly as the original spelled it, and counting only the surviving
+    /// fragment of a line the cap cut in half.
+    ///
+    /// Not `text.len()`, and the difference is the point: the returned text also carries this
+    /// module's markers and notice, and it drops the newline the original's last line may have
+    /// had. A caller that subtracted `text.len()` from [`Self::total_bytes`] to size a follow-up
+    /// request would be off by the markers in both directions and would conclude a fully returned
+    /// output still had bytes left to fetch.
+    pub returned_bytes: usize,
+    /// `total_bytes - returned_bytes`. Zero exactly when the original is present in full.
+    pub dropped_bytes: usize,
     /// How many [`gap_marker`] lines were emitted.
     pub gaps: usize,
     /// Whether the byte cap bit, i.e. whether lines chosen by `head`/`tail`/`grep` were then
@@ -221,14 +235,17 @@ impl SliceReport {
     #[must_use]
     pub fn summary(&self) -> String {
         let mut s = format!(
-            "showing {} of {} lines ({} bytes of original output)",
-            self.returned_lines, self.total_lines, self.total_bytes
+            "showing {} of {} lines, {} of {} bytes of the original output",
+            self.returned_lines, self.total_lines, self.returned_bytes, self.total_bytes
         );
         if let Some(matched) = self.matched_lines {
             s.push_str(&format!("; {matched} matched the pattern"));
         }
         if self.dropped_lines > 0 {
-            s.push_str(&format!("; {} lines omitted", self.dropped_lines));
+            s.push_str(&format!(
+                "; {} lines ({} bytes) omitted",
+                self.dropped_lines, self.dropped_bytes
+            ));
         }
         if self.truncated {
             s.push_str("; TRUNCATED at the byte budget");
@@ -350,6 +367,18 @@ impl SlicePlan {
         let (out, truncated, cut_mid_line) = apply_budget(rendered, self.max_bytes, keep_end);
 
         let returned_lines = out.iter().filter(|l| l.origin.is_some()).count();
+        // Each returned line carries the `\n` that terminated it in the original — every line but
+        // possibly the last one has one — so these sum to `text.len()` when nothing was dropped.
+        // A line the cap cut in half is shorter than its original and brings no terminator.
+        let returned_bytes: usize = out
+            .iter()
+            .filter_map(|l| Some((l.origin?, l.text.len())))
+            .map(|(i, len)| {
+                let whole = len == lines[i].len();
+                let terminated = i + 1 < total_lines || text.ends_with('\n');
+                len + usize::from(whole && terminated)
+            })
+            .sum();
         let gaps = out
             .iter()
             .filter(|l| l.origin.is_none() && l.text != TRUNCATION_NOTICE)
@@ -364,6 +393,8 @@ impl SlicePlan {
                 matched_lines,
                 returned_lines,
                 dropped_lines: total_lines - returned_lines,
+                returned_bytes,
+                dropped_bytes: text.len() - returned_bytes,
                 gaps,
                 truncated,
                 cut_mid_line,
@@ -430,6 +461,10 @@ fn ceil_char_boundary(s: &str, at: usize) -> usize {
 ///   [`SliceRequest::max_bytes`];
 /// * lines are dropped whole. A cut lands inside a line only when not even one line fits, since
 ///   that is the only case where a line boundary is not available;
+/// * a line pays for the `\n` that joins it to whatever the output already holds. "Already holds"
+///   is a fact about the output, never about the byte counter: a zero-length line costs zero
+///   bytes, so charging the separator off the counter makes every leading blank line free — and a
+///   log that opens with blank lines then has no budget at all;
 /// * a marker is never emitted partially. Half of `[... 40 lines omitted ...]` is worse than none;
 /// * a cut inside a line lands on a UTF-8 character boundary, so the result is still `&str`-shaped
 ///   and a multi-byte character is never split into mojibake.
@@ -445,15 +480,11 @@ fn apply_budget<'a>(
     }
 
     // Reserve room for the notice, which is emitted inside the budget. When even the notice does
-    // not fit we spend everything on content: the report still tells the truth.
-    let reserve = if TRUNCATION_NOTICE.len() < max_bytes {
-        TRUNCATION_NOTICE.len() + 1
-    } else if TRUNCATION_NOTICE.len() == max_bytes {
-        TRUNCATION_NOTICE.len()
-    } else {
-        0
-    };
-    let content_budget = max_bytes.saturating_sub(reserve);
+    // not fit we spend everything on content: the report still tells the truth. This is a plain
+    // `bool` rather than a reserved-bytes count, because "the reserve is zero" and "there is no
+    // notice" are two different facts that happen to coincide today.
+    let emits_notice = TRUNCATION_NOTICE.len() <= max_bytes;
+    let content_budget = max_bytes - usize::from(emits_notice) * TRUNCATION_NOTICE.len();
 
     let mut kept: Vec<OutLine<'a>> = Vec::new();
     let mut used = 0usize;
@@ -465,7 +496,13 @@ fn apply_budget<'a>(
     };
     for idx in order {
         let line = &lines[idx];
-        let cost = line.text.len() + usize::from(used > 0);
+        // Every line pays for the `\n` that joins it to what is already in the output — an
+        // earlier kept line, or the notice. Only the first line of a notice-less output escapes
+        // it. The predicate has to be "is anything already there", read off the output vector:
+        // charging the separator off `used` instead makes a run of zero-length lines free, since
+        // an empty line never advances the counter, and the cap stops bounding anything.
+        let sep = usize::from(emits_notice || !kept.is_empty());
+        let cost = line.text.len() + sep;
         if used + cost <= content_budget {
             used += cost;
             kept.push(OutLine {
@@ -474,13 +511,18 @@ fn apply_budget<'a>(
             });
             continue;
         }
-        if used == 0 && line.origin.is_some() && content_budget > 0 {
+        if kept.is_empty() && line.origin.is_some() && content_budget > sep {
             // Nothing fits whole, so this is the one case where a line boundary is unavailable.
+            // Guarding on `kept.is_empty()` rather than `used == 0` is the same distinction
+            // again: after a run of free-looking empty lines `used` is still 0, and a `used == 0`
+            // guard would cut a line in half *in the middle of* the output rather than at its
+            // only unavoidable place, the start.
+            let room = content_budget - sep;
             let s = line.text.as_ref();
             let piece = if keep_end {
-                &s[ceil_char_boundary(s, s.len() - content_budget)..]
+                &s[ceil_char_boundary(s, s.len() - room)..]
             } else {
-                &s[..floor_char_boundary(s, content_budget)]
+                &s[..floor_char_boundary(s, room)]
             };
             if !piece.is_empty() {
                 kept.push(OutLine {
@@ -496,7 +538,7 @@ fn apply_budget<'a>(
         kept.reverse();
     }
 
-    if reserve > 0 {
+    if emits_notice {
         let notice = OutLine {
             text: Cow::Borrowed(TRUNCATION_NOTICE),
             origin: None,
@@ -944,50 +986,239 @@ mod tests {
         assert!(!s.report.is_complete());
     }
 
+    /// A zero-length line still costs the `\n` that joins it to its neighbour, and charging the
+    /// separator off a byte counter — which a blank line never advances — makes every leading
+    /// blank line free. A build log that opens with 400 empty lines then busts its budget by the
+    /// whole of its own length, while reporting `dropped_lines: 0`.
+    #[test]
+    fn a_run_of_blank_lines_is_charged_for_the_separators_it_costs() {
+        let text = "\n".repeat(200) + "hello";
+        let s = run(
+            &text,
+            &SliceRequest {
+                max_bytes: Some(100),
+                ..SliceRequest::default()
+            },
+        );
+        assert!(
+            s.text.len() <= 100,
+            "returned {} bytes against a 100-byte cap: {:?}",
+            s.text.len(),
+            s.text
+        );
+        // The other half of the same defect: a slice that busts its budget also claimed to have
+        // dropped nothing, so `truncated` and `dropped_lines` contradicted each other.
+        assert!(s.report.truncated);
+        assert!(s.report.dropped_lines > 0, "{:?}", s.report);
+        assert!(!s.report.is_complete());
+    }
+
+    /// Outputs whose *shape* is what breaks a byte budget, not their size.
+    ///
+    /// The cap defect this sweep exists to catch survived a budget sweep for years of review
+    /// because every fixture line was non-empty and roughly uniform, so no line ever cost zero
+    /// and no arithmetic that confused "nothing kept yet" with "nothing spent yet" could show.
+    fn shapes() -> Vec<(&'static str, String)> {
+        vec![
+            ("uniform", log(60)),
+            ("leading blanks", "\n".repeat(40) + &log(5)),
+            ("trailing blanks", log(5) + &"\n".repeat(40)),
+            (
+                "interior blank run",
+                format!("{}\n{}\n{}", log(3), "\n".repeat(30), log(3)),
+            ),
+            ("all blank", "\n".repeat(60)),
+            ("one empty line", "\n".to_string()),
+            ("single byte lines", "x\n".repeat(60)),
+            (
+                "empty next to very long",
+                format!("\n\n{}\n\n{}\n\n", "L".repeat(500), "M".repeat(500)),
+            ),
+            ("one long line only", "z".repeat(400)),
+            ("multibyte and blank", "\n\néééééééééé\n\né\n".to_string()),
+        ]
+    }
+
+    /// Every combination of the four knobs, so the cap is exercised against selections that are
+    /// contiguous, gapped, reversed, and empty.
+    fn shape_requests(budget: usize) -> Vec<SliceRequest> {
+        let mut out = Vec::new();
+        for head in [None, Some(0), Some(3), Some(25)] {
+            for tail in [None, Some(0), Some(3), Some(25)] {
+                for (grep, context) in [
+                    (None, 0),
+                    (Some("L"), 0),
+                    (Some("^$"), 2),
+                    (Some("nothing matches this"), 1),
+                ] {
+                    out.push(SliceRequest {
+                        head,
+                        tail,
+                        grep: grep.map(str::to_string),
+                        context,
+                        max_bytes: Some(budget),
+                    });
+                }
+            }
+        }
+        out
+    }
+
     /// The markers and the notice are this module's own bytes, and a cap that excluded them would
     /// hand a caller with a 200-byte budget more than 200 bytes — which makes the budget useless
     /// for the one thing it is for: bounding the next request.
+    ///
+    /// Swept across [`shapes`], because the cap is arithmetic over line lengths and the lengths
+    /// that break arithmetic are the degenerate ones: zero, one, and enormous.
     #[test]
     fn the_returned_text_never_exceeds_the_byte_cap_including_its_markers() {
-        let text = log(200);
-        for budget in [0, 1, 5, 39, 40, 41, 60, 100, 250, 1000, 100_000] {
-            for r in [
-                SliceRequest {
-                    max_bytes: Some(budget),
-                    ..SliceRequest::default()
-                },
-                SliceRequest {
-                    head: Some(20),
-                    tail: Some(20),
-                    max_bytes: Some(budget),
-                    ..SliceRequest::default()
-                },
-                SliceRequest {
-                    tail: Some(30),
-                    max_bytes: Some(budget),
-                    ..SliceRequest::default()
-                },
-                SliceRequest {
-                    grep: Some("L1".into()),
-                    context: 2,
-                    max_bytes: Some(budget),
-                    ..SliceRequest::default()
-                },
-            ] {
-                let s = run(&text, &r);
-                assert!(
-                    s.text.len() <= budget,
-                    "budget {budget} exceeded ({}) by {r:?}",
-                    s.text.len()
-                );
-                // A half-written marker is worse than no marker.
-                assert!(
-                    !s.text.contains("[... ") || s.text.contains(" ...]"),
-                    "partial marker at budget {budget}: {:?}",
-                    s.text
-                );
+        // Dense through the notice-length boundary, where the reserve arithmetic changes shape,
+        // then sparse out to budgets no fixture can fill.
+        let budgets: Vec<usize> = (0..=64).chain([100, 250, 600, 2000, 100_000]).collect();
+        for (name, text) in shapes() {
+            for &budget in &budgets {
+                for r in shape_requests(budget) {
+                    let s = run(&text, &r);
+                    assert!(
+                        s.text.len() <= budget,
+                        "{name}: budget {budget} exceeded ({}) by {r:?}",
+                        s.text.len()
+                    );
+                    // A half-written marker is worse than no marker.
+                    assert!(
+                        !s.text.contains("[... ") || s.text.contains(" ...]"),
+                        "{name}: partial marker at budget {budget}: {:?}",
+                        s.text
+                    );
+                    check_report_is_self_consistent(&text, &s, &format!("{name} @ {budget}"), &r);
+                }
             }
         }
+    }
+
+    /// The four fields a caller reads together must never disagree: a slice that busted its budget
+    /// while reporting `dropped_lines: 0` reads as the whole output *and* as a truncated one, and
+    /// a reader believes whichever half suits it.
+    fn check_report_is_self_consistent(original: &str, s: &Slice, at: &str, r: &SliceRequest) {
+        let rep = &s.report;
+        let ctx = || format!("{at} {r:?} => {rep:?} text {:?}", s.text);
+        assert_eq!(rep.total_bytes, original.len(), "{}", ctx());
+        assert!(rep.returned_lines <= rep.total_lines, "{}", ctx());
+        assert_eq!(
+            rep.dropped_lines,
+            rep.total_lines - rep.returned_lines,
+            "{}",
+            ctx()
+        );
+        assert_eq!(
+            rep.dropped_bytes,
+            rep.total_bytes - rep.returned_bytes,
+            "{}",
+            ctx()
+        );
+        assert!(rep.returned_bytes <= rep.total_bytes, "{}", ctx());
+        // A cut inside a line is a truncation; the flags cannot disagree about that.
+        assert!(!rep.cut_mid_line || rep.truncated, "{}", ctx());
+        // `truncated` claims the cap took something. It has to have taken something.
+        assert!(
+            !rep.truncated || rep.dropped_lines > 0 || rep.cut_mid_line,
+            "{}",
+            ctx()
+        );
+        assert_eq!(
+            rep.is_complete(),
+            rep.dropped_bytes == 0,
+            "completeness and the byte accounting disagree: {}",
+            ctx()
+        );
+        // The strongest statement of the module's rule: `complete` means the caller is holding
+        // the original, not merely a slice that lost nothing it happened to count.
+        if rep.is_complete() {
+            assert_eq!(
+                s.text,
+                original.strip_suffix('\n').unwrap_or(original),
+                "{}",
+                ctx()
+            );
+        }
+        // Marker lines are this module's words and must not inflate the line count. Split on
+        // `\n` rather than using `str::lines`, which swallows a trailing empty line — exactly the
+        // line these fixtures exist to exercise.
+        if !s.text.is_empty() {
+            let rows: Vec<&str> = s.text.split('\n').collect();
+            let markers = rows
+                .iter()
+                .filter(|l| l.starts_with("[... ") && l.ends_with(" ...]"))
+                .count();
+            assert_eq!(rows.len(), rep.returned_lines + markers, "{}", ctx());
+        }
+    }
+
+    /// The notice shares `origin: None` with the gap markers and is told apart from them by its
+    /// text, so a notice counted as a gap would report a hole in the output that is not there.
+    #[test]
+    fn the_truncation_notice_is_not_counted_as_a_gap() {
+        for lines in 0..4 {
+            assert_ne!(gap_marker(lines), TRUNCATION_NOTICE);
+        }
+        let s = run(
+            &log(200),
+            &SliceRequest {
+                max_bytes: Some(120),
+                ..SliceRequest::default()
+            },
+        );
+        assert!(s.text.ends_with(TRUNCATION_NOTICE), "{}", s.text);
+        // The kept lines are contiguous from the front, so there is no gap at all.
+        assert_eq!(s.report.gaps, 0, "{:?}", s.report);
+    }
+
+    /// `returned_bytes` is what makes "how many bytes were dropped" answerable without the caller
+    /// re-deriving it from `text.len()`, which counts this module's markers as if they were the
+    /// output's own bytes.
+    #[test]
+    fn returned_bytes_counts_the_original_and_not_the_markers() {
+        let text = "alpha\nbravo\ncharlie\n";
+        let whole = run(text, &req());
+        assert_eq!(whole.report.returned_bytes, text.len());
+        assert_eq!(whole.report.dropped_bytes, 0);
+
+        let head = run(
+            text,
+            &SliceRequest {
+                head: Some(1),
+                ..req()
+            },
+        );
+        // "alpha\n" — the newline that terminated it in the original is part of what came back,
+        // even though `text` has no trailing newline of its own.
+        assert_eq!(head.report.returned_bytes, 6);
+        assert_eq!(head.report.dropped_bytes, text.len() - 6);
+
+        // Markers are not the output's bytes: the gap marker is far longer than the line it
+        // stands in for, and counting `text.len()` would report more bytes returned than exist.
+        let gapped = run(
+            text,
+            &SliceRequest {
+                head: Some(1),
+                tail: Some(1),
+                ..req()
+            },
+        );
+        assert!(gapped.text.len() > gapped.report.returned_bytes);
+        assert_eq!(gapped.report.returned_bytes, 6 + 8);
+
+        // A line cut in half contributes only the bytes that survived, and no terminator.
+        let cut = run(
+            &"q".repeat(500),
+            &SliceRequest {
+                max_bytes: Some(100),
+                ..SliceRequest::default()
+            },
+        );
+        assert!(cut.report.cut_mid_line);
+        assert_eq!(cut.report.returned_bytes, 59);
+        assert_eq!(cut.report.dropped_bytes, 441);
     }
 
     /// A caller that asked for the last 100 lines and got the first 20 of them got the opposite of

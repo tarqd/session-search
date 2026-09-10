@@ -5,8 +5,8 @@ default-off `mcp` cargo feature. Covered by tests: the tool bodies, the slicer a
 ranking as unit tests (`mcp/envelope.rs`, `mcp/tools/*`, `slice.rs`), and `tests/mcp_stdio.rs`,
 which spawns the real binary, speaks `initialize` + `tools/list` to it, and asserts stdout parses
 as JSON-RPC, the server introduces itself by its own name rather than its transport library's,
-every tool has an object-rooted input schema with no required fields and a description on every
-property, both closed vocabularies carry their `enum`, and neither stream carries an escape
+every tool has an object-rooted input schema with a description on every property and no required
+argument but `aggregate`'s `field`, both closed vocabularies carry their `enum`, and neither stream carries an escape
 sequence. **Not** covered: no test drives the schemas with a model on the eval query set,
 so the one acceptance item of #28 that cannot be asserted from inside the process — do these
 descriptions actually route a model to the right tool — is still open. `docs/EVAL.md` has no MCP
@@ -184,11 +184,32 @@ back:** `project` and the time window drop last, because dropping them does not 
 question, it answers a different one. A hit from another repository is not a better answer than
 zero; it is a wrong answer that reads like a right one.
 
+Three rules govern what the retry *does* with that diagnosis, because the message is prose a model
+may skim and the retry is an object it will send unread — where the two disagree, the retry wins in
+practice. **A contradiction drops the exclusion, not the intent:** `agent_type` lives only on
+sidechain documents and `no_sidechains` deletes every one of them, so the flag goes and the value
+stays. **A mis-spelled exact-match value is corrected, not deleted:** `program: ["Cargo"]` retries
+as `["cargo"]`, because dropping the filter answers a much wider question — everything mentioning
+the query — and reads as an answer to the one that was asked. **A negated query term is never
+handed back:** a query carrying a `-flag` retries as the whole query quoted, which is the repair
+the message itself recommends.
+
 The ranking is a total function of the request and never probes the index — a ranking that ran a
-second query for every zero would still be a guess, and would cost a second pass to make it. It
-lives in one module with four callers, for the same reason `sessions.rs` was extracted: four
-copies would disagree about which filter is narrowest, and the disagreement would be invisible
-from any one of them.
+second query for every zero would still be a guess, and would cost a second pass to make it. The
+corrections above keep that promise: each candidate is derived from the value the caller sent
+(case-folded, cut at its first word, or respelled against the capitalised tool vocabulary), never
+from a lookup, and a correction that is itself wrong costs one extra call — the next pass finds
+nothing left to repair and drops the filter. It lives in one module with four callers, for the
+same reason `sessions.rs` was extracted: four copies would disagree about which filter is
+narrowest, and the disagreement would be invisible from any one of them.
+
+An argument no tool defines is the one caller mistake a description cannot cover, so it is caught
+rather than described. `#[serde(deny_unknown_fields)]` is incompatible with the `#[serde(flatten)]`
+every request uses for `Filters`, so each request carries a second flattened field — a map — that
+takes whatever the named fields did not, and the router turns each leftover key into a warning
+naming the closest argument that does exist (`tool_name` → `tool`, `sinceX` → `since`). Before it,
+a misspelled filter came back as the whole corpus with `applied_filters: []` and nothing to
+suggest the filter had never been applied.
 
 The other half of the same argument is `SearchResponse::warnings`. Three outcomes of this index
 look exactly like an empty corpus from outside — a `word:value` term whose root is not a schema

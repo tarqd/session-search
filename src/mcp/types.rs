@@ -23,6 +23,7 @@
 
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
+use serde_json::{Map, Value};
 
 use crate::search::{FacetResult, Filters, SnippetSource, SortBy};
 
@@ -77,14 +78,20 @@ pub struct NoResults {
     /// Why this filter and not another — the mechanism that makes it the narrowest, in one
     /// sentence.
     pub why: Option<String>,
-    /// What to do with it: `drop` to widen, or `fix` when the value is provably outside a
-    /// closed vocabulary and the legal set is known.
+    /// What to do with it: `drop` to widen, or `fix` when the value could not have matched —
+    /// either it is outside a closed vocabulary, or it is an exact-match value spelled a way
+    /// the corpus never writes (`Cargo`, `cargo build`, `bash`).
     pub action: RetryAction,
-    /// The legal values, when `action` is `fix`. Empty otherwise.
+    /// The legal values, when `action` is `fix` over a closed vocabulary. Empty when the fix is
+    /// a spelling repair over an open one, where there is a correction to send but no set to
+    /// enumerate — `aggregate` on that field returns what the corpus actually holds.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub legal_values: Vec<String>,
-    /// A ready-to-send arguments object for the same tool, with the narrowest filter dropped
-    /// (or corrected). Send it as-is before rewriting the query.
+    /// A ready-to-send arguments object for the same tool, with one filter dropped or its value
+    /// corrected. Send it as-is before rewriting the query. It never contradicts `message`: a
+    /// value the message calls mis-spelled comes back corrected rather than deleted, a query
+    /// term the message calls a negation is never handed back as the term to keep, and where
+    /// two filters contradict each other the retry keeps the one carrying a value.
     pub retry: serde_json::Value,
 }
 
@@ -94,8 +101,9 @@ pub struct NoResults {
 pub enum RetryAction {
     /// Widen: send the retry without that filter.
     Drop,
-    /// The value is outside a closed vocabulary and could never have matched. The retry carries
-    /// a legal value in its place.
+    /// The value could never have matched, and the retry carries a corrected one in its place:
+    /// a legal value where the vocabulary is closed, or the same value respelled the way the
+    /// corpus writes it where it is open.
     Fix,
     /// No filter was set. The query itself matched nothing, and the retry narrows it to its
     /// most distinctive term.
@@ -119,10 +127,114 @@ pub struct Envelope {
     /// short, a filter a session listing cannot answer. Prose, meant to be read.
     #[serde(default)]
     pub warnings: Vec<String>,
-    /// Present exactly when the answer is empty. Never a bare zero.
+    /// Present exactly when the MATCH SET is empty — nothing matched this query and these
+    /// filters at all. Never a bare zero.
+    ///
+    /// An empty PAGE over a non-empty match set is a different thing and is not explained here:
+    /// paging past the last result with `offset` returns `returned: 0`, no `no_results`, and a
+    /// `warning` saying how many documents matched and that the offset is past them. Nothing
+    /// about that request was wrong, and "drop your narrowest filter" would be false advice —
+    /// check `offset` before rewriting anything.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub no_results: Option<NoResults>,
 }
+
+/// Arguments a request carried that its tool does not define.
+///
+/// `#[serde(deny_unknown_fields)]` is not available here: it is incompatible with
+/// `#[serde(flatten)]`, and every request flattens [`Filters`]. So the unrecognised keys are
+/// *captured* instead, by a second flattened field placed after that one — serde offers each
+/// flattened field the keys no named field claimed, in order, and a map takes what is left. The
+/// alternative was silence, and silence is the one failure a description cannot cover: a caller
+/// who writes `tool_name` for `tool` gets the whole corpus back with `applied_filters: []` and
+/// no reason to doubt it.
+///
+/// Serialised back out by `#[serde(flatten)]`, which is what makes a request round-trip; the
+/// schema hides it, because it is not an argument anyone should send on purpose.
+pub type UnknownArgs = Map<String, Value>;
+
+/// One warning per argument the tool does not define, naming the closest one it does.
+///
+/// The accepted names come from serialising `T::default()` rather than from a list kept here:
+/// `Filters` has no `skip_serializing_if`, so a round-trip emits all eighteen filter names plus
+/// the request's own, which is exactly the set a client may send. A list would drift from the
+/// structs the first time a filter was added.
+///
+/// The suggestion is deliberately narrow — an exact match ignoring case and punctuation, or the
+/// longest accepted name one of the two is a prefix of. `tool_name` finds `tool` and `sinceX`
+/// finds `since`, which are the two spellings the surface actually invites; anything less
+/// obvious is reported without a guess, because a wrong "did you mean" is worse than none.
+pub fn unknown_key_warnings<T: Default + Serialize>(unknown: &UnknownArgs) -> Vec<String> {
+    if unknown.is_empty() {
+        return Vec::new();
+    }
+    let accepted: Vec<String> = match serde_json::to_value(T::default()) {
+        Ok(Value::Object(map)) => map.keys().cloned().collect(),
+        _ => Vec::new(),
+    };
+    unknown
+        .keys()
+        .map(|key| match nearest_argument(key, &accepted) {
+            Some(name) => format!(
+                "ignored unknown argument {key:?}: nothing was filtered by it, so this answer is \
+                 wider than the one you asked for. Did you mean {name:?}?"
+            ),
+            None => format!(
+                "ignored unknown argument {key:?}: nothing was filtered by it, so this answer is \
+                 wider than the one you asked for"
+            ),
+        })
+        .collect()
+}
+
+fn nearest_argument<'a>(key: &str, accepted: &'a [String]) -> Option<&'a str> {
+    let squash = |s: &str| {
+        s.chars()
+            .filter(|c| c.is_alphanumeric())
+            .flat_map(char::to_lowercase)
+            .collect::<String>()
+    };
+    let want = squash(key);
+    if let Some(exact) = accepted.iter().find(|name| squash(name) == want) {
+        return Some(exact.as_str());
+    }
+    accepted
+        .iter()
+        .filter(|name| {
+            let name = squash(name);
+            name.len() > 2 && (want.starts_with(&name) || name.starts_with(&want))
+        })
+        .max_by_key(|name| name.len())
+        .map(String::as_str)
+}
+
+/// A response carrying an [`Envelope`], so the router can add to it what only the router knows.
+///
+/// The unrecognised arguments are a fact about the *request*, which the tool bodies never see —
+/// they receive a typed struct with the unknown keys already set aside. One trait rather than
+/// five copies of the same two lines, and it is what keeps the warning on every tool instead of
+/// on whichever ones somebody remembered.
+pub trait Enveloped {
+    fn envelope_mut(&mut self) -> &mut Envelope;
+}
+
+macro_rules! enveloped {
+    ($($ty:ty),+ $(,)?) => {
+        $(impl Enveloped for $ty {
+            fn envelope_mut(&mut self) -> &mut Envelope {
+                &mut self.envelope
+            }
+        })+
+    };
+}
+
+enveloped!(
+    SearchTurnsResponse,
+    GetTurnResponse,
+    GetOutputResponse,
+    SearchSessionsResponse,
+    AggregateResponse,
+);
 
 /// The corpus, as the server reports it in `instructions` and in a no-filter zero.
 #[derive(Debug, Clone, Default)]
@@ -240,6 +352,11 @@ pub struct SearchTurnsRequest {
     /// Characters of snippet around the match. The skeleton is the body of the answer; this is
     /// the one highlighted fragment beside it.
     pub snippet_chars: usize,
+    /// Arguments this tool does not define, captured so they can be reported rather than
+    /// silently dropped. See [`UnknownArgs`]. Never send this; it has no schema.
+    #[serde(flatten)]
+    #[schemars(skip)]
+    pub unknown: UnknownArgs,
 }
 
 impl Default for SearchTurnsRequest {
@@ -252,6 +369,7 @@ impl Default for SearchTurnsRequest {
             sort: SortBy::default(),
             include_thinking: false,
             snippet_chars: DEFAULT_SNIPPET_CHARS,
+            unknown: UnknownArgs::new(),
         }
     }
 }
@@ -333,6 +451,11 @@ pub struct GetTurnRequest {
     /// Per-document byte budget for tool results. A result longer than this is cut and marked;
     /// `get_output` is the way to read one in full.
     pub max_doc_bytes: usize,
+    /// Arguments this tool does not define, captured so they can be reported rather than
+    /// silently dropped. See [`UnknownArgs`]. Never send this; it has no schema.
+    #[serde(flatten)]
+    #[schemars(skip)]
+    pub unknown: UnknownArgs,
 }
 
 impl Default for GetTurnRequest {
@@ -345,6 +468,7 @@ impl Default for GetTurnRequest {
             after: 0,
             max_docs: DEFAULT_TURN_DOCS,
             max_doc_bytes: DEFAULT_DOC_BYTES,
+            unknown: UnknownArgs::new(),
         }
     }
 }
@@ -435,13 +559,23 @@ grep never reads as a complete one.")]
     /// Byte budget for the returned slice. The slice is cut to fit and the response reports what
     /// was dropped.
     #[schemars(description = "\
-Hard cap on the bytes returned, applied last, after `head`/`tail`/`grep` have chosen the lines. \
-Exists because tool outputs are unbounded in practice — a 200 KB build log is ordinary and \
-spilled results can be larger — and an unbudgeted fetch spends a context window on progress \
-bars. When the cap bites, the slice is cut at a line boundary and the response says how many \
-bytes and lines were dropped. Prefer narrowing with `head`, `tail` or `grep` over raising this: \
-a bigger budget returns more of the same noise, a better slice returns the answer.")]
+Hard cap on the bytes returned, applied last, after `head`/`tail`/`grep` have chosen the lines, \
+and counting the omission markers as well as the output's own bytes. Exists because tool outputs \
+are unbounded in practice — a 200 KB build log is ordinary and spilled results can be larger — \
+and an unbudgeted fetch spends a context window on progress bars. When the cap bites, whole \
+lines are dropped from the end of the selection (from the start, for a `tail`-only request), \
+`truncated` is set, and `dropped_lines` and `dropped_bytes` say how much of the original did not \
+come back. One case has no line boundary to cut at — a single line longer than the whole budget \
+— and there the slice ends mid-line with `cut_mid_line` set, which is the signal not to parse \
+its tail as a whole path or a whole JSON object. Prefer narrowing with `head`, `tail` or `grep` \
+over raising this: a bigger budget returns more of the same noise, a better slice returns the \
+answer.")]
     pub max_bytes: Option<usize>,
+    /// Arguments this tool does not define, captured so they can be reported rather than
+    /// silently dropped. See [`UnknownArgs`]. Never send this; it has no schema.
+    #[serde(flatten)]
+    #[schemars(skip)]
+    pub unknown: UnknownArgs,
 }
 
 /// Whether there is an output at all, and why not when there is not.
@@ -488,6 +622,13 @@ pub struct GetOutputResponse {
     pub returned_lines: usize,
     /// `total_lines - returned_lines`.
     pub dropped_lines: usize,
+    /// Bytes of the original present in `output`, counting each returned line's terminating
+    /// newline. Not `output.len()`: the returned text also carries the omission markers, so a
+    /// caller subtracting that from `total_bytes` is wrong in both directions.
+    pub returned_bytes: usize,
+    /// `total_bytes - returned_bytes`. Zero exactly when `complete` is true, so this is the
+    /// number to quote when saying how much of the output you did not read.
+    pub dropped_bytes: usize,
     /// Whether the byte cap bit.
     pub truncated: bool,
     /// Whether the cap cut inside a line rather than between two. A slice that ends mid-token
@@ -510,6 +651,11 @@ pub struct SearchSessionsRequest {
     pub filters: Filters,
     /// How many sessions to return, most recent last-activity first.
     pub limit: usize,
+    /// Arguments this tool does not define, captured so they can be reported rather than
+    /// silently dropped. See [`UnknownArgs`]. Never send this; it has no schema.
+    #[serde(flatten)]
+    #[schemars(skip)]
+    pub unknown: UnknownArgs,
 }
 
 impl Default for SearchSessionsRequest {
@@ -517,6 +663,7 @@ impl Default for SearchSessionsRequest {
         SearchSessionsRequest {
             filters: Filters::default(),
             limit: DEFAULT_SESSION_LIMIT,
+            unknown: UnknownArgs::new(),
         }
     }
 }
@@ -567,15 +714,19 @@ pub struct SessionRow {
 // aggregate
 // ---------------------------------------------------------------------------
 
+/// `field` is the one argument in this server with no default, and it is declared that way
+/// rather than defaulted to `""`: a schema that emits `"default": ""` and no `required` array
+/// lets a validating client send a call the server can only refuse, and the refusal it gets back
+/// (`unknown field ""`) describes a field nobody wrote. Every other argument keeps its default,
+/// so this is the only struct whose defaults are per-field.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
-#[serde(default)]
 pub struct AggregateRequest {
     /// Field to count. A declared fast field, or any JSON path such as `tool_input.file_path` or
     /// `bash_cmd.program`.
     #[schemars(description = "\
-The field whose values are counted. Required — there is no default worth having, and omitting \
-it is rejected as `unknown field \"\"` rather than counting something arbitrary. Two kinds are \
-accepted.
+The field whose values are counted. Required, and declared required: there is no default worth \
+having, so a call without it is refused rather than answered about something arbitrary. Two \
+kinds are accepted.
 
 Declared fast fields — the ones the schema names:
   `tool_name`   which tools were used
@@ -611,6 +762,7 @@ you the right answer.")]
     pub field: String,
     /// Restrict the counted set to documents matching this free-text query. Same grammar as
     /// `search_turns`. Omit it to count across everything the filters keep.
+    #[serde(default)]
     pub query: Option<String>,
     #[serde(flatten)]
     pub filters: Filters,
@@ -620,9 +772,16 @@ you the right answer.")]
     /// `other_docs: 0` narrowly: it means no value was truncated away, NOT that every matching
     /// document is in a bucket. Documents carrying no value for this field at all are in
     /// neither, and `matching_docs` minus `docs_with_value` is how many.
+    #[serde(default = "default_facet_top")]
     pub top: usize,
     /// Also search assistant thinking blocks when applying `query`.
+    #[serde(default)]
     pub include_thinking: bool,
+    /// Arguments this tool does not define, captured so they can be reported rather than
+    /// silently dropped. See [`UnknownArgs`]. Never send this; it has no schema.
+    #[serde(flatten)]
+    #[schemars(skip)]
+    pub unknown: UnknownArgs,
 }
 
 impl Default for AggregateRequest {
@@ -633,12 +792,18 @@ impl Default for AggregateRequest {
             filters: Filters::default(),
             top: DEFAULT_FACET_TOP,
             include_thinking: false,
+            unknown: UnknownArgs::new(),
         }
     }
 }
 
 /// Buckets returned when the caller does not say.
 pub const DEFAULT_FACET_TOP: usize = 20;
+
+/// `top`'s default, spelled as a function because [`AggregateRequest`] defaults per field.
+fn default_facet_top() -> usize {
+    DEFAULT_FACET_TOP
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct AggregateResponse {
@@ -653,4 +818,123 @@ pub struct AggregateResponse {
     pub hidden_values: Option<u64>,
     pub elapsed_ms: u64,
     pub envelope: Envelope,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The measured call: `tool_name` is a plausible spelling of `tool` — `aggregate`'s own field
+    /// vocabulary uses it — and `sinceX` is a typo of `since`. Before the catch-all both were
+    /// dropped in silence and the answer came back over the whole corpus with
+    /// `applied_filters: []`, which reads as "nothing matched your filters" rather than "your
+    /// filters were never applied".
+    #[test]
+    fn an_unknown_argument_is_captured_and_named_rather_than_silently_ignored() {
+        let req: SearchTurnsRequest = serde_json::from_str(
+            r#"{"query":"indexer","tool_name":["Bash"],"sinceX":"7d","limit":2}"#,
+        )
+        .expect("an unknown key must not fail the call: the tool can still answer it");
+
+        // The known arguments still land where they belong — a catch-all that swallowed
+        // `limit` too would be a worse bug than the one it fixes.
+        assert_eq!(req.query.as_deref(), Some("indexer"));
+        assert_eq!(req.limit, 2);
+        assert!(req.filters.tool.is_empty());
+        assert_eq!(
+            req.unknown.keys().collect::<Vec<_>>(),
+            vec!["sinceX", "tool_name"]
+        );
+
+        let warnings = unknown_key_warnings::<SearchTurnsRequest>(&req.unknown);
+        assert_eq!(warnings.len(), 2, "{warnings:?}");
+        assert!(
+            warnings
+                .iter()
+                .any(|w| w.contains(r#""tool_name""#) && w.contains(r#"Did you mean "tool"?"#)),
+            "{warnings:?}"
+        );
+        assert!(
+            warnings
+                .iter()
+                .any(|w| w.contains(r#""sinceX""#) && w.contains(r#"Did you mean "since"?"#)),
+            "{warnings:?}"
+        );
+    }
+
+    #[test]
+    fn a_request_with_nothing_unknown_carries_no_warnings_and_round_trips() {
+        let req: SearchTurnsRequest =
+            serde_json::from_str(r#"{"query":"indexer","tool":["Bash"],"since":"7d"}"#)
+                .expect("a well-formed call");
+        assert!(req.unknown.is_empty());
+        assert!(unknown_key_warnings::<SearchTurnsRequest>(&req.unknown).is_empty());
+        // The catch-all is flattened on the way out too, so an empty one adds no key.
+        let back = serde_json::to_value(&req).expect("serialises");
+        assert!(back.get("unknown").is_none(), "{back}");
+    }
+
+    /// An argument nobody could have meant is still reported, and without a guess: a wrong
+    /// "did you mean" sends the caller to a filter they did not ask for.
+    #[test]
+    fn an_unrecognisable_argument_is_reported_without_inventing_a_suggestion() {
+        let unknown: UnknownArgs = serde_json::from_str(r#"{"zzz":1}"#).expect("an object");
+        let warnings = unknown_key_warnings::<SearchSessionsRequest>(&unknown);
+        assert_eq!(warnings.len(), 1);
+        assert!(warnings[0].contains(r#""zzz""#), "{warnings:?}");
+        assert!(!warnings[0].contains("Did you mean"), "{warnings:?}");
+    }
+
+    /// The schema is what a validating client enforces, so `field` has to be required *there*,
+    /// not only in the prose. It emitted `"default": ""` and no `required`, which let a call
+    /// through that the server could only refuse.
+    #[test]
+    fn the_aggregate_schema_declares_its_one_required_argument() {
+        let schema = serde_json::to_value(schemars::schema_for!(AggregateRequest)).expect("JSON");
+        assert_eq!(schema["required"], serde_json::json!(["field"]), "{schema}");
+        assert!(
+            schema["properties"]["field"].get("default").is_none(),
+            "a required argument must not also carry a default: {schema}"
+        );
+        // And the same is true of deserialization, which is where a non-validating client finds
+        // out: a call without `field` is refused before the index is touched.
+        let err = serde_json::from_str::<AggregateRequest>(r#"{"top":5}"#)
+            .expect_err("a call with no field is not a request");
+        assert!(err.to_string().contains("field"), "{err}");
+    }
+
+    /// The other three tools take no required argument, and must not start: `{"query":"SIGBUS"}`
+    /// is a valid `search_turns` call and the schema has to keep saying so.
+    #[test]
+    fn no_other_tool_demands_an_argument() {
+        for schema in [
+            serde_json::to_value(schemars::schema_for!(SearchTurnsRequest)).expect("JSON"),
+            serde_json::to_value(schemars::schema_for!(GetTurnRequest)).expect("JSON"),
+            serde_json::to_value(schemars::schema_for!(GetOutputRequest)).expect("JSON"),
+            serde_json::to_value(schemars::schema_for!(SearchSessionsRequest)).expect("JSON"),
+        ] {
+            assert!(schema.get("required").is_none(), "{schema}");
+            // The catch-all is machinery, not an argument: a model that saw it in the schema
+            // would have a documented place to put the arguments it invented.
+            assert!(
+                schema["properties"].get("unknown").is_none(),
+                "the catch-all leaked into the schema: {schema}"
+            );
+        }
+    }
+
+    /// `no_results` is documented on the wire, and the description is the whole contract for a
+    /// caller that never reads this file. It promised "exactly when the answer is empty", which
+    /// is false for a page past the end of a non-empty match set — deliberately, since nothing
+    /// about that request was wrong and any filter advice would be false.
+    #[test]
+    fn the_envelope_schema_promises_no_results_only_for_an_empty_match_set() {
+        let schema = serde_json::to_value(schemars::schema_for!(Envelope)).expect("JSON");
+        let described = schema["properties"]["no_results"]["description"]
+            .as_str()
+            .expect("no_results is described")
+            .to_string();
+        assert!(described.contains("MATCH SET"), "{described}");
+        assert!(described.contains("offset"), "{described}");
+    }
 }
