@@ -95,6 +95,7 @@ intended: facets show whole commands/paths, search matches words inside them.
 src/
   lib.rs         re-exports; `pub mod` declarations only
   model.rs       raw serde types for transcript records          [Foundation]
+  media.rs       describe binary payloads, never index them       [Foundation]
   discovery.rs   locate roots, enumerate transcripts + sidechains [Foundation]
   parse.rs       records -> Vec<Doc>                              [Foundation]
   schema.rs      Tantivy schema + Fields handle                   [Foundation]
@@ -189,7 +190,7 @@ pub struct Doc {
     pub slug: Option<String>,
     pub text: String,            // the indexed body
     pub thinking: Option<String>,// stored, indexed only with include_thinking
-    pub raw: String,             // original JSONL line
+    pub raw: String,             // the JSONL line, minus any base64 payload (`media::scrub`)
 }
 
 #[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
@@ -314,6 +315,27 @@ Field names and options:
 | `seq` | `U64 \| STORED \| FAST \| INDEXED` |
 | `is_error`, `is_sidechain`, `is_meta` | `U64 \| FAST \| INDEXED \| STORED` (0/1) — STORED because `search::doc_from_stored` reads them back out of the stored payload |
 | `raw` | `STORED` only |
+
+### Images are described, never indexed
+
+A pasted screenshot, a `Read` of a PNG and a `Bash` command with `isImage` all put base64 in
+the same fields prose lives in — ~300 KB per phone photo. None of it is text: it matches no
+query, it dilutes term statistics, and it costs its own size again in the index. `media.rs`
+replaces every payload with a placeholder describing it — `[image/jpeg 230 KiB]` — which
+tokenizes into terms someone would actually search, while the path stays where it always was,
+on the tool call. Two layers, because the transcript format is open:
+
+1. `describe_block` / `describe_payload` recognise today's shapes and render the placeholder
+   from the metadata beside the bytes.
+2. `scrub` / `redacted` recognise a base64 blob *by looking at it* — an unbroken run of ≥512
+   `[A-Za-z0-9+/=]` carrying both cases and a digit — wherever it turns up. `parse::build_doc`
+   runs it over `text`, `tool_output` and `thinking`, so the guarantee holds at one point
+   rather than shape by shape; the earlier passes exist so the byte budget is spent on text.
+
+`raw` is scrubbed too. It is stored, never indexed and never returned, so a payload there is
+pure weight — it inflates the index by the size of the transcript's images and can push a
+pending tool call past `PENDING_DOC_CAP`. The elision is lexical and a base64 run cannot span
+a quote or a brace, so the line stays valid JSON and every other byte of it survives.
 
 `index.rs`:
 

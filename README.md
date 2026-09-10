@@ -297,6 +297,26 @@ session-search show b20208d8 --limit 1
 
 Raise `--limit` to replay more of it; `show <ID> --around <SEQ|UUID>` prints a window instead.
 
+### Images are described, not indexed
+
+Transcripts carry images inline, in the same fields prose lives in: a pasted screenshot is
+~300 KB of base64 on the line next to the sentence about it, a `Read` of a PNG comes back as
+base64, and a `Bash` command can put image bytes straight on `stdout`. None of it is text — it
+matches no query anyone would type, it dilutes the term statistics that rank the documents that
+*are* text, and it costs its own size again in the index.
+
+So the payload never reaches the index and a description of it does:
+
+```
+#0     01:20:33  user
+      [image/jpeg 230 KiB]
+      Attached a picture so it’d be in the session
+```
+
+The media type and size stay searchable (`session-search search 'image/jpeg'`), the file path
+stays where it always was — on the tool call, in `tool_input.file_path` — and the bytes are
+gone. On one session with a single pasted photo the index went from 720 KB to 420 KB.
+
 ---
 
 ## Facets: aggregation over tool parameters

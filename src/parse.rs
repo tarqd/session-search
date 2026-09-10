@@ -24,9 +24,10 @@ use std::path::{Path, PathBuf};
 
 use serde_json::Value;
 
+use crate::media;
 use crate::model::{
-    AssistantRecord, Attachment, AttachmentRecord, ContentBlock, MessageContent, ParsedLine,
-    Record, SystemRecord, ToolUseBlock, UserRecord, clean_line, parse_line,
+    AssistantRecord, Attachment, AttachmentRecord, ContentBlock, MediaBlock, MessageContent,
+    ParsedLine, Record, SystemRecord, ToolUseBlock, UserRecord, clean_line, parse_line,
 };
 
 // ---------------------------------------------------------------------------
@@ -610,6 +611,13 @@ impl<'a> Parser<'a> {
     fn observe_results(&mut self, u: &UserRecord) {
         let rich = u.tool_use_result.as_ref();
         let rich_text = rich.map(|v| self.result_text(v)).unwrap_or_default();
+        // When the rich payload is bytes rather than text, its description *is* the result:
+        // the `tool_result` block beside it is the same bytes in the API's own wrapping, and
+        // when `Bash` sets `isImage` that wrapping is a bare string of them, which reads as
+        // ordinary output and would otherwise be indexed as one.
+        let rich_media = rich
+            .and_then(Value::as_object)
+            .is_some_and(|o| media::describe_payload(o).is_some());
         let rich_error = rich.is_some_and(is_error_payload) || u.tool_denial_kind.is_some();
 
         let mut matched = false;
@@ -621,7 +629,11 @@ impl<'a> Parser<'a> {
                 let Some(id) = tr.tool_use_id.clone() else {
                     continue;
                 };
-                let mut text = content_text(&tr.content);
+                let mut text = if rich_media {
+                    rich_text.clone()
+                } else {
+                    content_text(&tr.content)
+                };
                 if text.trim().is_empty() {
                     text = rich_text.clone();
                 }
@@ -706,11 +718,16 @@ impl<'a> Parser<'a> {
     fn result_text(&self, v: &Value) -> String {
         let cap = self.opts.max_text_bytes;
         if let Some(s) = v.as_str() {
-            return truncate(s, cap);
+            return truncate(&media::scrub(s), cap);
         }
         let Some(obj) = v.as_object() else {
-            return truncate(&v.to_string(), cap);
+            return truncate(&media::scrub(&v.to_string()), cap);
         };
+        // A result that is bytes rather than text — a `Read` of an image, a rendered PDF, a
+        // `Bash` command whose stdout is image data — indexes what it was, not what it held.
+        if let Some(desc) = media::describe_payload(obj) {
+            return truncate(&desc, cap);
+        }
         let mut parts: Vec<String> = Vec::new();
         let push = |parts: &mut Vec<String>, s: &str| {
             if !s.trim().is_empty() {
@@ -744,8 +761,9 @@ impl<'a> Parser<'a> {
             push(&mut parts, &joined);
         }
         if parts.is_empty() {
-            // Unknown tool shape: keep the JSON, capped. Still searchable.
-            return truncate(&v.to_string(), cap);
+            // Unknown tool shape: keep the JSON, capped. Still searchable — minus any blob in
+            // it, which never was.
+            return truncate(&media::scrub(&v.to_string()), cap);
         }
         truncate(&parts.join("\n"), cap)
     }
@@ -977,6 +995,12 @@ impl<'a> Parser<'a> {
                                 texts.push(s.to_string());
                             }
                         }
+                        // A pasted screenshot is part of the turn even though none of it is
+                        // text: the description stands in for it, so the message is counted,
+                        // its prose is indexed beside it, and "what was that image" is a
+                        // query that can hit.
+                        ContentBlock::Image(m) => texts.push(media_text(m, "image")),
+                        ContentBlock::Document(m) => texts.push(media_text(m, "document")),
                         ContentBlock::ToolResult(tr) => {
                             // Orphaned result: the `tool_use` never appeared in this file, so
                             // nothing else will carry it.
@@ -1037,6 +1061,7 @@ impl<'a> Parser<'a> {
     }
 
     fn note_first_prompt(&mut self, u: &UserRecord, text: &str) {
+        let text = &*media::scrub(text);
         if self.session.first_prompt.is_none() && u.is_human_turn() {
             self.session.first_prompt = Some(truncate_chars(text, FIRST_PROMPT_CHARS));
         }
@@ -1176,7 +1201,8 @@ impl<'a> Parser<'a> {
         PartialDoc::tool_call(
             tu.name.clone(),
             tu.id.clone(),
-            tu.input.clone(),
+            // `tool_input` is indexed, not just stored, so a blob in it would become a term.
+            tu.input.as_ref().map(media::redacted),
             body,
             outcome.is_error,
         )
@@ -1299,11 +1325,20 @@ impl<'a> Parser<'a> {
             slug: common
                 .and_then(|c| c.slug.clone())
                 .or_else(|| self.session.slug.clone()),
-            text: p.text,
-            tool_output: p.tool_output,
-            thinking: p.thinking,
+            // Every indexed body passes through here, so this is where "no payload is ever a
+            // term" is *guaranteed* rather than argued shape by shape. The descriptions the
+            // parser built above survive it untouched; anything a future transcript smuggles
+            // past them does not.
+            text: media::scrub(&p.text).into_owned(),
+            tool_output: p.tool_output.map(|t| media::scrub(&t).into_owned()),
+            thinking: p.thinking.map(|t| media::scrub(&t).into_owned()),
             thinking_tokens: p.thinking_tokens,
-            raw: raw.to_string(),
+            // `raw` is stored, never indexed and never returned (`format`, `docs/MCP.md`), so
+            // a 300 KiB pasted photo here is pure weight: it inflates the index by the size of
+            // the transcript's images and can push a pending tool call past `PENDING_DOC_CAP`,
+            // losing the carry. The elision is lexical, so everything that is not an encoded
+            // payload survives byte for byte.
+            raw: media::scrub(raw).into_owned(),
         }
     }
 }
@@ -1466,19 +1501,29 @@ fn tool_use_block(block: &ContentBlock) -> Option<&ToolUseBlock> {
 /// Plain text of a `String | Array<block>` content.
 fn content_text(content: &MessageContent) -> String {
     match content {
-        MessageContent::Text(s) => s.clone(),
+        MessageContent::Text(s) => media::scrub(s).into_owned(),
         MessageContent::Blocks(blocks) => blocks
             .iter()
             .filter_map(|b| match b {
                 ContentBlock::Text(t) => t.text.clone(),
                 ContentBlock::Thinking(t) => t.thinking.clone(),
+                ContentBlock::Image(m) => Some(media_text(m, "image")),
+                ContentBlock::Document(m) => Some(media_text(m, "document")),
                 _ => None,
             })
             .collect::<Vec<_>>()
             .join("\n"),
         MessageContent::Other(v) if v.is_null() => String::new(),
-        MessageContent::Other(v) => v.to_string(),
+        // An unmodelled content shape is kept as JSON so it stays searchable; blobs inside it
+        // are not text and never were.
+        MessageContent::Other(v) => media::scrub(&v.to_string()).into_owned(),
     }
+}
+
+/// The one line an `image` / `document` block contributes to an indexed body: what it was, how
+/// big, and where it came from — never the bytes. See `crate::media`.
+fn media_text(m: &MediaBlock, kind: &str) -> String {
+    media::describe_block(kind, m.source.as_ref(), &m.extra)
 }
 
 fn attachment_text(rec: &AttachmentRecord, att: &Attachment, cap: usize) -> String {
@@ -1511,7 +1556,9 @@ fn collect_strings(v: &Value, depth: usize, out: &mut Vec<String>) {
         return;
     }
     match v {
-        Value::String(s) if !s.is_empty() => out.push(s.clone()),
+        // Wherever a leaf turns out to be an encoded payload — an MCP tool's `data`, an
+        // attachment nobody modelled — the description goes in and the bytes do not.
+        Value::String(s) if !s.is_empty() => out.push(media::scrub(s).into_owned()),
         Value::Array(items) => items
             .iter()
             .for_each(|i| collect_strings(i, depth + 1, out)),
@@ -1611,6 +1658,130 @@ mod tests {
     /// two fields a tool call happened to put it in.
     fn body_of(d: &Doc) -> String {
         format!("{}{}", d.text, d.tool_output.as_deref().unwrap_or(""))
+    }
+
+    /// The reason `crate::media` exists: a phone photo pasted into a prompt is ~300 KB of
+    /// base64 on the same line as the sentence about it. The sentence is the document; the
+    /// bytes are not, and the description is what stands in for them.
+    #[test]
+    fn a_pasted_image_indexes_a_description_beside_the_prose_never_the_bytes() {
+        let (out, _) = parse("images.jsonl");
+        let prompt = out
+            .docs
+            .iter()
+            .find(|d| d.role == "user" && d.kind == DocKind::Message)
+            .expect("the human turn is a document");
+
+        assert_eq!(
+            prompt.text,
+            "[image/jpeg 22 KiB]\nAttached a picture so it'd be in the session"
+        );
+        assert_eq!(
+            out.session.messages, 1,
+            "an image-bearing turn is still one turn"
+        );
+        assert_eq!(
+            out.session.first_prompt.as_deref(),
+            Some("[image/jpeg 22 KiB]\nAttached a picture so it'd be in the session"),
+        );
+    }
+
+    /// `Read` of a PNG: the path is on the call and the payload is on the result. Keeping the
+    /// first and dropping the second is the whole of "paths are fine, bytes are not".
+    #[test]
+    fn an_image_result_keeps_the_path_from_the_call_and_describes_the_payload() {
+        let (out, _) = parse("images.jsonl");
+        let read = out
+            .docs
+            .iter()
+            .find(|d| d.tool_name.as_deref() == Some("Read"))
+            .expect("the Read call is a document");
+
+        assert!(
+            read.text.contains("/home/user/shots/joel-watch.png"),
+            "the path is the searchable fact: {}",
+            read.text
+        );
+        assert_eq!(read.tool_output.as_deref(), Some("[image/png 15 KiB]"));
+    }
+
+    /// `Bash` flags image bytes in `stdout` rather than moving them; the warning printed beside
+    /// them on `stderr` is ordinary output and has to survive.
+    #[test]
+    fn a_bash_result_flagged_as_an_image_keeps_its_stderr() {
+        let (out, _) = parse("images.jsonl");
+        let bash = out
+            .docs
+            .iter()
+            .find(|d| d.tool_name.as_deref() == Some("Bash"))
+            .expect("the Bash call is a document");
+
+        assert_eq!(
+            bash.tool_output.as_deref(),
+            Some("[image 9 KiB]\nimport: warning: no display")
+        );
+    }
+
+    /// The backstop, over every shape in the fixture at once — including the two nobody
+    /// modelled, an MCP tool's flattened `data` block and its `{renders:[{b64}]}` result.
+    /// Whatever a future CLI does with images, none of it becomes a term.
+    #[test]
+    fn no_field_of_any_document_carries_an_encoded_payload() {
+        let (out, _) = parse("images.jsonl");
+        assert_eq!(out.docs.len(), 4, "one turn and three tool calls");
+
+        // The blob the fixture is built from: `crate::media`'s placeholder is the only thing
+        // that may survive of it, in any field, indexed or merely stored.
+        let smell = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
+        for doc in &out.docs {
+            for (field, value) in [
+                ("text", Some(doc.text.clone())),
+                ("tool_output", doc.tool_output.clone()),
+                ("thinking", doc.thinking.clone()),
+                ("tool_input", doc.tool_input.as_ref().map(Value::to_string)),
+                ("raw", Some(doc.raw.clone())),
+            ] {
+                let Some(value) = value else { continue };
+                assert!(
+                    !value.contains(smell),
+                    "{} of {} kept a payload: {}...",
+                    field,
+                    doc.doc_id,
+                    &value[..120.min(value.len())]
+                );
+            }
+        }
+    }
+
+    /// `raw` is stored, never indexed and never returned, so eliding a blob there is free —
+    /// but only if the elision is surgical. Every other byte of the line is the record.
+    #[test]
+    fn scrubbing_raw_leaves_the_rest_of_the_line_intact() {
+        let (out, _) = parse("images.jsonl");
+        let prompt = out
+            .docs
+            .iter()
+            .find(|d| d.role == "user" && d.kind == DocKind::Message)
+            .unwrap();
+
+        let raw: Value = serde_json::from_str(&prompt.raw).expect("still a JSON line");
+        assert_eq!(
+            raw["message"]["content"][0]["source"]["media_type"],
+            "image/jpeg"
+        );
+        assert_eq!(
+            raw["message"]["content"][0]["source"]["data"],
+            "[base64 22 KiB]"
+        );
+        assert_eq!(
+            raw["message"]["content"][1]["text"],
+            "Attached a picture so it'd be in the session"
+        );
+        assert!(
+            prompt.raw.len() < 2_000,
+            "the line went from 30 KB of base64 to nothing: {}",
+            prompt.raw.len()
+        );
     }
 
     /// `thinking_tokens` is a per-message total that appears on only *some* of the message's

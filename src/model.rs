@@ -409,12 +409,20 @@ impl MessageContent {
 }
 
 /// API content blocks. Types that exist in the CLI bundle but not in any sample
-/// (`redacted_thinking`, `image`, `document`, `search_result`, ...) land in `Unknown`.
+/// (`redacted_thinking`, `search_result`, ...) land in `Unknown`.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(tag = "type")]
 pub enum ContentBlock {
     #[serde(rename = "text")]
     Text(TextBlock),
+    /// A pasted screenshot, or a tool that answered with an image. Modelled rather than left
+    /// to `Unknown` so the bytes can be *replaced* by a description of them
+    /// (`crate::media`) instead of silently dropped along with the fact an image was there.
+    #[serde(rename = "image")]
+    Image(MediaBlock),
+    /// The same, for a PDF or other document attached to a turn.
+    #[serde(rename = "document")]
+    Document(MediaBlock),
     #[serde(rename = "thinking")]
     Thinking(ThinkingBlock),
     #[serde(rename = "tool_use")]
@@ -434,6 +442,18 @@ pub enum ContentBlock {
 pub struct TextBlock {
     #[serde(deserialize_with = "flex_string")]
     pub text: Option<String>,
+    #[serde(flatten)]
+    pub extra: Extra,
+}
+
+/// An `image` or `document` block. The payload itself is never modelled: `source` holds it in
+/// the API form (`{type:"base64",media_type,data}`, or a `url` / `file_id` locator), `extra`
+/// holds the flattened MCP form (`{data,mimeType}`), and `crate::media` reads a description off
+/// whichever one turned up.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default)]
+pub struct MediaBlock {
+    pub source: Option<Value>,
     #[serde(flatten)]
     pub extra: Extra,
 }
