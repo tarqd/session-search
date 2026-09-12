@@ -44,7 +44,7 @@ use serde_json::{Value, json};
 use crate::index::{IndexOptions, IndexStats};
 use crate::parse::SessionInfo;
 use crate::schema::Fields;
-use crate::search::Filters;
+use crate::sessions::{self, SessionMatcher};
 use crate::{cli, context, discovery, index, search};
 
 /// How long a `/around` window reaches by default, matching `show --before/--after`.
@@ -170,8 +170,17 @@ impl From<anyhow::Error> for ApiError {
     /// The index or the disk was wrong, not the caller. `{err:#}` keeps the whole context
     /// chain: "opening the index at /… : permission denied" is actionable, "permission denied"
     /// on its own is not.
+    ///
+    /// The one exception is a [`sessions::FilterError`], which the query builder raises for a
+    /// filter it could not read. That is the caller's mistake and has to be a 400 for the same
+    /// reason a malformed date is one, pinned by `a_malformed_date_is_a_400_wherever_it_arrives`:
+    /// a caller typing a filter hits every prefix of it on the way, and a 500 claims the index or
+    /// the disk broke. `dto` pre-validates the shapes it can see, so this catches the rest.
     fn from(err: anyhow::Error) -> ApiError {
-        ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, format!("{err:#}"))
+        match err.downcast::<sessions::FilterError>() {
+            Ok(filter) => ApiError::bad_request(format!("{}: {:#}", filter.field, filter.source)),
+            Err(err) => ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, format!("{err:#}")),
+        }
     }
 }
 
@@ -809,11 +818,15 @@ async fn sessions_list(
     // `session_filters` refuses an unknown key itself, against `SESSION_LIST_PARAMS`, and
     // applies the default row limit.
     let (filters, limit) = dto::session_filters(&params).map_err(ApiError::bad_request)?;
-    let warnings = unanswerable_session_filters(&filters);
+    // The same list `session-search sessions` warns about, rendered as sentences instead: this
+    // surface has no stderr a caller can read, so a filter it could not apply has to travel in
+    // the response body or it does not travel at all.
+    let warnings = sessions::unanswerable_filter_notes(&filters, sessions::SearchSurface::HttpApi);
     for warning in &warnings {
         tracing::warn!(warning, "session filter ignored");
     }
-    let matcher = SessionMatcher::new(&filters).map_err(ApiError::bad_request)?;
+    let matcher =
+        SessionMatcher::new(&filters).map_err(|err| ApiError::bad_request(format!("{err:#}")))?;
 
     blocking(move || {
         let mut sessions: Vec<SessionInfo> = index::load_sessions(&state.index_dir)?
@@ -1016,143 +1029,6 @@ fn resolve_target(
 // ---------------------------------------------------------------------------
 // session-list filtering
 // ---------------------------------------------------------------------------
-
-/// Filters that arrived but that session metadata cannot answer.
-///
-/// `sessions.json` holds one row per transcript, not per message, so it carries no model, role,
-/// kind or tool. `model` is nevertheless an accepted parameter — it is in the documented set —
-/// and dropping it on the floor would hand back the unfiltered listing as though it had been
-/// filtered. Naming it in the response is the difference between "no session used that model"
-/// and "that question cannot be asked here".
-fn unanswerable_session_filters(f: &Filters) -> Vec<String> {
-    let mut ignored: Vec<String> = Vec::new();
-    for (name, present) in [
-        ("tool", !f.tool.is_empty()),
-        ("tool_input", !f.tool_input.is_empty()),
-        ("tool_output", !f.tool_output.is_empty()),
-        ("min_thinking", f.min_thinking.is_some()),
-        ("model", f.model.is_some()),
-        ("role", f.role.is_some()),
-        ("kind", f.kind.is_some()),
-        ("errors_only", f.errors_only),
-    ] {
-        if present {
-            ignored.push(format!(
-                "`{name}` was ignored: a session listing reads sessions.json, which records one \
-                 row per transcript and carries no per-message fields. Use /api/search for it."
-            ));
-        }
-    }
-    ignored
-}
-
-/// The subset of [`Filters`] that `sessions.json` can answer, pre-resolved once.
-///
-/// This mirrors `cli.rs`'s matcher, which is private to that module. It is duplicated rather
-/// than approximated: `sessions` and `GET /api/sessions` answering the same filters differently
-/// is exactly the kind of drift a reader has no way to notice.
-struct SessionMatcher {
-    project: Option<String>,
-    branch: Option<String>,
-    session: Option<String>,
-    agent_type: Option<String>,
-    since_ms: Option<i64>,
-    until_ms: Option<i64>,
-    no_sidechains: bool,
-    sidechains_only: bool,
-}
-
-impl SessionMatcher {
-    fn new(f: &Filters) -> Result<SessionMatcher, String> {
-        let now = chrono::Utc::now();
-        let edge = |raw: &str, upper: bool| -> Result<i64, String> {
-            match search::parse_when(raw, now).map_err(|err| format!("{err:#}"))? {
-                search::When::Instant(ms) => Ok(ms),
-                // A bare `YYYY-MM-DD` covers the whole day, at both ends.
-                search::When::Day(ms) => Ok(if upper { ms + search::DAY_MS - 1 } else { ms }),
-            }
-        };
-        Ok(SessionMatcher {
-            project: f.project.as_deref().map(expand_tilde),
-            branch: f.branch.clone(),
-            session: f.session.clone(),
-            agent_type: f.agent_type.clone(),
-            since_ms: f.since.as_deref().map(|s| edge(s, false)).transpose()?,
-            until_ms: f.until.as_deref().map(|s| edge(s, true)).transpose()?,
-            no_sidechains: f.no_sidechains,
-            sidechains_only: f.sidechains_only,
-        })
-    }
-
-    fn matches(&self, info: &SessionInfo) -> bool {
-        // Path-aware, exactly as the index-side filter is: `project=/home/u/alpha` must not
-        // drag in the sibling `/home/u/alpha-beta`.
-        if let Some(prefix) = &self.project
-            && !info
-                .project
-                .as_deref()
-                .is_some_and(|p| search::path_has_prefix(p, prefix))
-        {
-            return false;
-        }
-        if let Some(branch) = &self.branch
-            && info.git_branch.as_deref() != Some(branch.as_str())
-        {
-            return false;
-        }
-        // A session id is long enough that a prefix is a convenience, not an ambiguity.
-        if let Some(session) = &self.session
-            && !info.session_id.starts_with(session.as_str())
-        {
-            return false;
-        }
-        if let Some(kind) = &self.agent_type
-            && info.agent_type.as_deref() != Some(kind.as_str())
-        {
-            return false;
-        }
-        if self.no_sidechains && info.agent_id.is_some() {
-            return false;
-        }
-        if self.sidechains_only && info.agent_id.is_none() {
-            return false;
-        }
-        // A session overlaps the window if it ended after `since` and started before `until`.
-        if let Some(since) = self.since_ms
-            && info
-                .last_ts_ms
-                .or(info.first_ts_ms)
-                .is_some_and(|t| t < since)
-        {
-            return false;
-        }
-        if let Some(until) = self.until_ms
-            && info
-                .first_ts_ms
-                .or(info.last_ts_ms)
-                .is_some_and(|t| t > until)
-        {
-            return false;
-        }
-        true
-    }
-}
-
-/// `~` is the shell's, not the browser's — but the CLI expands it on the way into the same
-/// filter, and a `project` that matches under `session-search sessions` and not under
-/// `GET /api/sessions` is a difference nobody would think to look for.
-fn expand_tilde(path: &str) -> String {
-    if (path == "~" || path.starts_with("~/"))
-        && let Some(home) = std::env::var_os("HOME")
-    {
-        let home = PathBuf::from(home);
-        return match path.strip_prefix("~/") {
-            Some(rest) => home.join(rest).to_string_lossy().into_owned(),
-            None => home.to_string_lossy().into_owned(),
-        };
-    }
-    path.to_string()
-}
 
 // ---------------------------------------------------------------------------
 // tests
@@ -1431,6 +1307,38 @@ mod tests {
 
         let (status, body) = server.get("/api/search?since=7d");
         assert_eq!(status, StatusCode::OK, "{body}");
+    }
+
+    /// The same argument as the date above, for the filters the query builder parses rather than
+    /// `dto`. These reach `ApiError` as a `FilterError` from inside `search::search`, and without
+    /// the downcast that classifies them they are a `500` telling the caller the index broke when
+    /// what happened is that they typed `--tool-input command` without an `=`.
+    #[test]
+    fn a_malformed_tool_filter_is_a_400_and_names_the_wire_parameter() {
+        let server = server();
+        // Only the `tool_input` spellings: an empty `tool_output=` is dropped by the query-string
+        // decoder before the builder ever sees it, so over HTTP it is an absent filter rather
+        // than an unreadable one. That asymmetry with the CLI is issue #13, not this change.
+        for uri in [
+            "/api/search?tool_input=command",
+            "/api/search?tool_input=k%3D",
+            "/api/facets/tool_name?tool_input=command",
+        ] {
+            let (status, body) = server.get(uri);
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{uri}: {body}");
+            let message = error_message(&body);
+            assert!(
+                !message.contains("--"),
+                "over HTTP there is no flag: {uri}: {message}"
+            );
+        }
+
+        let (status, body) = server.get("/api/search?tool_input=command%3Dcargo");
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "a readable filter still answers: {body}"
+        );
     }
 
     #[test]

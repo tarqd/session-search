@@ -37,6 +37,7 @@ use tantivy::{DateTime, Score, Searcher, TantivyDocument};
 
 use crate::parse::{Doc, DocKind};
 use crate::schema::Fields;
+use crate::sessions::FilterError;
 
 /// Wraps the matched span inside a snippet. Plain text on purpose: the snippet travels through
 /// JSON output and MCP responses as well as the terminal, so HTML would be wrong everywhere.
@@ -68,50 +69,223 @@ const CONTEXT_BOOST: Score = 0.3;
 const GROUP_FANOUT: usize = 8;
 
 #[derive(Debug, Clone, Default, clap::Args, serde::Serialize, serde::Deserialize)]
+#[cfg_attr(feature = "mcp", derive(schemars::JsonSchema))]
 #[serde(default)]
 pub struct Filters {
-    /// Project path; matches by prefix, so `-p ~/code` catches subdirectories.
+    /// Project path; matches by prefix on a path boundary, so `-p ~/code` catches subdirectories
+    /// but not `~/code-other`. `~` is expanded.
     #[arg(short = 'p', long, value_name = "PATH")]
+    #[cfg_attr(
+        feature = "mcp",
+        schemars(description = "\
+Project directory. Prefix match, aware of path boundaries: `/home/u/code` matches \
+`/home/u/code` and `/home/u/code/sub`, and never the sibling `/home/u/code-other`. A trailing \
+slash is ignored. Give an absolute path — this is the `cwd` each record recorded, never the \
+mangled project-directory name, and a `~` is expanded against the server's HOME, which is not \
+necessarily yours. This is the filter to drop last on a retry: dropping it does not widen the \
+question, it answers a different one.")
+    )]
     pub project: Option<String>,
-    /// Tool name; repeatable.
+    /// Tool name; repeatable, OR. Exact and case-sensitive — `Bash`, not `bash`.
     #[arg(short = 't', long, value_name = "NAME")]
+    #[cfg_attr(
+        feature = "mcp",
+        schemars(description = "\
+Tool names, ORed together. Exact term match and case-sensitive as the transcript spells them: \
+`Bash`, `Read`, `Edit`, `Write`, `Grep`, `Glob`, `WebFetch`, `Task`. `bash` and `BASH` match \
+nothing and do not error. If you are unsure what this corpus contains, call `aggregate` on \
+`tool_name` first — that is one call and it returns the exact vocabulary.")
+    )]
     pub tool: Vec<String>,
-    /// Tool parameter filter as `key=value`, e.g. `--tool-input command=cargo`; repeatable.
+    /// Tool parameter filter as `key=value`, e.g. `--tool-input command=cargo`; repeatable, ANDed.
     #[arg(long = "tool-input", value_name = "KEY=VALUE")]
+    #[cfg_attr(
+        feature = "mcp",
+        schemars(description = "\
+Filters on one parameter a tool was called with, written `key=value`; repeatable and ANDed. \
+The key is any parameter name the tool actually wrote — subpaths are dynamic, so \
+`file_path=/src/main.rs` works without `file_path` being declared anywhere in the schema, and so \
+does `timeout=600000` or `pattern=TODO`. The value is matched both as text terms and as the \
+whole raw value, so paths, quoted phrases and numbers all match the way they were indexed. \
+This is the narrowest filter in the set and it has two independent ways to be wrong: the key may \
+never appear on any tool, and the value may not be spelled the way it was recorded — both are \
+silent zeroes. To learn either, `aggregate` on `tool_input.<key>` and read the buckets. Use the \
+free-text query instead when you want 'this string appeared somewhere in the call', since a \
+`tool_input` match is an exact one on a single named parameter.")
+    )]
     pub tool_input: Vec<String>,
-    /// Phrase the tool's *output* must contain, e.g. `--tool-output "No such file"`;
-    /// repeatable, and ANDed.
+    /// Phrase the tool's *output* must contain, e.g. `--tool-output "No such file"`; repeatable,
+    /// and ANDed.
     #[arg(long = "tool-output", value_name = "TEXT")]
+    #[cfg_attr(
+        feature = "mcp",
+        schemars(description = "\
+An exact phrase the tool's OUTPUT must contain — what came back, not what the tool was asked to \
+do. Repeatable and ANDed. This is a phrase query over the code analyzer: the words must appear \
+adjacent and in order, and nothing is stemmed, so `compiling` does not find `compile` here. One \
+extra or missing word ends the match set. Case, unlike the words, does not matter: the analyzer \
+folds it, so `ENOENT` and `enoent` are the same phrase — this is the one filter here that is not \
+case-sensitive, where `tool`, `program` and `branch` all are. Use it for the literal text of an \
+error you have already seen (`error[E0433]`, `No such file or directory`); use the free-text \
+query when you only half-remember the wording, since a bare query already searches tool output.")
+    )]
     pub tool_output: Vec<String>,
-    /// Fenced-code language, as written in the info string (`rust`, `bash`); repeatable.
+    /// Fenced-code language, as written in the info string (`rust`, `bash`); repeatable, OR.
+    /// Lowercased before matching, so `Rust` and `rust` are the same fence — `rs` is not.
     #[arg(long, value_name = "LANG")]
+    #[cfg_attr(
+        feature = "mcp",
+        schemars(description = "\
+Fenced-code languages, ORed. Matched against the info string of a markdown code fence exactly \
+as written, after lowercasing — `Rust` and `rust` are the same filter, `rs` is a different one \
+and matches nothing if the corpus writes rust. Only messages that contain a fenced block \
+carry any value at all, so this filter excludes every tool call and every unfenced message. \
+Multi-valued: one message with a rust fence and a bash fence carries both.")
+    )]
     pub lang: Vec<String>,
     /// Only turns where the model spent at least N thinking tokens. Works even where the
     /// thinking text itself was stripped before it reached disk, which is the case for remote
     /// and web sessions.
     #[arg(long, value_name = "N")]
+    #[cfg_attr(
+        feature = "mcp",
+        schemars(description = "\
+Minimum thinking tokens: an inclusive lower bound on the token count the model spent reasoning \
+before answering. Use it to find the moments a session stopped and thought hard, which is a good \
+proxy for where the difficult decisions were made. It survives where the reasoning itself does \
+not: remote and web sessions strip the thinking text before it reaches disk but keep the count. \
+Note this is close to a presence filter — the count is attached to exactly one document per API \
+message, so even `min_thinking: 1` cuts the corpus to a small minority, and combining it with \
+another narrow filter usually returns zero. The thinking TEXT is only searchable if the index \
+was built to include it.")
+    )]
     pub min_thinking: Option<u64>,
-    /// Program run by a Bash command — any simple command in the script, e.g.
-    /// `--program cargo`; repeatable, OR.
+    /// The program that ran; exact match, case-sensitive. Any simple command in a Bash script,
+    /// e.g. `--program cargo`; repeatable, OR.
     #[arg(long, value_name = "NAME")]
+    #[cfg_attr(
+        feature = "mcp",
+        schemars(description = "\
+The program that ran; exact match, case-sensitive. Matched against `bash_cmd.program`, which is \
+indexed with the raw tokenizer, so the value is compared whole and byte for byte: `cargo` is a \
+hit, and `Cargo`, `cargo build` and `/usr/bin/cargo` are silent zeroes. Repeatable, ORed. \
+Use this instead of putting the program's name in the free-text query. `query: \"cargo\"` also \
+matches `Cargo.toml`, the flag `--cargo-flag`, a directory named `cargo` in some path, and every \
+sentence that merely mentions cargo; this filter matches only commands that actually invoked it. \
+Two limits worth knowing: the field exists only where the shell grammar parsed the command, so a \
+command it rejected is invisible here; and it is multi-valued — one pipeline contributes every \
+simple command in it, so `grep` matches `ls | grep foo`.")
+    )]
     pub program: Vec<String>,
+    /// Git branch; exact match on the whole name, so it must be spelled in full.
     #[arg(long, value_name = "BRANCH")]
+    #[cfg_attr(
+        feature = "mcp",
+        schemars(description = "\
+Git branch, exact term match on the whole recorded name. Not a prefix: `claude/` does not match \
+`claude/rust-mcp-session-indexing`, and `main` does not match `main-2` either. Slashes are safe — \
+the field is stored as one term, so a branch name is not split. A name spelled short or wrong is \
+a silent zero; `aggregate` on `git_branch` lists what exists.")
+    )]
     pub branch: Option<String>,
+    /// Model id; exact match on the full id as recorded, e.g. `claude-opus-4-1-20250805`.
     #[arg(long, value_name = "MODEL")]
+    #[cfg_attr(
+        feature = "mcp",
+        schemars(description = "\
+Model id, exact term match on the full string the transcript recorded — `claude-opus-4-1-\
+20250805`, not `opus` and not `claude-opus`. A family name matches nothing. Only assistant \
+records carry a model, so this filter also excludes every user prompt, attachment and system \
+record. `aggregate` on `model` gives the exact ids in this corpus.")
+    )]
     pub model: Option<String>,
+    /// One of `user`, `assistant`, `system`, `attachment`. Exact; any other value matches nothing.
     #[arg(long, value_name = "ROLE")]
+    #[cfg_attr(feature = "mcp", schemars(
+        extend("enum" = ["user", "assistant", "system", "attachment", null]),
+        description = "\
+Who produced the document. Exactly four legal values:
+  `user`       — a typed human prompt. In a subagent transcript these are synthesised by the \
+parent, not typed by a person.
+  `assistant`  — model output. This INCLUDES tool calls: a tool call's role is `assistant`, so \
+`role` cannot isolate them — use `kind` for that.
+  `system`     — a system record, including compaction summaries and meta turns.
+  `attachment` — injected context: system-reminders, environment blocks, file contents pulled in \
+around a prompt.
+Any other value — `human`, `tool`, `User`, `ai` — matches nothing and does not error. A zero-hit \
+result with `role` set almost always means the value, not the corpus."))]
     pub role: Option<String>,
-    /// `message` or `tool_call`.
+    /// `message` or `tool_call`. Exact; any other value matches nothing.
     #[arg(long, value_name = "KIND")]
+    #[cfg_attr(feature = "mcp", schemars(
+        extend("enum" = ["message", "tool_call", null]),
+        description = "\
+What the document is. Exactly two legal values:
+  `message`   — a prompt, an assistant reply, a system record or an attachment.
+  `tool_call` — one tool invocation joined with the result that answered it; the call's name and \
+inputs are its text, the result is its output.
+`toolcall`, `tool`, `ToolCall`, `tool_use` and `tool_result` all match nothing and do not error. \
+This filter is weak when right — the two values split the corpus roughly in half — and total when \
+wrong, which is why a zero with `kind` set is far more likely a typo than a fact about the \
+corpus."))]
     pub kind: Option<String>,
+    /// Session id; matches by prefix, so the first block of a uuid is enough.
     #[arg(long, value_name = "SESSION_ID")]
+    #[cfg_attr(
+        feature = "mcp",
+        schemars(description = "\
+Session id, matched by PREFIX — the first block of a uuid (`b20208d8`) is enough, which is what \
+anyone pasting an id has to hand. Note two things about session identity: a subagent transcript \
+records its PARENT's session id, so filtering by session includes that session's sidechains \
+(separate them with `sidechains_only` / `no_sidechains`); and two files can carry the same \
+session id after a reset or relocation, which is why a turn is addressed by `source_path` plus \
+`turn_seq` and not by session id plus a number.")
+    )]
     pub session: Option<String>,
+    /// Subagent type, e.g. `Explore`; exact match. Only sidechain documents have one.
     #[arg(long = "agent-type", value_name = "TYPE")]
+    #[cfg_attr(
+        feature = "mcp",
+        schemars(description = "\
+Subagent type, exact and case-sensitive: `Explore`, `workflow-subagent`, and whatever else this \
+machine has run. It comes from the attribution on a sidechain's assistant records, so setting it \
+implies sidechains — every document with an `agent_type` is inside a subagent transcript, and \
+combining this with `no_sidechains` is a guaranteed zero. `aggregate` on `agent_type` lists the \
+values.")
+    )]
     pub agent_type: Option<String>,
-    /// RFC3339, `YYYY-MM-DD`, or a relative span such as `7d`.
+    /// Lower bound, inclusive. RFC3339, `YYYY-MM-DD`, `YYYY-MM-DDTHH:MM[:SS]` (UTC), `now`, or a
+    /// relative span back from now: `90s`, `30m`, `24h`, `7d`, `2w`.
     #[arg(long, value_name = "WHEN")]
+    #[cfg_attr(
+        feature = "mcp",
+        schemars(description = "\
+Start of the time window, inclusive. Accepted forms:
+  RFC3339 with an offset      — `2026-09-03T14:00:00Z`, `2026-09-03T10:00:00-04:00`
+  a bare day                  — `2026-09-03`, taken from that day's midnight UTC
+  a local-looking timestamp   — `2026-09-03T14:00` or `2026-09-03T14:00:00`, assumed UTC
+  the literal `now`
+  a span counted back from now — `90s`, `30m`, `24h`, `7d`, `2w`
+A bare `YYYY-MM-DD` is inclusive at BOTH ends of the range: `since 2026-09-03 until 2026-09-05` \
+covers all three days, up to the last instant of the 5th, rather than stopping at its midnight. \
+Anything else is a parse error, not a silent zero — this is one of the few filters that tells you \
+when it is wrong. Relative spans are resolved against the server's clock at the moment of the \
+call, so the response echoes the resolved absolute range back; quote that range when you report \
+a result, never the span you sent.")
+    )]
     pub since: Option<String>,
+    /// Upper bound. Same grammar as `since`; a bare `YYYY-MM-DD` covers that whole day.
     #[arg(long, value_name = "WHEN")]
+    #[cfg_attr(
+        feature = "mcp",
+        schemars(description = "\
+End of the time window. Same grammar as `since`: RFC3339, `YYYY-MM-DD`, `YYYY-MM-DDTHH:MM[:SS]` \
+(assumed UTC), `now`, or a span back from now (`90s`, `30m`, `24h`, `7d`, `2w`). A bare day is \
+inclusive — `until 2026-09-05` covers the whole of the 5th, not just its first instant, because \
+an upper bound that stopped at midnight would silently drop a day's work. An explicit timestamp \
+is an inclusive instant. The response echoes the resolved absolute range; report that, not the \
+relative span you sent.")
+    )]
     pub until: Option<String>,
     /// Search the whole index, including the records nobody typed and the model did not
     /// write: attachments (system reminders, environment blocks, pasted file contents),
@@ -126,6 +300,25 @@ pub struct Filters {
     /// An explicit `--role` overrides the default on its own: asking for `--role attachment`
     /// and getting nothing would be a filter that silently contradicts itself.
     #[arg(long = "all-records")]
+    #[cfg_attr(
+        feature = "mcp",
+        schemars(description = "\
+Search the whole index, including the records nobody typed and the model did not write: \
+`attachment` documents (system reminders, environment blocks, the contents of pasted files), \
+`system` records, and meta turns such as compaction summaries. All three are excluded by \
+default. They are a fifth of the documents here and a twentieth of the text, and they are dense \
+with the vocabulary every search uses — paths, tool names, the word `session` — so a plain query \
+that kept them would return page after page of the same boilerplate reminder instead of the \
+conversation. They stay indexed; this brings them back. Two things follow. An explicit `role` \
+already overrides the default on its own, so `role: attachment` returns attachments with or \
+without this — a filter that asked for them and was handed none would be contradicting itself. \
+And this is the one filter here that cannot cause a zero: it only ever widens, so it is never \
+the reason a search came back empty, and it is never wrong to add on a retry. Whether it would \
+change an answer is not a guess — `search_turns` returns `hidden`, the count of documents this \
+query matched and the default scope refused. `hidden: 0` and `hidden: 340` are the difference \
+between a search that found nothing and a search that was not allowed to look, so a non-zero \
+`hidden` beside a thin result is the signal to ask again with this on.")
+    )]
     pub all_records: bool,
     /// One turn, by the file it is in and its `turn_seq`: everything that happened under one
     /// human prompt, and nothing else.
@@ -135,14 +328,74 @@ pub struct Filters {
     /// every file — the same reason [`crate::context::turn`] takes a path where [`around`]
     /// takes an `Option`.
     #[arg(long = "turn-of", value_name = "SOURCE_PATH", requires = "turn_seq")]
+    #[cfg_attr(
+        feature = "mcp",
+        schemars(description = "\
+Half of one turn address: the transcript file, spelled exactly as the `source_path` a \
+`search_turns` hit came back with. `turn_of` and `turn_seq` are two halves of a single filter \
+and neither does anything alone — sending one without the other is refused rather than quietly \
+ignored, because half an address is not a narrower search but a wider one. Check which tool you \
+want before using it: if you are holding a turn from a `search_turns` hit and mean to READ it, \
+that is `get_turn`, which takes this same `source_path` and `turn_seq` and returns the turn's \
+documents in full. This filter does the other thing — it restricts a *search* to that one turn, \
+answering `which documents inside this turn match this query` and nothing else. Use it to count \
+inside a turn with `aggregate`, or to find where a phrase sits in a long one; use `get_turn` to \
+read it. A zero here means the turn does not contain your query terms, not that the address is \
+wrong.")
+    )]
     pub turn_of: Option<String>,
+    /// The turn's ordinal within `--turn-of`'s file. Both halves or neither; see `--turn-of`.
     #[arg(long = "turn-seq", value_name = "N", requires = "turn_of")]
+    #[cfg_attr(
+        feature = "mcp",
+        schemars(description = "\
+The other half of a turn address: the turn's ordinal inside `turn_of`'s file, exactly as the \
+`turn_seq` a `search_turns` hit came back with. It is a PER-FILE ordinal and never a global id — \
+turn 12 exists in every transcript at least twelve turns long, and two transcripts can even \
+carry the same `session_id` — so on its own it would match that position in every file, and it \
+is refused without `turn_of` rather than doing that silently. Pass the pair back exactly as it \
+was returned: do not compute it, do not take one half from one hit and the other half from \
+another, and do not use it as a page number. As with `turn_of`, reading a turn you have already \
+found is `get_turn`, which takes this same pair; this filter is for searching or counting \
+*within* the turn.")
+    )]
     pub turn_seq: Option<u64>,
+    /// Only failed tool calls.
     #[arg(long)]
+    #[cfg_attr(
+        feature = "mcp",
+        schemars(description = "\
+Keep only documents flagged as a failed tool call. The flag is the transcript's own: the tool \
+host said the call failed, an `Error…` / `InputValidationError…` payload came back, the call was \
+interrupted, or permission was denied. It is NOT a text scan — a command that printed the word \
+`error` and exited 0 is not flagged, and for that you want a `tool_output` phrase instead. \
+Failures are a small minority of the corpus, so this narrows hard; it is the natural pairing with \
+`aggregate` for 'what errors did we see' and 'which files could we not read'.")
+    )]
     pub errors_only: bool,
+    /// Exclude subagent transcripts. Mutually exclusive with `sidechains_only`.
     #[arg(long, conflicts_with = "sidechains_only")]
+    #[cfg_attr(
+        feature = "mcp",
+        schemars(description = "\
+Exclude subagent (sidechain) transcripts, keeping only the main conversation. Use it when you \
+want what the top-level session did rather than what its delegated agents did. Cheap to drop on a \
+retry: sidechains are a minority of documents, so it rarely explains a zero on its own — unless \
+it was combined with `agent_type` or `sidechains_only`, which contradict it outright.")
+    )]
     pub no_sidechains: bool,
+    /// Only subagent transcripts. Mutually exclusive with `no_sidechains`.
     #[arg(long)]
+    #[cfg_attr(
+        feature = "mcp",
+        schemars(description = "\
+Keep only subagent (sidechain) documents — the transcripts of delegated agents, which live in \
+their own files and record the parent's session id. Worth knowing before you drill in: a \
+subagent's `user` records are synthesised by the parent and never open a new turn, so an entire \
+sidechain transcript is ONE turn. A `get_turn` on a hit from here returns that whole transcript \
+and will hit the document cap; prefer reading the skeleton and pulling single outputs with \
+`get_output`.")
+    )]
     pub sidechains_only: bool,
 }
 
@@ -170,6 +423,7 @@ pub struct Filters {
     serde::Deserialize,
     clap::ValueEnum,
 )]
+#[cfg_attr(feature = "mcp", derive(schemars::JsonSchema))]
 #[serde(rename_all = "snake_case")]
 #[clap(rename_all = "kebab-case")]
 pub enum SortBy {
@@ -233,33 +487,80 @@ impl Default for SearchRequest {
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[cfg_attr(feature = "mcp", derive(schemars::JsonSchema))]
 pub struct FacetCount {
+    /// The value itself, exactly as it was indexed.
     pub value: String,
+    /// Documents carrying this value. On a multi-valued field one document can be counted in
+    /// several buckets, so these do not sum to a document count. See [`FacetResult`].
     pub count: u64,
 }
 
-/// A terms aggregation plus the context needed to read it honestly.
+/// A terms aggregation plus the counts needed to read it honestly.
 ///
-/// The bucket list alone is misleading on a high-cardinality field: summing the returned
-/// buckets answers "how many documents are in the rows I am showing you", which a caller
-/// naturally misreads as "how many documents matched". On `tool_input.command` those differ by
-/// 50x. So the counts a caller needs to interpret the buckets travel with them.
+/// The bucket list alone is misleading: summing the returned buckets answers "how many documents
+/// are in the rows I am showing you", which reads as "how many documents matched" and on
+/// `tool_input.command` differs by 50x. Never sum the buckets. `matching_docs` is the total,
+/// `docs_with_value` is the coverage, `other_docs` says the buckets are truncated, and `distinct`
+/// says whether this field is a distribution at all.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[cfg_attr(feature = "mcp", derive(schemars::JsonSchema))]
 pub struct FacetResult {
+    /// The field these buckets count, echoed back.
     pub field: String,
+    /// The top buckets, most frequent first. Never a total — see the counts below.
     pub values: Vec<FacetCount>,
     /// Documents matching the query and filters. **Not** the sum of `values`.
+    #[cfg_attr(
+        feature = "mcp",
+        schemars(description = "\
+How many documents the query and filters matched, in total. This is the denominator for every \
+bucket count and it is the ONLY number here you may quote as a total. It is not the sum of the \
+returned buckets and will not equal it: buckets stop at the top `n`, documents without a value \
+for this field are counted here and appear in no bucket at all, and on a multi-valued field one \
+document is counted once here and several times across the buckets. If you find yourself adding \
+bucket counts together, the number you wanted was this one.")
+    )]
     pub matching_docs: u64,
     /// Of those, the ones that actually carry a value for this field. Counted with an
     /// `ExistsQuery`, not summed from the buckets: a multi-valued field like `code_lang` or
     /// `bash_cmd.program` buckets a document once per value, so the sum counts values and
     /// can exceed `matching_docs`. Documents, not values: one answer with a rust fence and a
     /// bash fence counts once here and twice in `values`.
+    #[cfg_attr(
+        feature = "mcp",
+        schemars(description = "\
+How many of the `matching_docs` carry any value for this field at all — counted directly, not \
+summed from the buckets. The gap between this and `matching_docs` is real and often large: a \
+`tool_input.file_path` aggregation over a set that includes prompts and Bash calls has a value on \
+only the small share of documents that were file reads. Report coverage as \
+`docs_with_value of matching_docs`. On a multi-valued field this is DOCUMENTS, not values: one \
+answer holding a rust fence and a bash fence counts once here and twice in the buckets.")
+    )]
     pub docs_with_value: u64,
     /// Values that fell outside the returned buckets (`sum_other_doc_count`) — one document
     /// per value, except on a multi-valued field, where one document can contribute several.
+    #[cfg_attr(
+        feature = "mcp",
+        schemars(description = "\
+How much of the matching set sits in values that did not make the top `n` buckets. Greater than \
+zero means the buckets you were given are a truncated view, and any statement of the form 'the \
+only values are…' or 'X accounts for all of them' is false. Say 'the top N are…' and name this \
+number. One document per value here, except on a multi-valued field, where one document can \
+contribute to several.")
+    )]
     pub other_docs: u64,
     /// Approximate count of distinct values (HyperLogLog), over the matching set.
+    #[cfg_attr(
+        feature = "mcp",
+        schemars(description = "\
+Roughly how many distinct values exist across the whole matching set, not just the buckets \
+returned. Approximate — it is a HyperLogLog estimate, so quote it as 'about N distinct values' \
+and never subtract it from anything. Its real job is to tell you what shape of field you are \
+looking at: when it approaches `docs_with_value`, the values barely repeat and what you have is a \
+sample of a long tail rather than a distribution — whole shell commands are the standard case — \
+and the question wants full-text search instead of an aggregation.")
+    )]
     pub distinct: Option<u64>,
 }
 
@@ -298,6 +599,7 @@ impl FacetResult {
 /// `Text` also covers the no-highlight fallback's `Doc::body`, which is the same claim — the
 /// turn's own words — rendered from the stored body rather than the indexed halves.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[cfg_attr(feature = "mcp", derive(schemars::JsonSchema))]
 #[serde(rename_all = "snake_case")]
 pub enum SnippetSource {
     Text,
@@ -361,6 +663,28 @@ pub struct SearchResponse {
     /// and `total` is still a document count.
     #[serde(default)]
     pub grouped: bool,
+    /// What the search noticed about this request that the numbers above cannot say.
+    ///
+    /// Three outcomes of this index look exactly like an empty corpus from the outside: a
+    /// `word:value` term whose root is not a schema field (read as a `tool_input` JSON subpath,
+    /// which cannot fail to parse and simply matches nothing), a similarity seed whose every
+    /// term fell outside the tuning, and a grouped page that came back short because the
+    /// collapse window never reached `limit` distinct turns. Each was logged at WARN and
+    /// nothing else, which reaches whoever is reading stderr — never the caller who drew the
+    /// wrong conclusion. A zero-hit answer must not read as an authoritative "no".
+    ///
+    /// `Vec<String>` rather than a typed enum because these are prose advice, not a condition a
+    /// caller branches on: every consumer — `info.warnings` on the HTTP envelope, an agent
+    /// reading a tool result — renders them as text, so a typed variant would be flattened to a
+    /// sentence at the only place it is used. The sentences themselves are the `WARN_*`
+    /// constants below, shared verbatim with the `tracing` call that logs them so the two
+    /// cannot drift.
+    ///
+    /// `#[serde(default)]` for the same reason [`SearchResponse::grouped`] carries it: a
+    /// response deserialized from an older writer has no such key, and a missing warning list
+    /// means "none", not a parse failure.
+    #[serde(default)]
+    pub warnings: Vec<String>,
     /// Documents this query matched and the default scope refused: attachments, `system`
     /// records and meta turns. Zero when `--all-records` or an explicit `--role` is in force,
     /// because nothing was refused.
@@ -372,6 +696,23 @@ pub struct SearchResponse {
     #[serde(default)]
     pub hidden: usize,
 }
+
+/// A grouped page that ran out of collapse window before it ran out of turns.
+///
+/// Kept as a constant, not written inline, because it is both logged and returned: the caller
+/// that has to act on it (raise `limit`, narrow the query) is not the one reading stderr, and
+/// two spellings of the same advice is exactly the drift this crate keeps pinning down.
+const WARN_GROUPED_PAGE_SHORT: &str = "grouped page is short: the matched documents cluster into fewer turns than the collapse \
+     window reached. Raise --limit, or narrow the query.";
+
+/// Zero hits from a query carrying an unqualified `word:value`. See [`has_unqualified_field_term`].
+const WARN_UNQUALIFIED_FIELD_TERM: &str = "no matches: a `word:value` term here was read as a tool_input JSON subpath. \
+     If you meant it as text, quote it.";
+
+/// Zero hits from a `--similar-to` seed. See the call site for which knobs decide it.
+const WARN_EMPTY_SIMILARITY_SEED: &str = "no matches: every term of the seed turn may have fallen outside the similarity \
+     tuning (too rare, too common, too short or too long). Widen the seed with \
+     --similar-in text,code,tool_output, or check the filters.";
 
 // ---------------------------------------------------------------------------
 // entry points
@@ -606,6 +947,12 @@ pub fn search(
         }
     }
 
+    // Every warning below is both logged and carried on the response: the structured fields are
+    // for whoever is reading stderr, the sentence is for the caller who would otherwise read a
+    // zero-hit page as an authoritative "no". `"{}"` over the shared constant is what keeps the
+    // two texts one text.
+    let mut warnings: Vec<String> = Vec::new();
+
     // A turn the fetch window never reached cannot anchor a hit, and with grouping on that is
     // the one way a page comes back short of `--limit` while documents are still matching.
     if req.group_by_turn
@@ -617,9 +964,10 @@ pub fn search(
             turns = anchored.len(),
             docs_scanned = collector_limit(&searcher, wanted),
             matching_docs = total,
-            "grouped page is short: the matched documents cluster into fewer turns than the \
-             collapse window reached. Raise --limit, or narrow the query."
+            "{}",
+            WARN_GROUPED_PAGE_SHORT
         );
+        warnings.push(WARN_GROUPED_PAGE_SHORT.to_string());
     }
 
     // An unqualified `word:value` is a JSON-subpath lookup, so it cannot fail to parse — it
@@ -630,11 +978,8 @@ pub fn search(
         && let Some(text) = non_empty(req.query.as_deref())
         && has_unqualified_field_term(&schema, text)
     {
-        tracing::warn!(
-            query = %text,
-            "no matches: a `word:value` term here was read as a tool_input JSON subpath. \
-             If you meant it as text, quote it."
-        );
+        tracing::warn!(query = %text, "{}", WARN_UNQUALIFIED_FIELD_TERM);
+        warnings.push(WARN_UNQUALIFIED_FIELD_TERM.to_string());
     }
 
     // The second silent-nothing outcome of `MoreLikeThisQuery` (the first is refused in
@@ -648,10 +993,10 @@ pub fn search(
         tracing::warn!(
             doc = %source.doc_id,
             turn = source.turn_seq,
-            "no matches: every term of the seed turn may have fallen outside the similarity \
-             tuning (too rare, too common, too short or too long). Widen the seed with \
-             --similar-in text,code,tool_output, or check the filters."
+            "{}",
+            WARN_EMPTY_SIMILARITY_SEED
         );
+        warnings.push(WARN_EMPTY_SIMILARITY_SEED.to_string());
     }
 
     Ok(SearchResponse {
@@ -660,6 +1005,7 @@ pub fn search(
         facets,
         elapsed_ms: started.elapsed().as_millis(),
         grouped: req.group_by_turn,
+        warnings,
         hidden,
     })
 }
@@ -1337,7 +1683,14 @@ fn regex_escape(s: &str) -> String {
     out
 }
 
-fn expand_tilde(path: &str) -> String {
+/// `~` / `~/rest` against `$HOME`, for a `project` filter typed by a human.
+///
+/// `pub(crate)` because the shell is not the only front door: the CLI expands it on the way
+/// into the index-side filter, and `sessions.json` is filtered by the same `Filters::project`
+/// through a different code path (`sessions::SessionMatcher`). A project that matches under
+/// `session-search search` and not under `session-search sessions` is a difference nobody would
+/// think to look for, so there is one expansion rather than one per surface.
+pub(crate) fn expand_tilde(path: &str) -> String {
     let home = std::env::var("HOME").ok();
     match (path, home) {
         ("~", Some(home)) => home,
@@ -1349,17 +1702,37 @@ fn expand_tilde(path: &str) -> String {
     }
 }
 
-/// `--tool-input command=cargo` -> a query over the JSON subpath `tool_input.command`.
+/// A filter value this builder could not read, typed rather than left as a bare `anyhow`.
 ///
-/// Routed through `QueryParser` on purpose: it emits both the tokenized text terms *and* the
-/// typed fast-value term, so `path=/tmp/x.rs`, `command="cargo build"` and `timeout=600000`
-/// all match the way they were indexed.
+/// [`FilterError`] is the crate's one "the caller sent something unusable" type, and being that
+/// type is what the answer depends on: `mcp::from_anyhow` downcasts it into an `invalid_params`
+/// and renders everything it cannot classify as an `internal_error`. Those two say opposite
+/// things — an `internal_error` tells a model the tool broke and to stop, an `invalid_params`
+/// tells it to send a different value — and only the second is true of a misspelled filter. A
+/// second error type would be a second arm at that boundary for somebody to forget, and the
+/// symptom is silent: the sentence still arrives, labelled as the server's fault.
+///
+/// `field` is the plain name (`tool_input`), never `--tool-input`. This builder is shared by a
+/// CLI that spells it with dashes, an HTTP API that spells it `tool_input=` and an MCP server
+/// where no flag exists at all, so baking one spelling in here puts a flag that cannot be typed
+/// into two of the three answers. Each front end re-spells `field` in its own dialect, exactly
+/// as `cli::session_matcher` re-spells [`FilterError`]'s `since`.
+fn filter_error(field: &'static str, message: String) -> anyhow::Error {
+    anyhow::Error::new(FilterError {
+        field,
+        source: anyhow::Error::msg(message),
+    })
+}
+
 /// `--tool-output TEXT` as a phrase query over what the tool returned. Quoted, so an operator
 /// or a stray colon in the text is matched literally rather than reinterpreted as grammar.
 fn tool_output_query(index: &tantivy::Index, phrase: &str) -> anyhow::Result<Box<dyn Query>> {
     let phrase = phrase.trim();
     if phrase.is_empty() {
-        bail!("--tool-output expects a non-empty value");
+        return Err(filter_error(
+            "tool_output",
+            "expects a non-empty value".into(),
+        ));
     }
     let escaped = phrase.replace('\\', r"\\").replace('"', r#"\""#);
     let qp = QueryParser::for_index(index, Vec::new());
@@ -1367,21 +1740,31 @@ fn tool_output_query(index: &tantivy::Index, phrase: &str) -> anyhow::Result<Box
         .with_context(|| format!("building a tool-output filter from {phrase:?}"))
 }
 
+/// `--tool-input command=cargo` -> a query over the JSON subpath `tool_input.command`.
+///
+/// Routed through `QueryParser` on purpose: it emits both the tokenized text terms *and* the
+/// typed fast-value term, so `path=/tmp/x.rs`, `command="cargo build"` and `timeout=600000`
+/// all match the way they were indexed.
 fn tool_input_query(index: &tantivy::Index, spec: &str) -> anyhow::Result<Box<dyn Query>> {
+    let unreadable = |message: String| filter_error("tool_input", message);
     let (key, value) = spec
         .split_once('=')
-        .ok_or_else(|| anyhow!("--tool-input expects KEY=VALUE, got {spec:?}"))?;
+        .ok_or_else(|| unreadable(format!("expects KEY=VALUE, got {spec:?}")))?;
     let key = key.trim();
     if key.is_empty() {
-        bail!("--tool-input expects a non-empty key, got {spec:?}");
+        return Err(unreadable(format!("expects a non-empty key, got {spec:?}")));
     }
     if key.contains([' ', '"', ':']) {
-        bail!("--tool-input key {key:?} contains a character the query grammar reserves");
+        return Err(unreadable(format!(
+            "key {key:?} contains a character the query grammar reserves"
+        )));
     }
     if value.trim().is_empty() {
         // `tool_input.k:""` parses cleanly and matches nothing, which is indistinguishable
         // from "this value does not occur". Say what actually went wrong instead.
-        bail!("--tool-input expects a non-empty value, got {spec:?}");
+        return Err(unreadable(format!(
+            "expects a non-empty value, got {spec:?}"
+        )));
     }
     let escaped = value.replace('\\', r"\\").replace('"', r#"\""#);
     let expr = format!("tool_input.{key}:\"{escaped}\"");
@@ -1491,6 +1874,44 @@ pub(crate) fn parse_when(raw: &str, now: chrono::DateTime<chrono::Utc>) -> anyho
         "cannot read {raw:?} as a date: expected RFC3339, YYYY-MM-DD, `now`, \
          or a relative span such as 7d / 24h / 30m"
     )
+}
+
+/// Which end of a `--since` / `--until` range a [`When`] is being resolved for.
+///
+/// Only a bare `YYYY-MM-DD` needs it — `When::Day` names a whole day, and which instant of that
+/// day is meant depends entirely on the end it sits at.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Edge {
+    Lower,
+    Upper,
+}
+
+/// [`parse_when`] resolved to a single instant at the requested end of the range.
+///
+/// The index side never needs this: `date_range` hands Tantivy a `Bound`, so a whole day is
+/// `Included(midnight) .. Excluded(midnight + DAY_MS)` and no instant has to stand for the day.
+/// Everything that filters `sessions.json` instead of the index — `session-search sessions`,
+/// `GET /api/sessions`, and any front end after them — compares two `i64` timestamps and needs
+/// one number, so the day has to collapse to an edge: midnight as a lower bound, the last
+/// millisecond of the day (`+ DAY_MS - 1`) as an upper one. Both ends are inclusive, which is
+/// what makes `--since 2026-09-09 --until 2026-09-09` mean that day rather than nothing.
+///
+/// It lives here, beside [`parse_when`] and [`DAY_MS`], because a second front end that
+/// re-derived the edge is how `--until 2026-09-09` starts meaning "up to midnight" on one
+/// surface and "up to 23:59:59.999" on another — a filter silently dropping a day of results
+/// with nothing on screen to say so.
+pub(crate) fn when_ms(
+    raw: &str,
+    now: chrono::DateTime<chrono::Utc>,
+    edge: Edge,
+) -> anyhow::Result<i64> {
+    Ok(match parse_when(raw, now)? {
+        When::Instant(ms) => ms,
+        When::Day(ms) => match edge {
+            Edge::Lower => ms,
+            Edge::Upper => ms + DAY_MS - 1,
+        },
+    })
 }
 
 /// `7d` -> milliseconds. `None` when the shape does not match.
@@ -2405,13 +2826,20 @@ fn coordinate_query(
 /// search ends up seeded from a document the caller never named. The order is by the `seq` fast
 /// field, then by `doc_id`, so the two candidates an error names are the same two on every run.
 ///
-/// The single exception is §9's duplicate. When every candidate is the same `seq` of the same
-/// session and agent, they are one logical record that was indexed from two files — the
-/// `resetSessionFile()`/`relocated` case, where one transcript lives under two project keys and
+/// The single exception is §9's duplicate: one transcript indexed under two project keys — the
+/// `resetSessionFile()`/`relocated` case — so the *same record* is read out of two files and
 /// carries identical record uuids in both. There is no question to ask there: the documents say
 /// the same thing, and the only difference is which file they were read from. So the first by
 /// `doc_id` is taken. Anything else — two different `seq`s, two different transcripts — is a
 /// real ambiguity and stays an error.
+///
+/// The `uuid` is what makes the exception an exception, and it is not decoration. `seq` is a
+/// per-file ordinal and §9 lets two *different* transcripts share a session id, so `seq` +
+/// session + agent is satisfied by turn 0 of one conversation and turn 0 of another. Matching on
+/// those three alone declared that pair one record and returned whichever file sorted first — a
+/// document from a transcript the caller never named, with no error and no warning, which reads
+/// exactly like a correct answer. An absent uuid is no evidence either way, so it is not
+/// accepted as agreement.
 fn one_of(
     searcher: &Searcher,
     f: &Fields,
@@ -2421,7 +2849,11 @@ fn one_of(
     let mut docs = docs_by_seq(searcher, f, query, RESOLVE_CANDIDATE_LIMIT)?;
     docs.sort_by(|a, b| a.seq.cmp(&b.seq).then_with(|| a.doc_id.cmp(&b.doc_id)));
     let same_record = |a: &Doc, b: &Doc| {
-        a.seq == b.seq && a.session_id == b.session_id && a.agent_id == b.agent_id
+        a.seq == b.seq
+            && a.session_id == b.session_id
+            && a.agent_id == b.agent_id
+            && a.uuid.is_some()
+            && a.uuid == b.uuid
     };
     match docs.as_slice() {
         [] => Ok(None),
@@ -2730,7 +3162,45 @@ pub(crate) fn session_clauses(
 pub(crate) mod testkit {
     use super::*;
     use crate::schema::{build_schema, doc_to_json};
+    use std::collections::BTreeSet;
     use tantivy::Index;
+
+    /// Every field of [`Filters`], by the name it travels under.
+    ///
+    /// Read off the struct rather than typed out, and that is the whole point of it. Three
+    /// separate lists elsewhere in this crate enumerate the filters by hand — the drop order in
+    /// `mcp::envelope::narrowest`, the echo in `mcp::envelope::applied_filters`, and
+    /// `sessions::unanswerable_filters` — and each had a test that asserted its own length
+    /// against a number written in the same commit. When `all_records`, `turn_of` and `turn_seq`
+    /// were added to `Filters`, all three tests went on passing: a hand-written list cannot
+    /// notice a field nobody told it about. Any test that compares its coverage against this
+    /// fails instead, naming the field that was forgotten.
+    pub fn filter_field_names() -> BTreeSet<String> {
+        filter_object(&Filters::default())
+            .into_iter()
+            .map(|(name, _)| name)
+            .collect()
+    }
+
+    /// The fields this `Filters` actually sets: everything that differs from the default.
+    ///
+    /// Lets a test say "these cases cover every field" without repeating, per case, which field
+    /// it was meant to be about — the repetition being the thing that goes stale.
+    pub fn filter_fields_set(f: &Filters) -> BTreeSet<String> {
+        let default = filter_object(&Filters::default());
+        filter_object(f)
+            .into_iter()
+            .filter(|(name, value)| default.get(name) != Some(value))
+            .map(|(name, _)| name)
+            .collect()
+    }
+
+    fn filter_object(f: &Filters) -> serde_json::Map<String, serde_json::Value> {
+        match serde_json::to_value(f).expect("Filters holds only JSON-native values") {
+            serde_json::Value::Object(map) => map,
+            other => panic!("Filters must serialize as an object, not {other}"),
+        }
+    }
 
     pub fn blank_doc(seq: u64) -> Doc {
         Doc {
@@ -3454,6 +3924,54 @@ mod tests {
         assert!(err.contains("KEY=VALUE"), "{err}");
     }
 
+    /// A `tool_input` / `tool_output` value this builder cannot read is the caller's mistake,
+    /// and it has to arrive *typed* — the sentence alone is not the fix.
+    ///
+    /// [`crate::mcp::from_anyhow`] downcasts [`FilterError`] into an `invalid_params` and turns
+    /// everything else into an `internal_error`. Without the type these read to a model as "the
+    /// tool broke", when the remedy is to send a different value; the wording would still look
+    /// right in the terminal, so nothing but the downcast catches it. The field name is pinned
+    /// alongside because the same builder answers an HTTP API and an MCP server, neither of
+    /// which has a `--tool-input` for a caller to correct.
+    #[test]
+    fn an_unreadable_tool_filter_is_a_typed_caller_mistake_naming_the_plain_field() {
+        let (index, f) = index_docs(&corpus());
+        let input = |spec: &str| Filters {
+            tool_input: vec![spec.into()],
+            ..Filters::default()
+        };
+        let output = |phrase: &str| Filters {
+            tool_output: vec![phrase.into()],
+            ..Filters::default()
+        };
+
+        for (filters, field, needle) in [
+            (input("command"), "tool_input", "KEY=VALUE"),
+            (input("=cargo"), "tool_input", "non-empty key"),
+            (
+                input("a b=cargo"),
+                "tool_input",
+                "the query grammar reserves",
+            ),
+            (input("command="), "tool_input", "non-empty value"),
+            (output(""), "tool_output", "non-empty value"),
+        ] {
+            let request = SearchRequest {
+                filters,
+                ..SearchRequest::default()
+            };
+            let err = search(&index, &f, &request).unwrap_err();
+            let rendered = format!("{err:#}");
+            let typed = err
+                .downcast_ref::<FilterError>()
+                .unwrap_or_else(|| panic!("{rendered} must classify as a caller mistake"));
+            assert_eq!(typed.field, field, "{rendered}");
+            assert!(rendered.contains(needle), "{rendered}");
+            // The plain field, never a flag: two of the three front ends have no `--` to offer.
+            assert!(!rendered.contains("--"), "{rendered}");
+        }
+    }
+
     #[test]
     fn project_filter_matches_by_prefix_and_expands_tilde() {
         let (index, f) = index_docs(&corpus());
@@ -3601,6 +4119,32 @@ mod tests {
         assert!(matches!(parse_when("2026-09-09", now), Ok(When::Day(_))));
         assert!(matches!(parse_when("now", now), Ok(When::Instant(_))));
         assert!(parse_when("last tuesday", now).is_err());
+    }
+
+    /// Hoisted here from `cli.rs` when `Edge`/`when_ms` were: two front ends had their own
+    /// resolution of a bare day to an instant, and this is the one place the answer is decided.
+    #[test]
+    fn dates_parse_in_every_documented_form() {
+        let now = chrono::DateTime::parse_from_rfc3339("2026-09-09T12:00:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        let ms = |s: &str, edge| when_ms(s, now, edge).unwrap();
+
+        assert_eq!(ms("now", Edge::Lower), now.timestamp_millis());
+        assert_eq!(ms("7d", Edge::Lower), now.timestamp_millis() - 7 * DAY_MS);
+        assert_eq!(ms("30m", Edge::Lower), now.timestamp_millis() - 30 * 60_000);
+        assert_eq!(
+            ms("2026-09-09T19:07:19Z", Edge::Lower),
+            1_788_980_839_000,
+            "RFC3339"
+        );
+        // A bare day is inclusive at both ends.
+        let midnight = ms("2026-09-09", Edge::Lower);
+        assert_eq!(ms("2026-09-09", Edge::Upper), midnight + DAY_MS - 1);
+        assert_eq!(ms("2026-09-09T19:07", Edge::Lower), midnight + 68_820_000);
+
+        let err = when_ms("last tuesday", now, Edge::Lower).unwrap_err();
+        assert!(format!("{err}").contains("cannot read"), "{err}");
     }
 
     #[test]
@@ -5040,6 +5584,20 @@ mod tests {
         r.hits.iter().map(|h| h.doc.seq).collect()
     }
 
+    /// `MoreLikeThisQuery` returning nothing is indistinguishable from "nothing here is
+    /// similar", and it reports no error at all. The advice about which knobs decide it has to
+    /// travel with the empty answer.
+    #[test]
+    fn an_empty_similarity_result_names_the_knobs_on_the_response() {
+        let (index, f) = index_docs(&similar_docs());
+        let mut request = similar_req(seeded(&index, &f, "s1:3"));
+        // Nothing is indexed under this project, so the similarity query cannot answer at all.
+        request.filters.project = Some("/nowhere".into());
+        let empty = search(&index, &f, &request).unwrap();
+        assert_eq!(empty.total, 0);
+        assert_eq!(empty.warnings, vec![WARN_EMPTY_SIMILARITY_SEED.to_string()]);
+    }
+
     /// Every spelling of a reference names the same document, and so does an unambiguous prefix
     /// of each. This is the acceptance box: `--similar-to` must resolve a reference the way
     /// `show` resolves an id.
@@ -5079,6 +5637,81 @@ mod tests {
 
         // The exact-before-prefix rule: one of them spelled in full is not ambiguous.
         assert_eq!(resolve_doc(&index, &f, "dup-alpha").unwrap().seq, 4);
+    }
+
+    /// Two documents at the same `SESSION:SEQ` that are not the same record stay an ambiguity.
+    ///
+    /// §9's `resetSessionFile()` lets two *different* transcripts carry one session id, and
+    /// `seq` restarts at 0 in every file — so `s1:0` names turn 0 of one conversation and turn 0
+    /// of another, and they agree on session, agent and `seq`. Without the `uuid` half of
+    /// [`one_of`]'s same-record test this passes silently and wrongly: the pair is declared one
+    /// logical record, whichever file sorts first by `doc_id` is returned, and the caller is
+    /// handed a document out of a transcript it never named with no error and no warning. That
+    /// is the hazard `get_turn` warns a model about for a bare turn number, arriving through the
+    /// resolver instead.
+    #[test]
+    fn two_transcripts_sharing_a_session_id_stay_an_ambiguous_reference() {
+        let docs: Vec<Doc> = [
+            ("aaaaaaaa", "/tmp/a/s1.jsonl", "record-in-a"),
+            ("bbbbbbbb", "/tmp/b/s1.jsonl", "record-in-b"),
+        ]
+        .into_iter()
+        .map(|(tag, path, uuid)| Doc {
+            doc_id: format!("s1:-:{tag}:0"),
+            source_path: path.into(),
+            // Different records: two files that merely share a session id are two conversations.
+            uuid: Some(uuid.into()),
+            body: format!("{tag} turn 0"),
+            ..blank_doc(0)
+        })
+        .collect();
+        let (index, f) = index_docs(&docs);
+
+        let err = format!("{:#}", resolve_doc(&index, &f, "s1:0").unwrap_err());
+        assert!(err.contains("ambiguous document reference"), "{err}");
+        assert!(
+            err.contains("s1:-:aaaaaaaa:0") && err.contains("s1:-:bbbbbbbb:0"),
+            "both candidates are named so the caller can pick one: {err}"
+        );
+
+        // The documents themselves were never ambiguous — only the coordinate was.
+        assert_eq!(
+            resolve_doc(&index, &f, "record-in-b").unwrap().doc_id,
+            "s1:-:bbbbbbbb:0"
+        );
+    }
+
+    /// §9's `relocated` duplicate is the one ambiguity with a single answer, and it survives the
+    /// test above: one transcript indexed under two project keys is the *same record* read from
+    /// two files, so the two candidates carry identical record uuids.
+    ///
+    /// The pair matters. Tightening [`one_of`] until this case errors too would refuse a
+    /// reference the caller has no other spelling for — `cli::source_path_for` returns `None` in
+    /// exactly this case, so there is no `--session`-plus-file form to fall back to, and
+    /// `--similar-to <uuid>` on a relocated transcript would stop working entirely.
+    #[test]
+    fn one_record_read_from_two_files_is_still_one_record() {
+        let docs: Vec<Doc> = [
+            ("aaaaaaaa", "/tmp/a/s1.jsonl"),
+            ("bbbbbbbb", "/tmp/b/s1.jsonl"),
+        ]
+        .into_iter()
+        .map(|(tag, path)| Doc {
+            doc_id: format!("s1:-:{tag}:0"),
+            source_path: path.into(),
+            // The same record uuid in both files — that is what makes it one transcript.
+            uuid: Some("relocated-record".into()),
+            ..blank_doc(0)
+        })
+        .collect();
+        let (index, f) = index_docs(&docs);
+
+        assert_eq!(resolve_doc(&index, &f, "s1:0").unwrap().seq, 0);
+        assert_eq!(
+            resolve_doc(&index, &f, "relocated-record").unwrap().doc_id,
+            "s1:-:aaaaaaaa:0",
+            "the first by `doc_id`, so two runs name the same file"
+        );
     }
 
     /// An unknown reference is an error naming the grammar, not an empty result set. The two
@@ -5646,6 +6279,69 @@ mod tests {
             vec![1, 1],
             "neither file's count leaks into the other"
         );
+    }
+
+    /// The zero-hit outcomes this index can produce that look exactly like an empty corpus.
+    /// Logging them reaches whoever is watching stderr; the caller who drew the wrong conclusion
+    /// reads the response, so the response is where the sentence has to be.
+    #[test]
+    fn a_zero_hit_page_carries_its_warning_to_the_caller_not_only_to_stderr() {
+        let (index, f) = index_docs(&identifier_docs());
+
+        // `zzz:` is no field of this schema, so the term became a `tool_input.zzz` subpath
+        // lookup that cannot fail and cannot match. That is a misread colon, not an empty index.
+        let misread = search(&index, &f, &req("zzz:qqq")).unwrap();
+        assert_eq!(misread.total, 0);
+        assert_eq!(
+            misread.warnings,
+            vec![WARN_UNQUALIFIED_FIELD_TERM.to_string()],
+            "the carried sentence is the logged one, verbatim"
+        );
+
+        // A real field that simply matched nothing is an honest zero: no warning to give.
+        let honest = search(&index, &f, &req("tool_name:NoSuchTool")).unwrap();
+        assert_eq!(honest.total, 0);
+        assert!(honest.warnings.is_empty(), "{:?}", honest.warnings);
+
+        // And a page that found something says nothing at all.
+        let found = search(&index, &f, &req("create")).unwrap();
+        assert!(found.total > 0 && found.warnings.is_empty());
+    }
+
+    /// `GROUP_FANOUT * (limit + offset)` documents were scanned and they all belonged to one
+    /// turn, so the page is short of `--limit` while documents are still matching. Silence here
+    /// reads as the end of the results.
+    #[test]
+    fn a_grouped_page_that_came_up_short_says_so_on_the_response() {
+        // One turn of 20 matching documents: at `limit` 2 the collapse window reaches 16 of
+        // them and still finds only one turn to anchor.
+        let (index, f) = index_docs(&turns_about("memmap", &[20]));
+        let short = search(
+            &index,
+            &f,
+            &SearchRequest {
+                group_by_turn: true,
+                limit: 2,
+                ..req("memmap")
+            },
+        )
+        .unwrap();
+        assert_eq!(short.hits.len(), 1);
+        assert_eq!(short.total, 20, "`total` still counts documents");
+        assert_eq!(short.warnings, vec![WARN_GROUPED_PAGE_SHORT.to_string()]);
+
+        // A window wide enough to see the whole match set has nothing to report.
+        let whole = search(
+            &index,
+            &f,
+            &SearchRequest {
+                group_by_turn: true,
+                limit: 3,
+                ..req("memmap")
+            },
+        )
+        .unwrap();
+        assert!(whole.warnings.is_empty(), "{:?}", whole.warnings);
     }
 
     /// Paging a grouped search pages turns. An offset in documents would skip *into* the first

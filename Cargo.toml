@@ -10,6 +10,16 @@ default = []
 http-api = ["dep:axum", "dep:tokio", "dep:serde_urlencoded"]
 # The static single-page frontend, embedded in the binary and served by the same server.
 web-ui = ["http-api"]
+# An MCP stdio server over the same read operations the CLI exposes. Off by default so the plain
+# CLI keeps its dependency footprint and build time; see docs/MCP.md.
+mcp = [
+  "dep:rmcp",
+  "dep:schemars",
+  "dep:tokio",
+  "tokio/io-std",
+  "tokio/macros",
+  "tokio/rt-multi-thread",
+]
 
 [dependencies]
 anyhow = "1.0.104"
@@ -19,6 +29,10 @@ clap = { version = "4.6.6", features = ["derive", "env", "wrap_help"] }
 owo-colors = "4.4.0"
 pulldown-cmark = { version = "0.13", default-features = false }
 rayon = "1.12.0"
+# Already in the tree as a mandatory tantivy dependency, so depending on it directly costs no
+# extra compile time and no extra binary size. `slice::grep` needs it: the caller is a model, and
+# a "grep" that quietly matched `.*error.*` literally would report a log full of errors as clean.
+regex = "1.13"
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.151"
 tantivy = "0.26.2"
@@ -44,6 +58,18 @@ tokio = { version = "1.49.0", optional = true, default-features = false, feature
 # Deserializing a query string into `Vec<(String, String)>` is the one thing `axum::extract::Query`
 # cannot do, and repeatable parameters (`?tool=Bash&tool=Read`) need it.
 serde_urlencoded = { version = "0.7.1", optional = true }
+
+# --- optional, `mcp` ----------------------------------------------------------------------
+# `default-features = false` drops the client side and the HTTP/SSE transports; a stdio server
+# needs the server, the `#[tool]` macros, the stdio transport and schema generation.
+rmcp = { version = "3.2", optional = true, default-features = false, features = [
+  "server",
+  "macros",
+  "transport-io",
+  "schemars",
+] }
+# `1`, not the `0.8` rmcp's README claims: the `#[tool]` macro expands to schemars 1.x APIs.
+schemars = { version = "1", optional = true }
 
 [dev-dependencies]
 insta = { version = "1.48.0", features = ["json", "redactions", "filters"] }

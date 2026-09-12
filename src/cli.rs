@@ -18,6 +18,7 @@ use crate::format::{self, OutputOpts};
 use crate::index::{self, IndexOptions, IndexStats};
 use crate::parse::SessionInfo;
 use crate::search::{self, Filters, SearchRequest, SimilarField, SortBy};
+use crate::sessions::{self, SessionMatcher};
 use crate::{context, discovery};
 
 /// Facet buckets returned alongside `search --facets`. `facets` has `--top` for the same knob;
@@ -267,6 +268,26 @@ pub enum Command {
         #[arg(long)]
         no_refresh: bool,
     },
+    /// Serve the index to an agent over MCP on stdio.
+    ///
+    /// The transport owns stdout: one JSON-RPC message per line and nothing else. Diagnostics
+    /// go to stderr as they always do, and no renderer in this crate is called on this path.
+    ///
+    /// The index this serves is the global `--index` / `$SESSION_SEARCH_INDEX`, resolved before
+    /// dispatch like every other command — an MCP server started by an agent host inherits
+    /// whatever environment the host gives it, so the server reports the directory it actually
+    /// opened back in its `instructions`, where the model can see it.
+    #[cfg(feature = "mcp")]
+    Mcp {
+        /// Re-index at most every N seconds while the server runs. 0 never re-indexes after
+        /// startup. Unlike the one-shot commands, a long-lived server cannot afford an index
+        /// scan on every request.
+        #[arg(long = "refresh-secs", default_value_t = crate::mcp::DEFAULT_REFRESH_SECS, value_name = "N")]
+        refresh_secs: u64,
+        /// Skip the startup refresh too, and serve the index exactly as it stands.
+        #[arg(long)]
+        no_refresh: bool,
+    },
 }
 
 impl Command {
@@ -280,6 +301,31 @@ impl Command {
             | Command::Stats { json } => *json,
             #[cfg(feature = "http-api")]
             Command::Serve { .. } => false,
+            // Not "this command emits JSON" so much as "this command emits nothing a human
+            // reads": `OutputOpts::color` is derived from it, and the one thing that must never
+            // happen on this path is an ANSI escape near stdout.
+            #[cfg(feature = "mcp")]
+            Command::Mcp { .. } => true,
+        }
+    }
+
+    /// True when the command writes to stdout itself and must not be handed a borrowed one.
+    ///
+    /// Only the MCP server does. Its stdio transport *is* stdout — JSON-RPC framing written from
+    /// the transport's own threads — and [`run`]'s buffered writer holds `stdout().lock()` for
+    /// the whole of [`dispatch`]. A `std::io::Stdout` lock is reentrant within a thread and
+    /// blocking across threads, so the transport's first write parks forever: no response, no
+    /// error, no log line, just a server that never answers. That is a five-minute bug to hit
+    /// and an hour to find, so the two paths are separated here rather than defended by a
+    /// comment.
+    fn owns_stdout(&self) -> bool {
+        #[cfg(feature = "mcp")]
+        {
+            matches!(self, Command::Mcp { .. })
+        }
+        #[cfg(not(feature = "mcp"))]
+        {
+            false
         }
     }
 }
@@ -311,6 +357,14 @@ pub fn run(cli: Cli) -> Result<()> {
         // Filled in by the `Search` arm once `--similar-to` has resolved to a document.
         similar_to: None,
     };
+
+    // A command that owns stdout gets it unborrowed; see `Command::owns_stdout`. `sink` rather
+    // than `stdout` because such a command writes nothing through this channel by definition,
+    // and handing it a second handle to the stream it is framing would invite exactly the
+    // interleaving the separation exists to prevent.
+    if cli.command.owns_stdout() {
+        return dispatch(cli.command, &index_dir, opts, &mut std::io::sink());
+    }
 
     // Buffered: the human renderings are many small writes, and a `| head` should not cost a
     // syscall per line.
@@ -413,7 +467,7 @@ fn dispatch(
                 similar_to: similar,
                 group_by_turn,
             };
-            let response = search::search(&index, &fields, &request)?;
+            let response = search::search(&index, &fields, &request).map_err(cli_dialect)?;
             opts.context = match window {
                 ContextWindow::Docs(n) => n,
                 ContextWindow::Turn | ContextWindow::Skeleton => 0,
@@ -443,7 +497,7 @@ fn dispatch(
                 snippet_chars: SNIPPET_CHARS,
                 ..SearchRequest::default()
             };
-            let result = search::facets(&index, &fields, &field, &request)?;
+            let result = search::facets(&index, &fields, &field, &request).map_err(cli_dialect)?;
             format::facet_list(out, &result, &opts)
         }
 
@@ -541,7 +595,7 @@ fn dispatch(
         } => {
             refresh(index_dir, no_refresh, false);
             warn_unused_session_filters(&filters);
-            let matcher = SessionMatcher::new(&filters)?;
+            let matcher = session_matcher(&filters)?;
             let mut sessions: Vec<SessionInfo> = index::load_sessions(index_dir)?
                 .into_values()
                 .filter(|info| matcher.matches(info))
@@ -561,6 +615,22 @@ fn dispatch(
             let roots = index::meta(index_dir).roots;
             let stats = index_stats(index_dir)?;
             format::stats_scoped(out, &stats, &roots, &opts)
+        }
+
+        #[cfg(feature = "mcp")]
+        Command::Mcp {
+            refresh_secs,
+            no_refresh,
+        } => {
+            // `out` is deliberately untouched: the stdio transport is the only thing allowed to
+            // write to stdout, and `run` flushes an empty buffer afterwards.
+            crate::mcp::serve(
+                index_dir,
+                crate::mcp::ServeOptions {
+                    refresh_secs,
+                    no_refresh,
+                },
+            )
         }
 
         #[cfg(feature = "http-api")]
@@ -593,7 +663,7 @@ fn dispatch(
 /// The read commands index first, so a search is never silently answered from a stale index.
 /// A refresh failure is not fatal: an unreadable transcript root should not stop you searching
 /// what was indexed yesterday.
-fn refresh(index_dir: &Path, no_refresh: bool, query_wants_thinking: bool) {
+pub(crate) fn refresh(index_dir: &Path, no_refresh: bool, query_wants_thinking: bool) {
     let meta = index::meta(index_dir);
 
     // Searching thinking that was never indexed matches nothing and looks like an empty corpus.
@@ -922,173 +992,57 @@ pub(crate) fn index_stats(index_dir: &Path) -> Result<IndexStats> {
 // session filtering
 // ---------------------------------------------------------------------------
 
-/// The subset of [`Filters`] that `sessions.json` can answer, pre-resolved once.
+/// [`SessionMatcher::new`] with an unreadable date named the way the reader typed it.
 ///
-/// Session records carry no tool, model, role or kind, so those filters are meaningless here
-/// and are reported (see [`warn_unused_session_filters`]) rather than silently ignored.
-struct SessionMatcher {
-    project: Option<String>,
-    branch: Option<String>,
-    session: Option<String>,
-    agent_type: Option<String>,
-    since_ms: Option<i64>,
-    until_ms: Option<i64>,
-    no_sidechains: bool,
-    sidechains_only: bool,
+/// The shared matcher reports the plain field (`since`), because the same matcher serves an HTTP
+/// surface where `--since` is a flag nobody can type. Here the flag *is* what was typed, so it
+/// goes back on at the boundary — this is the whole of the CLI's dialect.
+fn session_matcher(f: &Filters) -> Result<SessionMatcher> {
+    SessionMatcher::new(f).map_err(|err| cli_flag(err.field, &err.source))
 }
 
-impl SessionMatcher {
-    fn new(f: &Filters) -> Result<Self> {
-        let now = chrono::Utc::now();
-        Ok(SessionMatcher {
-            project: f.project.as_deref().map(expand_tilde),
-            branch: f.branch.clone(),
-            session: f.session.clone(),
-            agent_type: f.agent_type.clone(),
-            since_ms: f
-                .since
-                .as_deref()
-                .map(|s| when_ms(s, now, Edge::Lower))
-                .transpose()
-                .context("parsing --since")?,
-            until_ms: f
-                .until
-                .as_deref()
-                .map(|s| when_ms(s, now, Edge::Upper))
-                .transpose()
-                .context("parsing --until")?,
-            no_sidechains: f.no_sidechains,
-            sidechains_only: f.sidechains_only,
-        })
-    }
+/// A [`sessions::FilterError`] re-spelled as the flag the user actually typed.
+///
+/// The shared core names the plain field (`tool_input`), because the same builder answers an HTTP
+/// API and an MCP server, and neither of those callers can type a flag — putting `--tool-input`
+/// in a JSON-RPC error tells a model to send something it has no way to send. Here the flag *is*
+/// what was typed, so it goes back on, at the boundary that owns the dialect.
+fn cli_flag(field: &str, source: &anyhow::Error) -> anyhow::Error {
+    anyhow!("parsing --{}: {:#}", field.replace('_', "-"), source)
+}
 
-    fn matches(&self, info: &SessionInfo) -> bool {
-        // Path-aware, exactly as the index-side filter is: `-p /home/user/alpha` must not drag
-        // in the sibling `/home/user/alpha-beta`.
-        if let Some(prefix) = &self.project
-            && !info
-                .project
-                .as_deref()
-                .is_some_and(|p| search::path_has_prefix(p, prefix))
-        {
-            return false;
-        }
-        if let Some(branch) = &self.branch
-            && info.git_branch.as_deref() != Some(branch.as_str())
-        {
-            return false;
-        }
-        // A session id is long enough that a prefix is a convenience, not an ambiguity.
-        if let Some(session) = &self.session
-            && !info.session_id.starts_with(session.as_str())
-        {
-            return false;
-        }
-        if let Some(kind) = &self.agent_type
-            && info.agent_type.as_deref() != Some(kind.as_str())
-        {
-            return false;
-        }
-        if self.no_sidechains && info.agent_id.is_some() {
-            return false;
-        }
-        if self.sidechains_only && info.agent_id.is_none() {
-            return false;
-        }
-        // A session overlaps the window if it ended after `since` and started before `until`.
-        if let Some(since) = self.since_ms
-            && info
-                .last_ts_ms
-                .or(info.first_ts_ms)
-                .is_some_and(|t| t < since)
-        {
-            return false;
-        }
-        if let Some(until) = self.until_ms
-            && info
-                .first_ts_ms
-                .or(info.last_ts_ms)
-                .is_some_and(|t| t > until)
-        {
-            return false;
-        }
-        true
+/// The same re-spelling, for an error that arrived as an opaque `anyhow` from the query builder.
+///
+/// `search::build_query` reports an unreadable `--tool-input` / `--tool-output` as a
+/// [`sessions::FilterError`] for the reason above. Everything else it can fail with is a genuine
+/// internal fault and passes through untouched.
+fn cli_dialect(err: anyhow::Error) -> anyhow::Error {
+    match err.downcast::<sessions::FilterError>() {
+        Ok(filter) => cli_flag(filter.field, &filter.source),
+        Err(err) => err,
     }
 }
 
-fn warn_unused_session_filters(f: &Filters) {
-    let mut ignored: Vec<&str> = Vec::new();
-    if !f.tool.is_empty() {
-        ignored.push("--tool");
-    }
-    if !f.tool_input.is_empty() {
-        ignored.push("--tool-input");
-    }
-    if !f.tool_output.is_empty() {
-        ignored.push("--tool-output");
-    }
-    if !f.program.is_empty() {
-        ignored.push("--program");
-    }
-    if !f.lang.is_empty() {
-        ignored.push("--lang");
-    }
-    if f.model.is_some() {
-        ignored.push("--model");
-    }
-    if f.role.is_some() {
-        ignored.push("--role");
-    }
-    if f.kind.is_some() {
-        ignored.push("--kind");
-    }
-    if f.errors_only {
-        ignored.push("--errors-only");
-    }
-    if !ignored.is_empty() {
+/// The filters `sessions` was handed that a session listing cannot answer, on stderr.
+///
+/// The list is [`sessions::unanswerable_filters`], shared with `GET /api/sessions` so the two
+/// front doors cannot disagree about which questions `sessions.json` can be asked. Only the
+/// rendering is the CLI's: flag spelling, and a warning rather than a field in a response body,
+/// because the CLI's answer is a table a human is looking at and stderr is where it says what it
+/// did not do.
+/// Returns the flags it warned about, so the shared list and this dialect are testable together.
+fn warn_unused_session_filters(f: &Filters) -> Vec<String> {
+    let flags: Vec<String> = sessions::unanswerable_filters(f)
+        .iter()
+        .map(|name| format!("--{}", name.replace('_', "-")))
+        .collect();
+    if !flags.is_empty() {
         tracing::warn!(
-            filters = %ignored.join(", "),
+            filters = %flags.join(", "),
             "not applicable to `sessions` (session metadata has no per-message fields); ignored"
         );
     }
-}
-
-#[derive(Clone, Copy)]
-enum Edge {
-    Lower,
-    Upper,
-}
-
-use search::DAY_MS;
-
-/// RFC3339, `YYYY-MM-DD`, `YYYY-MM-DDTHH:MM[:SS]`, `now`, or a relative span (`90s`, `30m`,
-/// `24h`, `7d`, `2w`). A bare day is inclusive at both ends, matching `search.rs`: as a lower
-/// bound it is midnight, as an upper bound it is the last millisecond of that day.
-/// The `search.rs` date parser, resolved to a single instant at the requested edge of the
-/// range. Shared so `sessions` — which filters `sessions.json`, not the index — cannot drift
-/// from `--since`/`--until` on the index side.
-fn when_ms(raw: &str, now: chrono::DateTime<chrono::Utc>, edge: Edge) -> Result<i64> {
-    Ok(match search::parse_when(raw, now)? {
-        search::When::Instant(ms) => ms,
-        // A bare `YYYY-MM-DD` covers the whole day.
-        search::When::Day(ms) => match edge {
-            Edge::Lower => ms,
-            Edge::Upper => ms + DAY_MS - 1,
-        },
-    })
-}
-
-fn expand_tilde(path: &str) -> String {
-    if (path == "~" || path.starts_with("~/"))
-        && let Some(home) = std::env::var_os("HOME")
-    {
-        let home = PathBuf::from(home);
-        return match path.strip_prefix("~/") {
-            Some(rest) => home.join(rest).to_string_lossy().into_owned(),
-            None => home.to_string_lossy().into_owned(),
-        };
-    }
-    path.to_string()
+    flags
 }
 
 fn non_empty(value: Option<String>) -> Option<String> {
@@ -1454,30 +1408,6 @@ mod tests {
         assert!(!color_enabled(false, true));
     }
 
-    #[test]
-    fn dates_parse_in_every_documented_form() {
-        let now = chrono::DateTime::parse_from_rfc3339("2026-09-09T12:00:00Z")
-            .unwrap()
-            .with_timezone(&chrono::Utc);
-        let ms = |s: &str, edge| when_ms(s, now, edge).unwrap();
-
-        assert_eq!(ms("now", Edge::Lower), now.timestamp_millis());
-        assert_eq!(ms("7d", Edge::Lower), now.timestamp_millis() - 7 * DAY_MS);
-        assert_eq!(ms("30m", Edge::Lower), now.timestamp_millis() - 30 * 60_000);
-        assert_eq!(
-            ms("2026-09-09T19:07:19Z", Edge::Lower),
-            1_788_980_839_000,
-            "RFC3339"
-        );
-        // A bare day is inclusive at both ends.
-        let midnight = ms("2026-09-09", Edge::Lower);
-        assert_eq!(ms("2026-09-09", Edge::Upper), midnight + DAY_MS - 1);
-        assert_eq!(ms("2026-09-09T19:07", Edge::Lower), midnight + 68_820_000);
-
-        let err = when_ms("last tuesday", now, Edge::Lower).unwrap_err();
-        assert!(format!("{err}").contains("cannot read"), "{err}");
-    }
-
     fn session(id: &str, project: &str) -> SessionInfo {
         SessionInfo {
             session_id: id.into(),
@@ -1490,7 +1420,7 @@ mod tests {
     }
 
     fn matches(filters: &Filters, info: &SessionInfo) -> bool {
-        match SessionMatcher::new(filters) {
+        match session_matcher(filters) {
             Ok(matcher) => matcher.matches(info),
             Err(err) => panic!("filters should parse: {err:#}"),
         }
@@ -1649,9 +1579,38 @@ mod tests {
         ));
     }
 
+    /// Same list as `GET /api/sessions` returns, spelled the way it was typed. The list itself
+    /// is pinned in `sessions.rs`; what is the CLI's own is the `--kebab-case`.
+    #[test]
+    fn the_sessions_command_names_every_filter_it_cannot_apply_as_a_flag() {
+        assert!(warn_unused_session_filters(&Filters::default()).is_empty());
+        let flagged = warn_unused_session_filters(&Filters {
+            tool_input: vec!["command=cargo".into()],
+            lang: vec!["rust".into()],
+            min_thinking: Some(500),
+            program: vec!["cargo".into()],
+            errors_only: true,
+            // Answerable, so absent from the warning.
+            project: Some("/home/user".into()),
+            ..Filters::default()
+        });
+        assert_eq!(
+            flagged,
+            [
+                "--tool-input",
+                "--lang",
+                "--min-thinking",
+                "--program",
+                "--errors-only"
+            ]
+        );
+    }
+
+    /// The shared matcher names the field; `session_matcher` is where the CLI puts its own flag
+    /// spelling back on, so that is what this pins.
     #[test]
     fn a_bad_date_fails_the_command_rather_than_matching_nothing() {
-        let err = match SessionMatcher::new(&Filters {
+        let err = match session_matcher(&Filters {
             since: Some("yesterday-ish".into()),
             ..Filters::default()
         }) {
@@ -1659,6 +1618,40 @@ mod tests {
             Err(err) => err,
         };
         assert!(format!("{err:#}").contains("--since"), "{err:#}");
+    }
+
+    /// The shared query builder names the plain field, because an HTTP or MCP caller cannot type
+    /// a flag. Without this, that correctness for the other two front ends arrives here as a
+    /// message telling someone at a shell prompt to fix a `tool_input` they never typed.
+    #[test]
+    fn an_unreadable_tool_filter_is_reported_as_the_flag_that_was_typed() {
+        let (index, fields) = search::testkit::index_docs(&search::testkit::corpus());
+        for (filters, flag) in [
+            (
+                Filters {
+                    tool_input: vec!["command".into()],
+                    ..Filters::default()
+                },
+                "--tool-input",
+            ),
+            (
+                Filters {
+                    tool_output: vec![String::new()],
+                    ..Filters::default()
+                },
+                "--tool-output",
+            ),
+        ] {
+            let request = search::SearchRequest {
+                filters,
+                ..Default::default()
+            };
+            let err = search::search(&index, &fields, &request)
+                .map_err(cli_dialect)
+                .expect_err("an unreadable filter must fail the command");
+            let message = format!("{err:#}");
+            assert!(message.contains(flag), "{message}");
+        }
     }
 
     #[test]
